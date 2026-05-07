@@ -118,7 +118,7 @@
   <!-- Live Video -->
   <div>
     <h3>Channel 1 - Front <span class="live-badge">LIVE</span></h3>
-    <video id="ch1" autoplay muted controls></video>
+    <video id="ch1" autoplay controls></video>
   </div>
 
   <!-- Map -->
@@ -142,23 +142,19 @@
   </div>
 
   <!-- Recordings -->
-  <div class="recordings">
-    <h3>📹 Saved Recordings</h3>
-    <table>
-      <thead>
-        <tr>
-          <th>Channel</th>
-          <th>Start Time</th>
-          <th>End Time</th>
-          <th>Size</th>
-          <th>Action</th>
-        </tr>
-      </thead>
-      <tbody id="recordingList">
-        <tr><td colspan="5" style="color:#666">Waiting for recordings...</td></tr>
-      </tbody>
-    </table>
-  </div>
+  <div class="recordings" style="margin-top:30px;">
+  <h3>📹 Saved Recordings</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Channel</th><th>Start</th><th>End</th><th>Size</th><th>Type</th>
+      </tr>
+    </thead>
+    <tbody id="recordingList">
+      <tr><td colspan="5" style="color:#666">Waiting for recordings...</td></tr>
+    </tbody>
+  </table>
+</div>
 
   <!-- Playback -->
   <div id="playbackSection" style="display:none; margin-top:20px;">
@@ -243,75 +239,36 @@
     ws.onerror = e => console.error('WS error', e);
 
     ws.onmessage = e => {
-        try {
-            const msg = JSON.parse(e.data);
-
-            if (msg.type === 'recordings') {
-                showRecordings(msg.data);
-            }
-
-            if (msg.type === 'location') {
-                // Update map
-                updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
-
-                // Update info boxes
-                document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}`;
-                document.getElementById('info-lon').textContent        = `Longitude: ${msg.lon.toFixed(6)}`;
-                document.getElementById('info-speed').textContent      = `Speed: ${msg.speed} km/h`;
-                document.getElementById('info-dir').textContent        = `Direction: ${msg.direction}°`;
-                document.getElementById('info-elev').textContent       = `Elevation: ${msg.elevation} m`;
-                document.getElementById('info-dt').textContent         = `DateTime: ${msg.datetime}`;
-                document.getElementById('info-acc').textContent        = `ACC: ${msg.accOn ? 'ON' : 'OFF'}`;
-                document.getElementById('info-located').textContent    = `Located: ${msg.located ? 'Yes' : 'No'}`;
-                document.getElementById('info-mileage').textContent    = `Mileage: ${msg.mileage || '--'}`;
-                document.getElementById('info-voltage').textContent    = `Voltage: ${msg.voltage || '--'}`;
-                document.getElementById('info-satellites').textContent = `Satellites: ${msg.satellites || '--'}`;
-                document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
-            }
-
-        } catch (_) {}
-    };
+    try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'recordings') showRecordings(msg.data);  // ← ADD THIS
+        if (msg.type === 'location')   { /* existing GPS code */ }
+    } catch (_) {}
+};
 
     // ── Recordings ────────────────────────────────────────────────────────
     function showRecordings(list) {
-        const tbody = document.getElementById('recordingList');
-        if (!list || list.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="5" style="color:#666">No recordings found</td></tr>';
-            return;
-        }
-
-        const grouped = {};
-        list.forEach((r, i) => {
-            const date = r.startTime.split(' ')[0];
-            if (!grouped[date]) grouped[date] = [];
-            grouped[date].push({ ...r, index: i });
-        });
-
-        let html = '';
-        Object.keys(grouped).sort().reverse().forEach(date => {
-            html += `<tr><td colspan="5" style="background:#222; color:#00d4ff; 
-                font-weight:bold; padding:10px;">📅 ${date}</td></tr>`;
-            grouped[date].forEach(r => {
-                const startHHMM = r.startTime.split(' ')[1];
-                const endHHMM   = r.endTime.split(' ')[1];
-                html += `
-                    <tr>
-                        <td>CH${r.ch}</td>
-                        <td>${startHHMM}</td>
-                        <td>${endHHMM}</td>
-                        <td>${(r.size / 1024).toFixed(1)} KB</td>
-                        <td>
-                            <button class="btn" onclick="playRecording(${r.index})">
-                                ▶ Play
-                            </button>
-                        </td>
-                    </tr>`;
-            });
-        });
-
-        tbody.innerHTML = html;
-        window._recordings = list;
+    const tbody = document.getElementById('recordingList');
+    if (!list || list.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" style="color:#666">No recordings found</td></tr>';
+        return;
     }
+    const typeLabel = t => ['AV','Audio','Video'][t] || '?';
+    let html = '';
+    list.forEach((r, i) => {
+        const start = r.startTime.split(' ')[1];  // show HH:MM:SS only
+        const end   = r.endTime.split(' ')[1];
+        const kb    = (r.size / 1024).toFixed(1);
+        html += `<tr>
+            <td>CH${r.ch}</td>
+            <td>${r.startTime.split(' ')[0]}<br><b>${start}</b></td>
+            <td><b>${end}</b></td>
+            <td>${kb} KB</td>
+            <td>${typeLabel(r.avType)}</td>
+        </tr>`;
+    });
+    tbody.innerHTML = html;
+}
 
     // ── Playback ──────────────────────────────────────────────────────────
     function playRecording(index) {
