@@ -94,8 +94,7 @@
     <style>
         body { background: #111; color: #fff; font-family: Arial; padding: 20px; margin: 0; }
         h3   { color: #00d4ff; }
-        video { width: 100%; display: block; margin: 10px 0; background: #000; }
-        .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        video { width: 100%; max-width: 900px; display: block; margin: 10px 0; background: #000; }
         .recordings { margin-top: 30px; }
         table { width: 100%; border-collapse: collapse; margin-top: 10px; }
         th    { background: #222; padding: 8px; text-align: left; color: #00d4ff; }
@@ -117,15 +116,9 @@
 <body>
 
   <!-- Live Video -->
-  <div class="grid2">
-    <div>
-        <h3>Channel 1 - Front <span class="live-badge">LIVE</span></h3>
-        <video id="ch1" autoplay muted controls></video>
-    </div>
-    <div>
-        <h3>Channel 2 - Rear <span class="live-badge">LIVE</span></h3>
-        <video id="ch2" autoplay muted controls></video>
-    </div>
+  <div>
+    <h3>Channel 1 - Front <span class="live-badge">LIVE</span></h3>
+    <video id="ch1" autoplay muted controls></video>
   </div>
 
   <!-- Map -->
@@ -176,17 +169,17 @@
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // ── Live streams ──────────────────────────────────────────────────────
+    // ── Live stream ───────────────────────────────────────────────────────
     function startLive(videoId, src) {
         const video = document.getElementById(videoId);
         const hls   = new Hls({ lowLatencyMode: true });
         hls.loadSource(src);
         hls.attachMedia(video);
         hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+        hls.on(Hls.Events.ERROR, (e, d) => console.error(videoId, d));
     }
 
     startLive('ch1', '/public/ch1.m3u8');
-    startLive('ch2', '/public/ch2.m3u8');
 
     // ── Leaflet Map ───────────────────────────────────────────────────────
     const map = L.map('map').setView([20, 0], 2);

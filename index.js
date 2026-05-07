@@ -84,7 +84,8 @@ function startFFmpeg(channel) {
         '-hls_time',      '1',
         '-hls_list_size', '3',
         '-hls_flags',     'delete_segments+append_list',
-        `-./public/ch${channel}.m3u8`,
+        '-hls_segment_filename', `./public/ch${channel}_%03d.ts`,
+        `./public/ch${channel}.m3u8`,
     ]);
     
     ffmpeg.stderr.on('data', d => {
@@ -107,11 +108,9 @@ function startFFmpeg(channel) {
 
 const channels = {
     1: { ffmpeg: null, gotIFrame: false, subpackets: [] },
-    2: { ffmpeg: null, gotIFrame: false, subpackets: [] },
 };
 
 channels[1].ffmpeg = startFFmpeg(1);
-channels[2].ffmpeg = startFFmpeg(2);
 
 // ── Handle complete H.264 frame ───────────────────────────────────────────────
 // ── Handle complete H.264 frame ───────────────────────────────────────────────
@@ -452,10 +451,9 @@ const tcpServer = net.createServer(socket => {
                     if (msgId === 0x0100) {
                         socket.write(buildRegisterResponse(phone, seq, 0, 'AUTH1234'));
                     } else if (msgId === 0x0102) {
-                        // Auth → request video
+                        // Auth → request video (single channel)
                         socket.write(buildAck(phone, seq, msgId));
                         socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
-                        socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 2));
 
                     } 
                     else if (msgId === 0x0200) {
@@ -524,32 +522,27 @@ const tcpServer = net.createServer(socket => {
                             }
                         });
 // ── Save GPS data to file ─────────────────────────────────────────────
-                        let fileName = `gps_log_${new Date().toISOString().slice(0,10)}.txt`;
-                        const gpsLog = fs.createWriteStream(`./${fileName}`, { flags: 'a' });
-
-                        const info = deviceInfo[phone] || {};
+                        const fileName = `gps_log_${new Date().toISOString().slice(0,10)}.txt`;
 
                         const gpsRecord = {
-                            phone:         phone,
-                            model:         info.model || '--',
-                            plate:         info.plate || '--',
-                            datetime:      dt,
-                            latitude:      lat,
-                            longitude:     lon,
-                            speed_kmh:     speed,
-                            direction_deg: direction,
-                            elevation_m:   elevation,
-                            acc:           accOn   ? 'ON'  : 'OFF',
-                            located:       located ? 'YES' : 'NO',
-                            mileage:       locationData.mileage        || '--',
-                            voltage:       locationData.voltage        || '--',
-                            satellites:    locationData.satellites     || '--',
-                            signal:        locationData.signalStrength || '--',
-                            sensor_speed:  locationData.sensorSpeed    || '--',
-                            oil_circuit:   !!(statusBits & (1<<10)) ? 'CUT'  : 'NORMAL',
-                            vehicle_circuit: !!(statusBits & (1<<11)) ? 'CUT' : 'NORMAL',
-                            door:          !!(statusBits & (1<<13)) ? 'OPEN'  : 'CLOSED',
-                            alarms:        alarmFlags !== 0 ? [
+                            phone:           phone,
+                            datetime:        dt,
+                            latitude:        lat,
+                            longitude:       lon,
+                            speed_kmh:       speed,
+                            direction_deg:   direction,
+                            elevation_m:     elevation,
+                            acc:             accOn   ? 'ON'  : 'OFF',
+                            located:         located ? 'YES' : 'NO',
+                            mileage:         locationData.mileage        || '--',
+                            voltage:         locationData.voltage        || '--',
+                            satellites:      locationData.satellites     || '--',
+                            signal:          locationData.signalStrength || '--',
+                            sensor_speed:    locationData.sensorSpeed    || '--',
+                            oil_circuit:     !!(statusBits & (1<<10)) ? 'CUT'    : 'NORMAL',
+                            vehicle_circuit: !!(statusBits & (1<<11)) ? 'CUT'    : 'NORMAL',
+                            door:            !!(statusBits & (1<<13)) ? 'OPEN'   : 'CLOSED',
+                            alarms:          alarmFlags !== 0 ? [
                                 (alarmFlags & (1<<0)) ? 'EMERGENCY'   : null,
                                 (alarmFlags & (1<<1)) ? 'OVERSPEED'   : null,
                                 (alarmFlags & (1<<4)) ? 'GNSS_FAULT'  : null,
@@ -559,10 +552,10 @@ const tcpServer = net.createServer(socket => {
                             ].filter(Boolean).join('|') : 'NONE',
                         };
 
-                        // Write to file
                         const line = Object.values(gpsRecord).join(',') + '\n';
-                        gpsLog.write(line);
-                        //console.log(`[GPS LOG] ${gpsRecord.imei} ${gpsRecord.datetime} lat=${gpsRecord.latitude} lon=${gpsRecord.longitude}`);
+                        fs.appendFile(`./${fileName}`, line, err => {
+                            if (err) console.error('[GPS LOG] write error:', err.message);
+                        });
                         
                     }
                     else {
@@ -591,4 +584,3 @@ const tcpServer = net.createServer(socket => {
 tcpServer.listen(CONFIG.tcpPort, () => {
     console.log(`✓ TCP server on :${CONFIG.tcpPort}`);
 });
-
