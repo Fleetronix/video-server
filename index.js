@@ -101,13 +101,29 @@ function handleVideoFrame(h264Data, channel, dataType) {
     const ch = channels[channel];
     if (!ch) return;
 
-    if (dataType === 0) {
-        ch.gotIFrame = true;
-        console.log(`ch${channel} ✅ I_FRAME size:${h264Data.length}`);
-    }
+    // if (dataType === 0) {
+    //     ch.gotIFrame = true;
+    //     console.log(`ch${channel} ✅ I_FRAME size:${h264Data.length}`);
+    // }
 
-    if (!ch.gotIFrame) return;
+    // if (!ch.gotIFrame) return;
+        // ✅ CORRECT — accept all video frame types
+        const isVideoFrame = (dataType === 0 || dataType === 1 || dataType === 2); // I, P, B frames
+        const isIFrame = (dataType === 0);
 
+        if (isIFrame) {
+            ch.gotIFrame = true;
+            console.log(`ch${channel} ✅ I_FRAME size:${h264Data.length}`);
+        } else if (isVideoFrame) {
+            console.log(`ch${channel} ${dataType === 1 ? 'P' : 'B'}_FRAME size:${h264Data.length}`);
+        }
+
+        // Allow video frames only after first I-Frame, but also handle case
+        // where stream starts mid-GOP (P-frame without I-frame context)
+        if (!ch.gotIFrame && isVideoFrame) {
+            console.log(`ch${channel} ⚠️ Dropping ${dataType === 1 ? 'P' : 'B'} frame — waiting for I-Frame`);
+            return;
+        }
     // Collect NAL units
     const nalUnits = [];
     let i = 0;
@@ -164,29 +180,54 @@ function handleVideoFrame(h264Data, channel, dataType) {
     }
 }
 function convertDataPartitioning(h264Data) {
-    const output = Buffer.from(h264Data); // copy
+    const nalUnits = [];
     let i = 0;
-    while (i < output.length - 5) {
-        if (output[i] === 0 && output[i+1] === 0 && 
-            output[i+2] === 0 && output[i+3] === 1) {
+    
+    // Extract all NAL units
+    while (i < h264Data.length - 4) {
+        if (h264Data[i] === 0 && h264Data[i+1] === 0 && 
+            h264Data[i+2] === 0 && h264Data[i+3] === 1) {
             
-            const nalType = output[i+4] & 0x1F;
-            const nalRef  = (output[i+4] >> 5) & 0x03;
-
-            if (nalType === 2) {
-                // Convert partition A → normal slice (type 1)
-                output[i+4] = (nalRef << 5) | 1;
-                console.log('Converted NAL 2 → 1');
-            } else if (nalType === 3 || nalType === 4) {
-                // Remove partition B and C by zeroing them out
-                output[i+4] = 0;
+            let next = h264Data.length;
+            for (let j = i + 4; j < h264Data.length - 4; j++) {
+                if (h264Data[j] === 0 && h264Data[j+1] === 0 && 
+                    h264Data[j+2] === 0 && h264Data[j+3] === 1) {
+                    next = j;
+                    break;
+                }
             }
-            i += 4;
+            
+            const nalType = h264Data[i+4] & 0x1F;
+            const nalRef = (h264Data[i+4] >> 5) & 0x03;
+            const nalData = h264Data.slice(i, next);
+            
+            // NAL type 2 = Data Partition A (contains slice header)
+            // Convert to normal slice (type 1) to make it decodable standalone
+            if (nalType === 2) {
+                const converted = Buffer.from(nalData);
+                converted[4] = (nalRef << 5) | 1; // Change to type 1
+                nalUnits.push(converted);
+                console.log('Converted DP-A (NAL 2) → NAL 1');
+            } 
+            // NAL types 3,4 = Data Partitions B,C — these contain residual data
+            // that cannot be decoded without the main slice from DP-A
+            // We must skip them if we already converted DP-A to a full slice
+            else if (nalType === 3 || nalType === 4) {
+                // Skip these — they cause "slice type 32 too large" errors
+                // when fed to FFmpeg without proper DP-A context
+                console.log(`Skipping NAL ${nalType} (Data Partition B/C)`);
+            } 
+            else {
+                nalUnits.push(nalData);
+            }
+            
+            i = next;
         } else {
             i++;
         }
     }
-    return output;
+    
+    return Buffer.concat(nalUnits);
 }
 // ── Reassemble subpackets ─────────────────────────────────────────────────────
 function processVideoPacket(h264Data, channel, dataType, subpktMarker) {
