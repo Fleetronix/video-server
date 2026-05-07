@@ -24,6 +24,7 @@ if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 const wss = new WebSocketServer({ port: CONFIG.wsPort });
 console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
 
+
 // ── HTTP server (serves video.html) ──────────────────────────────────────────
 http.createServer((req, res) => {
     let filePath;
@@ -67,24 +68,40 @@ http.createServer((req, res) => {
 // ── FFmpeg for HLS ────────────────────────────────────────────────────────────
 function startFFmpeg(channel) {
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
-    '-fflags',        '+genpts+discardcorrupt+igndts',
-    '-err_detect',    'ignore_err',
-    '-f',             'h264',
-    '-i',             'pipe:0',
-    '-c:v',           'libx264',
-    '-preset',        'ultrafast',
-    '-tune',          'zerolatency',
-    '-f',             'hls',
-    '-hls_time',      '1',
-    '-hls_list_size', '3',
-    '-hls_flags',     'delete_segments+append_list',
-    `./public/ch${channel}.m3u8`,
-]);
-    ffmpeg.stderr.on('data', d => console.log(`FFmpeg ch${channel}:`, d.toString().trim()));
-    ffmpeg.on('close', code => {
-        console.log(`FFmpeg ch${channel} closed, restarting...`);
-        setTimeout(() => { channels[channel].ffmpeg = startFFmpeg(channel); }, 1000);
+        '-fflags',        '+genpts+discardcorrupt+igndts',
+        '-err_detect',    'ignore_err',
+        '-flags',         'low_delay',
+        '-f',             'h264',
+        '-probesize',     '32',
+        '-analyzeduration', '0',
+        '-i',             'pipe:0',
+        '-c:v',           'libx264',
+        '-preset',        'ultrafast',
+        '-tune',          'zerolatency',
+        '-g',             '50',           // Keyframe interval
+        '-keyint_min',    '25',
+        '-f',             'hls',
+        '-hls_time',      '1',
+        '-hls_list_size', '3',
+        '-hls_flags',     'delete_segments+append_list',
+        `-./public/ch${channel}.m3u8`,
+    ]);
+    
+    ffmpeg.stderr.on('data', d => {
+        const msg = d.toString().trim();
+        // Only log important errors, filter out repetitive ones
+        if (msg.includes('error') || msg.includes('Non-existing') || msg.includes('no frame')) {
+            console.error(`FFmpeg ch${channel}:`, msg);
+        }
     });
+    
+    ffmpeg.on('close', code => {
+        console.log(`FFmpeg ch${channel} closed (code ${code}), restarting...`);
+        setTimeout(() => { 
+            channels[channel].ffmpeg = startFFmpeg(channel); 
+        }, 1000);
+    });
+    
     return ffmpeg;
 }
 
@@ -97,137 +114,152 @@ channels[1].ffmpeg = startFFmpeg(1);
 channels[2].ffmpeg = startFFmpeg(2);
 
 // ── Handle complete H.264 frame ───────────────────────────────────────────────
+// ── Handle complete H.264 frame ───────────────────────────────────────────────
 function handleVideoFrame(h264Data, channel, dataType) {
     const ch = channels[channel];
     if (!ch) return;
 
-    // if (dataType === 0) {
-    //     ch.gotIFrame = true;
-    //     console.log(`ch${channel} ✅ I_FRAME size:${h264Data.length}`);
-    // }
+    const NAL_TYPES = { 
+        1:'SLICE', 2:'DPA', 3:'DPB', 4:'DPC', 5:'IDR', 
+        6:'SEI', 7:'SPS', 8:'PPS', 9:'AUD' 
+    };
 
-    // if (!ch.gotIFrame) return;
-        // ✅ CORRECT — accept all video frame types
-        const isVideoFrame = (dataType === 0 || dataType === 1 || dataType === 2); // I, P, B frames
-        const isIFrame = (dataType === 0);
+    // Accept I(0), P(1), B(2) frames
+    const isVideoFrame = (dataType === 0 || dataType === 1 || dataType === 2);
+    if (!isVideoFrame) return;
 
-        if (isIFrame) {
-            ch.gotIFrame = true;
-            console.log(`ch${channel} ✅ I_FRAME size:${h264Data.length}`);
-        } else if (isVideoFrame) {
-            console.log(`ch${channel} ${dataType === 1 ? 'P' : 'B'}_FRAME size:${h264Data.length}`);
-        }
+    if (dataType === 0) {
+        ch.gotIFrame = true;
+        console.log(`ch${channel} ✅ I_FRAME size:${h264Data.length}`);
+    } else {
+        console.log(`ch${channel} ${dataType === 1 ? 'P' : 'B'}_FRAME size:${h264Data.length}`);
+    }
 
-        // Allow video frames only after first I-Frame, but also handle case
-        // where stream starts mid-GOP (P-frame without I-frame context)
-        if (!ch.gotIFrame && isVideoFrame) {
-            console.log(`ch${channel} ⚠️ Dropping ${dataType === 1 ? 'P' : 'B'} frame — waiting for I-Frame`);
-            return;
-        }
-    // Collect NAL units
+    if (!ch.gotIFrame) {
+        console.log(`ch${channel} ⏳ Waiting for I-Frame, dropping ${dataType === 1 ? 'P' : 'B'}-Frame`);
+        return;
+    }
+
+    // Collect NAL units - FIXED loop boundary
     const nalUnits = [];
     let i = 0;
-    while (i < h264Data.length - 4) {
-        if (h264Data[i] === 0 && h264Data[i+1] === 0 && 
+    
+    while (i < h264Data.length - 3) {  // Changed from -4 to -3 to catch 3-byte start codes too
+        // Check for 4-byte start code (00 00 00 01)
+        let startCodeLen = 0;
+        if (i + 3 < h264Data.length && h264Data[i] === 0 && h264Data[i+1] === 0 && 
             h264Data[i+2] === 0 && h264Data[i+3] === 1) {
-            
-            // Find next NAL start
+            startCodeLen = 4;
+        } 
+        // Check for 3-byte start code (00 00 01)
+        else if (i + 2 < h264Data.length && h264Data[i] === 0 && 
+                 h264Data[i+1] === 0 && h264Data[i+2] === 1) {
+            startCodeLen = 3;
+        }
+
+        if (startCodeLen > 0) {
+            // Find next start code
             let next = h264Data.length;
-            for (let j = i + 4; j < h264Data.length - 4; j++) {
+            for (let j = i + startCodeLen; j < h264Data.length - 2; j++) {
                 if (h264Data[j] === 0 && h264Data[j+1] === 0 && 
-                    h264Data[j+2] === 0 && h264Data[j+3] === 1) {
+                    (h264Data[j+2] === 1 || (j+3 < h264Data.length && h264Data[j+2] === 0 && h264Data[j+3] === 1))) {
                     next = j;
                     break;
                 }
             }
 
-            const nalType = h264Data[i+4] & 0x1F;
-            const nalData = h264Data.slice(i, next);
-            nalUnits.push({ type: nalType, data: nalData });
-            console.log(`ch${channel} NAL type:${nalType} size:${nalData.length}`);
+            const nalHeaderIdx = i + startCodeLen;
+            if (nalHeaderIdx < h264Data.length) {
+                const nalType = h264Data[nalHeaderIdx] & 0x1F;
+                const nalData = h264Data.slice(i, next);
+                const typeName = NAL_TYPES[nalType] || `Unknown(${nalType})`;
+                
+                console.log(`ch${channel} NAL type:${nalType} (${typeName}) size:${nalData.length}`);
+                nalUnits.push({ type: nalType, data: nalData });
+            }
             i = next;
         } else {
             i++;
         }
     }
 
-    // Check if data partitioning (types 2,3,4)
+    // Debug: No NAL units found
+    if (nalUnits.length === 0 && h264Data.length > 0) {
+        console.log(`ch${channel} ⚠️ No NAL units found! First 20 bytes: ${h264Data.slice(0,20).toString('hex')}`);
+        return;
+    }
+
+    // Check for critical NALs
+    const hasSPS = nalUnits.some(n => n.type === 7);
+    const hasPPS = nalUnits.some(n => n.type === 8);
+    const hasIDR = nalUnits.some(n => n.type === 5);
+    
+    if (hasSPS) console.log(`ch${channel} 📋 SPS found`);
+    if (hasPPS) console.log(`ch${channel} 📋 PPS found`);
+    if (hasIDR) console.log(`ch${channel} 📋 IDR slice found`);
+
+    // Handle Data Partitioning
     const hasDP = nalUnits.some(n => n.type === 2);
     if (hasDP) {
-        const converted = convertDataPartitioning(h264Data);
-        if (ch.ffmpeg && ch.ffmpeg.stdin.writable) {
-        ch.ffmpeg.stdin.write(converted);
+        const converted = convertDataPartitioning(nalUnits);
+        if (converted.length > 0 && ch.ffmpeg && ch.ffmpeg.stdin.writable) {
+            ch.ffmpeg.stdin.write(converted);
         }
-        return;
-        // const part2 = nalUnits.find(n => n.type === 2);
-        // const part3 = nalUnits.find(n => n.type === 3);
-        // const part4 = nalUnits.find(n => n.type === 4);
-
-        // // Combine all parts into one frame
-        // const parts = [part2, part3, part4].filter(Boolean).map(n => n.data);
-        // const combined = Buffer.concat(parts);
-        // console.log(`ch${channel} DP combined size:${combined.length}`);
-
-        // if (ch.ffmpeg && ch.ffmpeg.stdin.writable) {
-        //     ch.ffmpeg.stdin.write(combined);
-        // }
         return;
     }
 
-    // Normal frame
-    if (ch.ffmpeg && ch.ffmpeg.stdin.writable) {
-        ch.ffmpeg.stdin.write(h264Data);
+    // Normal frame - write all NAL units
+    const allData = Buffer.concat(nalUnits.map(n => n.data));
+    if (allData.length > 0 && ch.ffmpeg && ch.ffmpeg.stdin.writable) {
+        ch.ffmpeg.stdin.write(allData);
     }
 }
-function convertDataPartitioning(h264Data) {
-    const nalUnits = [];
-    let i = 0;
+
+function getNalTypeName(type) {
+    const names = {
+        0: 'Unspecified', 1: 'Non-IDR', 2: 'Partition A', 3: 'Partition B',
+        4: 'Partition C', 5: 'IDR', 6: 'SEI', 7: 'SPS', 8: 'PPS',
+        9: 'AUD', 10: 'End of Sequence', 11: 'End of Stream', 12: 'Filler'
+    };
+    return names[type] || `Unknown(${type})`;
+}
+
+// ── Convert Data Partitioning to standard NALs ────────────────────────────────
+function convertDataPartitioning(nalUnits) {
+    const output = [];
     
-    // Extract all NAL units
-    while (i < h264Data.length - 4) {
-        if (h264Data[i] === 0 && h264Data[i+1] === 0 && 
-            h264Data[i+2] === 0 && h264Data[i+3] === 1) {
-            
-            let next = h264Data.length;
-            for (let j = i + 4; j < h264Data.length - 4; j++) {
-                if (h264Data[j] === 0 && h264Data[j+1] === 0 && 
-                    h264Data[j+2] === 0 && h264Data[j+3] === 1) {
-                    next = j;
+    for (const nal of nalUnits) {
+        const nalType = nal.type;
+        
+        if (nalType === 2) {
+            // Convert DPA to full slice
+            const converted = Buffer.from(nal.data);
+            let idx = 0;
+            // Find start code
+            while (idx < converted.length - 3) {
+                if (converted[idx] === 0 && converted[idx+1] === 0 &&
+                    (converted[idx+2] === 1 || (converted[idx+2] === 0 && converted[idx+3] === 1))) {
+                    const startLen = (converted[idx+2] === 1) ? 3 : 4;
+                    const nalRef = (converted[idx + startLen] >> 5) & 0x03;
+                    converted[idx + startLen] = (nalRef << 5) | 1; // Change type 2→1
                     break;
                 }
+                idx++;
             }
-            
-            const nalType = h264Data[i+4] & 0x1F;
-            const nalRef = (h264Data[i+4] >> 5) & 0x03;
-            const nalData = h264Data.slice(i, next);
-            
-            // NAL type 2 = Data Partition A (contains slice header)
-            // Convert to normal slice (type 1) to make it decodable standalone
-            if (nalType === 2) {
-                const converted = Buffer.from(nalData);
-                converted[4] = (nalRef << 5) | 1; // Change to type 1
-                nalUnits.push(converted);
-                console.log('Converted DP-A (NAL 2) → NAL 1');
-            } 
-            // NAL types 3,4 = Data Partitions B,C — these contain residual data
-            // that cannot be decoded without the main slice from DP-A
-            // We must skip them if we already converted DP-A to a full slice
-            else if (nalType === 3 || nalType === 4) {
-                // Skip these — they cause "slice type 32 too large" errors
-                // when fed to FFmpeg without proper DP-A context
-                console.log(`Skipping NAL ${nalType} (Data Partition B/C)`);
-            } 
-            else {
-                nalUnits.push(nalData);
-            }
-            
-            i = next;
-        } else {
-            i++;
+            output.push(converted);
+            console.log('Converted DPA (NAL 2) → NAL 1');
+        } 
+        else if (nalType === 3 || nalType === 4) {
+            // Skip DPB and DPC - they cause decode errors without proper context
+            console.log(`Skipping NAL ${nalType} (DP${nalType === 3 ? 'B' : 'C'})`);
+        } 
+        else {
+            // Keep SPS, PPS, SEI, IDR, etc.
+            output.push(nal.data);
         }
     }
     
-    return Buffer.concat(nalUnits);
+    return Buffer.concat(output);
 }
 // ── Reassemble subpackets ─────────────────────────────────────────────────────
 function processVideoPacket(h264Data, channel, dataType, subpktMarker) {
@@ -253,7 +285,7 @@ function processVideoPacket(h264Data, channel, dataType, subpktMarker) {
         ch.subpackets.push(h264Data);
         const complete = Buffer.concat(ch.subpackets);
         ch.subpackets = [];
-        console.log(`ch${channel} complete frame NAL: ${complete[0].toString(16)} ${complete[1].toString(16)} ${complete[2].toString(16)} ${complete[3].toString(16)}`);
+        console.log(`ch${channel} complete frame size:${complete.length}`);
         handleVideoFrame(complete, channel, dataType);
     }
 }
