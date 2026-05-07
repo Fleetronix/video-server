@@ -55,18 +55,20 @@ function startFFmpeg(channel) {
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
         '-fflags',          '+genpts+discardcorrupt+igndts',
         '-err_detect',      'ignore_err',
-        '-fflags',          '+genpts',
         '-f',               'hevc',          // raw H.265 annex-B input
         '-i',               'pipe:0',
-        // Transcode H.265 → H.264 baseline (hls.js/MSE cannot decode H.265)
-        '-vf',              'scale=trunc(iw/2)*2:trunc(ih/2)*2', // ensure even dimensions
+        // hls.js/MSE cannot decode H.265 — transcode to H.264
+        '-vf',              'scale=trunc(iw/2)*2:trunc(ih/2)*2',
         '-c:v',             'libx264',
         '-preset',          'ultrafast',
         '-tune',            'zerolatency',
         '-profile:v',       'baseline',
         '-level',           '3.1',
-        '-x264opts',        'keyint=30:min-keyint=30:no-scenecut',
-        '-an',              // no audio input in raw hevc pipe
+        '-g',               '60',            // keyframe every 60 frames (~2s at 30fps)
+        '-keyint_min',      '30',
+        '-sc_threshold',    '0',
+        '-force_key_frames','expr:gte(t,n_forced*2)', // force keyframe every 2s
+        '-an',              // no audio in raw hevc pipe (audio needs separate handling)
         // HLS output
         '-f',               'hls',
         '-hls_time',        '1',
@@ -96,69 +98,108 @@ const channels = {
 };
 channels[1].ffmpeg = startFFmpeg(1);
 
-// ── Frame delivery to FFmpeg ─────────────────────────────────────────────────
-// Camera sends raw H.265 annex-B bytestream. FFmpeg -f hevc reads it directly —
-// no MPEG-TS wrapping needed for video. Audio (G.711A, dataType=3) is currently
-// dropped because -f hevc is video-only; audio would need a separate pipe/process.
+// ── H.265 NAL unit helpers ───────────────────────────────────────────────────
+// Detect whether a reassembled frame contains an IDR/CRA keyframe by inspecting
+// the H.265 NAL unit type. We do NOT trust the T/98 dataType field for this
+// because sub-packet reassembly loses the original first-packet dataType.
+//
+// H.265 NAL unit types (nal_unit_type, bits [9:15] of the 2-byte NAL header):
+//   16-21 = BLA/IDR/CRA (all are random-access / keyframe types)
+//   32    = VPS   33 = SPS   34 = PPS   39 = SEI prefix
+// A keyframe is signalled by nal_unit_type in range [16,21].
 
-// ── Handle one complete stream frame ─────────────────────────────────────────
-// dataType per T/98 §5.5.3 Table 19:
-//   0x00 = Video I-frame  0x01 = Video P-frame  0x02 = Video B-frame
-//   0x03 = Audio frame    0x04 = Transparent data
-function handleVideoFrame(frameData, channel, dataType) {
-    const ch = channels[channel];
-    if (!ch) return;
+function isH265Keyframe(buf) {
+    // Scan annex-B start codes and check each NAL type
+    let i = 0;
+    while (i < buf.length - 4) {
+        // Find 0x000001 or 0x00000001
+        let scLen = 0;
+        if (buf[i] === 0 && buf[i+1] === 0 && buf[i+2] === 0 && buf[i+3] === 1) scLen = 4;
+        else if (buf[i] === 0 && buf[i+1] === 0 && buf[i+2] === 1) scLen = 3;
 
-    // Skip audio and transparent data for now (separate pipe needed for audio)
-    if (dataType === 3 || dataType === 4) return;
-
-    const isVideo = (dataType === 0 || dataType === 1 || dataType === 2);
-    if (!isVideo) return;
-
-    if (dataType === 0) {
-        ch.gotIFrame = true;
-        console.log(`ch${channel} ✅ I_FRAME size:${frameData.length}`);
-    } else {
-        if (!ch.gotIFrame) return;  // drop P/B until first keyframe
+        if (scLen > 0) {
+            const nalHdrOffset = i + scLen;
+            if (nalHdrOffset + 1 < buf.length) {
+                // H.265 NAL header: byte0 = [forbidden(1) | nal_unit_type(6) | layer_id_hi(1)]
+                const nalType = (buf[nalHdrOffset] >> 1) & 0x3F;
+                if (nalType >= 16 && nalType <= 21) return true; // BLA/IDR/CRA
+            }
+            // Jump past this start code to find next
+            i = nalHdrOffset + 1;
+        } else {
+            i++;
+        }
     }
-
-    if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
-
-    // Raw H.265 annex-B: frames must start with 0x00000001 start code
-    // The camera usually includes this, but ensure it's present
-    const hasStartCode = frameData.length >= 4 &&
-        frameData[0] === 0 && frameData[1] === 0 &&
-        (frameData[2] === 1 || (frameData[2] === 0 && frameData[3] === 1));
-
-    if (hasStartCode) {
-        ch.ffmpeg.stdin.write(frameData);
-    } else {
-        // Prepend 4-byte start code
-        const sc = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-        ch.ffmpeg.stdin.write(Buffer.concat([sc, frameData]));
-    }
+    return false;
 }
 
-// ── Reassemble subpackets ─────────────────────────────────────────────────────
+// ── Reassemble subpackets then deliver to FFmpeg ──────────────────────────────
+// dataType per T/98 §5.5.3 Table 19:
+//   0x00=I-frame  0x01=P-frame  0x02=B-frame  0x03=Audio  0x04=Transparent
+//
+// IMPORTANT: dataType is carried on the FIRST sub-packet only. Middle and last
+// sub-packets have dataType from their own header which may differ. So we save
+// the dataType from sub-packet marker=1 (first) and use it for the whole frame.
 function processVideoPacket(rawData, channel, dataType, subpktMarker) {
     const ch = channels[channel];
     if (!ch) return;
 
     if (subpktMarker === 0) {
-        handleVideoFrame(rawData, channel, dataType);
+        // Atomic packet — complete frame in one piece
+        deliverFrame(rawData, channel, dataType);
+
     } else if (subpktMarker === 1) {
-        ch.subpackets = [rawData];
+        // First sub-packet — start accumulation, save the dataType
+        ch.subpackets      = [rawData];
+        ch.subpacketDType  = dataType;   // ← save dataType from first packet
+
     } else if (subpktMarker === 3) {
-        if (ch.subpackets.length > 0) ch.subpackets.push(rawData);
+        // Middle sub-packet
+        if (ch.subpackets && ch.subpackets.length > 0) ch.subpackets.push(rawData);
+
     } else if (subpktMarker === 2) {
-        if (ch.subpackets.length > 0) {
+        // Last sub-packet — reassemble and deliver
+        if (ch.subpackets && ch.subpackets.length > 0) {
             ch.subpackets.push(rawData);
             const complete = Buffer.concat(ch.subpackets);
+            const dtype    = ch.subpacketDType; // use saved first-packet dataType
             ch.subpackets  = [];
-            console.log(`ch${channel} complete frame size:${complete.length}`);
-            handleVideoFrame(complete, channel, dataType);
+            ch.subpacketDType = 0;
+            deliverFrame(complete, channel, dtype);
         }
     }
+}
+
+function deliverFrame(frameData, channel, dataType) {
+    const ch = channels[channel];
+    if (!ch) return;
+
+    // Audio / transparent — skip (no audio pipe)
+    if (dataType === 3 || dataType === 4) return;
+
+    const isVideo = (dataType === 0 || dataType === 1 || dataType === 2);
+    if (!isVideo) return;
+
+    // Detect keyframe from actual H.265 NAL content (don't trust dataType alone
+    // since it can be wrong after sub-packet reassembly)
+    const keyframe = (dataType === 0) || isH265Keyframe(frameData);
+
+    if (keyframe) {
+        ch.gotIFrame = true;
+        console.log(`ch${channel} ✅ KEYFRAME size:${frameData.length}`);
+    } else {
+        if (!ch.gotIFrame) return; // still waiting for first keyframe
+    }
+
+    if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
+
+    // Ensure annex-B 4-byte start code prefix
+    const hasStartCode = frameData.length >= 4 &&
+        frameData[0] === 0 && frameData[1] === 0 && frameData[2] === 0 && frameData[3] === 1;
+
+    ch.ffmpeg.stdin.write(hasStartCode ? frameData : Buffer.concat([
+        Buffer.from([0x00, 0x00, 0x00, 0x01]), frameData
+    ]));
 }
 
 // ── JT/T 808 protocol helpers ─────────────────────────────────────────────────
