@@ -4,34 +4,76 @@
     <title>Vehicle Camera</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
-        body { background: #111; color: #fff; font-family: Arial; padding: 20px; margin: 0; }
-        h3   { color: #00d4ff; }
-        video { width: 100%; max-width: 900px; display: block; margin: 10px 0; background: #000; }
-        .recordings { margin-top: 30px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th    { background: #222; padding: 8px; text-align: left; color: #00d4ff; }
-        td    { padding: 8px; border-bottom: 1px solid #333; }
-        tr:hover { background: #1a1a1a; cursor: pointer; }
-        .btn  { background: #00d4ff; color: #000; border: none; padding: 6px 14px;
-                border-radius: 4px; cursor: pointer; font-weight: bold; }
+        * { box-sizing: border-box; }
+        body { background: #111; color: #fff; font-family: Arial, sans-serif; padding: 16px; margin: 0; }
+        h3   { color: #00d4ff; margin: 16px 0 8px; }
+
+        /* ── Video player ── */
+        .video-wrap {
+            position: relative; background: #000; border-radius: 8px;
+            overflow: hidden; max-width: 960px;
+        }
+        .video-wrap video { width: 100%; display: block; }
+        .live-badge {
+            background: #f00; color: #fff; padding: 2px 8px;
+            border-radius: 4px; font-size: 11px; margin-left: 8px;
+            vertical-align: middle;
+        }
+        /* Click-to-play overlay — shown when autoplay is blocked */
+        #playOverlay {
+            display: none; position: absolute; inset: 0;
+            background: rgba(0,0,0,0.6); cursor: pointer;
+            align-items: center; justify-content: center; flex-direction: column;
+        }
+        #playOverlay.visible { display: flex; }
+        #playOverlay .play-btn {
+            width: 72px; height: 72px; border-radius: 50%;
+            background: #00d4ff; display: flex; align-items: center; justify-content: center;
+        }
+        #playOverlay .play-btn svg { width: 36px; height: 36px; fill: #000; margin-left: 4px; }
+        #playOverlay p { margin: 12px 0 0; font-size: 14px; color: #ccc; }
+        #statusMsg { font-size: 13px; color: #aaa; margin: 6px 0; }
+
+        /* ── Map ── */
+        #map { height: 380px; border-radius: 8px; border: 1px solid #333; max-width: 960px; }
+
+        /* ── GPS grid ── */
+        #gpsInfo {
+            background: #1a1a1a; padding: 12px; border-radius: 8px;
+            display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+            margin-top: 12px; max-width: 960px;
+        }
+        .info-box {
+            background: #222; padding: 10px; border-radius: 6px;
+            font-size: 13px; border-left: 3px solid #00d4ff;
+        }
+
+        /* ── Recordings table ── */
+        .recordings { margin-top: 24px; max-width: 960px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+        th { background: #222; padding: 8px 10px; text-align: left; color: #00d4ff; }
+        td { padding: 8px 10px; border-bottom: 1px solid #2a2a2a; font-size: 13px; }
+        tr:hover td { background: #1a1a1a; }
+        .btn { background: #00d4ff; color: #000; border: none; padding: 5px 12px;
+               border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 12px; }
         .btn:hover { background: #00aacc; }
-        .live-badge { background: #f00; color: #fff; padding: 2px 8px;
-                      border-radius: 4px; font-size: 11px; margin-left: 8px; }
-        .info-box { background: #222; padding: 10px; border-radius: 6px;
-                    font-size: 13px; border-left: 3px solid #00d4ff; }
-        #map { height: 400px; border-radius: 8px; border: 1px solid #333; }
-        #gpsInfo { background: #1a1a1a; padding: 15px; border-radius: 8px;
-                   display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; 
-                   margin-top: 15px; }
+        #noRec { color: #666; font-style: italic; }
     </style>
 </head>
 <body>
 
   <!-- Live Video -->
-  <div>
-    <h3>Channel 1 - Front <span class="live-badge">LIVE</span></h3>
-    <video id="ch1" autoplay controls></video>
+  <h3>Channel 1 — Front Camera <span class="live-badge">LIVE</span></h3>
+  <div class="video-wrap">
+    <video id="ch1" muted playsinline controls></video>
+    <div id="playOverlay">
+      <div class="play-btn">
+        <svg viewBox="0 0 24 24"><polygon points="5,3 19,12 5,21"/></svg>
+      </div>
+      <p>Click to start live stream</p>
+    </div>
   </div>
+  <div id="statusMsg">⏳ Connecting to stream...</div>
 
   <!-- Map -->
   <h3>Vehicle Location</h3>
@@ -54,150 +96,208 @@
   </div>
 
   <!-- Recordings -->
-  <div class="recordings" style="margin-top:30px;">
-  <h3>📹 Saved Recordings</h3>
-  <table>
-    <thead>
-      <tr>
-        <th>Channel</th><th>Start</th><th>End</th><th>Size</th><th>Type</th>
-      </tr>
-    </thead>
-    <tbody id="recordingList">
-      <tr><td colspan="5" style="color:#666">Waiting for recordings...</td></tr>
-    </tbody>
-  </table>
-</div>
-
-  <!-- Playback -->
-  <div id="playbackSection" style="display:none; margin-top:20px;">
-    <h3>Playback</h3>
-    <video id="playback" controls style="width:640px; background:#000;"></video>
+  <div class="recordings">
+    <h3>📹 Saved Recordings</h3>
+    <table>
+      <thead>
+        <tr><th>CH</th><th>Date</th><th>Start</th><th>End</th><th>Size</th><th>Type</th><th></th></tr>
+      </thead>
+      <tbody id="recordingList">
+        <tr><td colspan="7" id="noRec">Waiting for device...</td></tr>
+      </tbody>
+    </table>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // ── Live stream ───────────────────────────────────────────────────────
-    function startLive(videoId, src) {
-        const video = document.getElementById(videoId);
-        const hls   = new Hls({ lowLatencyMode: true });
-        hls.loadSource(src);
+    // ── HLS player ────────────────────────────────────────────────────────────
+    const video      = document.getElementById('ch1');
+    const overlay    = document.getElementById('playOverlay');
+    const statusMsg  = document.getElementById('statusMsg');
+    let   hlsInst    = null;
+    let   retryTimer = null;
+
+    function setStatus(msg) { statusMsg.textContent = msg; }
+
+    function startHLS() {
+        if (hlsInst) { hlsInst.destroy(); hlsInst = null; }
+
+        if (!Hls.isSupported()) {
+            // Safari — native HLS
+            if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                video.src = '/public/ch1.m3u8';
+                video.play().catch(() => overlay.classList.add('visible'));
+            } else {
+                setStatus('❌ HLS not supported in this browser');
+            }
+            return;
+        }
+
+        const hls = new Hls({
+            lowLatencyMode:        true,
+            backBufferLength:      10,
+            maxBufferLength:       15,
+            maxMaxBufferLength:    30,
+            liveSyncDurationCount: 2,
+            liveMaxLatencyDurationCount: 4,
+            // Retry manifest load up to 10 times while stream is starting
+            manifestLoadingMaxRetry:    10,
+            manifestLoadingRetryDelay:  1000,
+            levelLoadingMaxRetry:       6,
+            fragLoadingMaxRetry:        6,
+        });
+        hlsInst = hls;
+
+        hls.loadSource('/public/ch1.m3u8');
         hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
-        hls.on(Hls.Events.ERROR, (e, d) => console.error(videoId, d));
+
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            setStatus('▶ Stream ready');
+            video.play().catch(() => {
+                // Autoplay blocked — show click overlay
+                overlay.classList.add('visible');
+                setStatus('👆 Click the video to start');
+            });
+        });
+
+        hls.on(Hls.Events.FRAG_LOADED, () => {
+            setStatus('🟢 Live');
+            overlay.classList.remove('visible');
+        });
+
+        hls.on(Hls.Events.ERROR, (event, data) => {
+            if (data.fatal) {
+                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                    setStatus('⏳ Waiting for stream...');
+                    // Stream not ready yet — retry in 3s
+                    clearTimeout(retryTimer);
+                    retryTimer = setTimeout(startHLS, 3000);
+                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                    setStatus('⚠ Media error — recovering...');
+                    hls.recoverMediaError();
+                } else {
+                    setStatus('❌ Fatal error — restarting...');
+                    clearTimeout(retryTimer);
+                    retryTimer = setTimeout(startHLS, 5000);
+                }
+            }
+        });
     }
 
-    startLive('ch1', '/public/ch1.m3u8');
+    // Click-to-play overlay handler
+    overlay.addEventListener('click', () => {
+        overlay.classList.remove('visible');
+        video.play();
+    });
 
-    // ── Leaflet Map ───────────────────────────────────────────────────────
-    const map = L.map('map').setView([20, 0], 2);
+    startHLS();
 
+    // ── Leaflet Map ───────────────────────────────────────────────────────────
+    const map = L.map('map').setView([20, 78], 5);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '© OpenStreetMap contributors'
     }).addTo(map);
 
-    const truckIcon = L.divIcon({
-    html: `<div style="
-        background: #00d4ff;
-        width: 20px;
-        height: 20px;
-        border-radius: 50%;
-        border: 3px solid #fff;
-        box-shadow: 0 0 8px #00d4ff;
-    "></div>`,
-    iconSize:   [20, 20],
-    iconAnchor: [10, 10],
-    className:  ''
-});
+    const vehicleIcon = L.divIcon({
+        html: `<div style="background:#00d4ff;width:18px;height:18px;border-radius:50%;
+               border:3px solid #fff;box-shadow:0 0 8px #00d4ff;"></div>`,
+        iconSize: [18,18], iconAnchor: [9,9], className: ''
+    });
 
-    let marker   = null;
-    let polyline = null;
-    let trail    = []; // store last 50 positions
+    let marker = null, polyline = null, trail = [];
 
-    function updateMap(lat, lon, speed, direction) {
+    function updateMap(lat, lon, speed, dir) {
         const pos = [lat, lon];
-
         if (!marker) {
-            // First position — create marker and center map
-            marker = L.marker(pos, { icon: truckIcon }).addTo(map);
+            marker = L.marker(pos, { icon: vehicleIcon }).addTo(map);
             map.setView(pos, 15);
         } else {
             marker.setLatLng(pos);
+            map.panTo(pos);
         }
-
-        // Update popup
-        marker.bindPopup(`
-            <b>Vehicle</b><br>
-            Lat: ${lat.toFixed(6)}<br>
-            Lon: ${lon.toFixed(6)}<br>
-            Speed: ${speed} km/h<br>
-            Direction: ${direction}°
-        `);
-
-        // Draw trail (last 50 points)
+        marker.bindPopup(`<b>Vehicle</b><br>Lat: ${lat.toFixed(6)}<br>Lon: ${lon.toFixed(6)}<br>Speed: ${speed} km/h<br>Dir: ${dir}°`);
         trail.push(pos);
-        if (trail.length > 50) trail.shift();
-
+        if (trail.length > 100) trail.shift();
         if (polyline) map.removeLayer(polyline);
         polyline = L.polyline(trail, { color: '#00d4ff', weight: 2 }).addTo(map);
-
-        // Keep map centered on vehicle
-        map.panTo(pos);
     }
 
-    // ── WebSocket ─────────────────────────────────────────────────────────
-    const ws = new WebSocket(`ws://${location.hostname}:8801`);
-    ws.onopen  = () => console.log('WS connected');
-    ws.onerror = e => console.error('WS error', e);
+    // ── WebSocket ─────────────────────────────────────────────────────────────
+    function connectWS() {
+        const ws = new WebSocket(`ws://${location.hostname}:8801`);
+        ws.onopen  = () => console.log('WS connected');
+        ws.onerror = () => {};
+        ws.onclose = () => setTimeout(connectWS, 3000); // auto-reconnect
 
-    ws.onmessage = e => {
-    try {
-        const msg = JSON.parse(e.data);
-        if (msg.type === 'recordings') showRecordings(msg.data);  // ← ADD THIS
-        if (msg.type === 'location')   { /* existing GPS code */ }
-    } catch (_) {}
-};
+        ws.onmessage = e => {
+            try {
+                const msg = JSON.parse(e.data);
+                if (msg.type === 'recordings') showRecordings(msg.data);
+                if (msg.type === 'location') {
+                    updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
+                    document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}°`;
+                    document.getElementById('info-lon').textContent        = `Longitude: ${msg.lon.toFixed(6)}°`;
+                    document.getElementById('info-speed').textContent      = `Speed: ${msg.speed} km/h`;
+                    document.getElementById('info-dir').textContent        = `Direction: ${msg.direction}°`;
+                    document.getElementById('info-elev').textContent       = `Elevation: ${msg.elevation} m`;
+                    document.getElementById('info-dt').textContent         = `DateTime: ${msg.datetime}`;
+                    document.getElementById('info-acc').textContent        = `ACC: ${msg.accOn  ? '🟢 ON' : '🔴 OFF'}`;
+                    document.getElementById('info-located').textContent    = `Located: ${msg.located ? '✅ Yes' : '❌ No'}`;
+                    document.getElementById('info-mileage').textContent    = `Mileage: ${msg.mileage || '--'}`;
+                    document.getElementById('info-voltage').textContent    = `Voltage: ${msg.voltage || '--'}`;
+                    document.getElementById('info-satellites').textContent = `Satellites: ${msg.satellites || '--'}`;
+                    document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms && msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
+                }
+            } catch (_) {}
+        };
+    }
+    connectWS();
 
-    // ── Recordings ────────────────────────────────────────────────────────
+    // ── Recordings ────────────────────────────────────────────────────────────
+    const avTypeLabel = t => (['AV','Audio','Video','AV/Video'][t] || '?');
+
     function showRecordings(list) {
-    const tbody = document.getElementById('recordingList');
-    if (!list || list.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="color:#666">No recordings found</td></tr>';
-        return;
-    }
-    const typeLabel = t => ['AV','Audio','Video'][t] || '?';
-    let html = '';
-    list.forEach((r, i) => {
-        const start = r.startTime.split(' ')[1];  // show HH:MM:SS only
-        const end   = r.endTime.split(' ')[1];
-        const kb    = (r.size / 1024).toFixed(1);
-        html += `<tr>
-            <td>CH${r.ch}</td>
-            <td>${r.startTime.split(' ')[0]}<br><b>${start}</b></td>
-            <td><b>${end}</b></td>
-            <td>${kb} KB</td>
-            <td>${typeLabel(r.avType)}</td>
-        </tr>`;
-    });
-    tbody.innerHTML = html;
-}
+        const tbody = document.getElementById('recordingList');
+        if (!list || list.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" id="noRec" style="color:#666;font-style:italic">No recordings on device</td></tr>';
+            return;
+        }
 
-    // ── Playback ──────────────────────────────────────────────────────────
+        // Group by date
+        const grouped = {};
+        list.forEach((r, i) => {
+            const date = r.startTime.split(' ')[0];
+            if (!grouped[date]) grouped[date] = [];
+            grouped[date].push({ ...r, index: i });
+        });
+
+        let html = '';
+        Object.keys(grouped).sort().reverse().forEach(date => {
+            html += `<tr><td colspan="7" style="background:#1a2a3a;color:#00d4ff;font-weight:bold;padding:8px 10px;">📅 ${date}</td></tr>`;
+            grouped[date].forEach(r => {
+                const start = r.startTime.split(' ')[1];
+                const end   = r.endTime.split(' ')[1];
+                const kb    = r.size > 0 ? (r.size / 1024).toFixed(0) + ' KB' : '--';
+                html += `<tr>
+                    <td>CH${r.ch}</td>
+                    <td>${r.startTime.split(' ')[0]}</td>
+                    <td>${start}</td>
+                    <td>${end}</td>
+                    <td>${kb}</td>
+                    <td>${avTypeLabel(r.avType)}</td>
+                    <td><button class="btn" onclick="playRecording(${r.index})">▶ Play</button></td>
+                </tr>`;
+            });
+        });
+
+        tbody.innerHTML = html;
+        window._recordings = list;
+    }
+
     function playRecording(index) {
         const rec = window._recordings[index];
-        ws.send(JSON.stringify({
-            type:      'playback_request',
-            channel:   rec.ch,
-            startTime: rec.startTime,
-            endTime:   rec.endTime,
-        }));
-
-        document.getElementById('playbackSection').style.display = 'block';
-        const video = document.getElementById('playback');
-        const hls   = new Hls();
-        hls.loadSource(`/public/ch${rec.ch}.m3u8`);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+        alert(`Playback for CH${rec.ch} ${rec.startTime} → ${rec.endTime}\n(Playback stream not yet implemented)`);
     }
   </script>
 </body>

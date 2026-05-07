@@ -55,24 +55,18 @@ function startFFmpeg(channel) {
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
         '-fflags',          '+genpts+discardcorrupt+igndts',
         '-err_detect',      'ignore_err',
-        '-f',               'hevc',          // raw H.265 annex-B bytestream input
-        '-probesize',       '500000',
-        '-analyzeduration', '0',
+        '-fflags',          '+genpts',
+        '-f',               'hevc',          // raw H.265 annex-B input
         '-i',               'pipe:0',
-        // hls.js MSE does NOT support H.265 — must transcode to H.264
+        // Transcode H.265 → H.264 baseline (hls.js/MSE cannot decode H.265)
+        '-vf',              'scale=trunc(iw/2)*2:trunc(ih/2)*2', // ensure even dimensions
         '-c:v',             'libx264',
         '-preset',          'ultrafast',
         '-tune',            'zerolatency',
-        '-profile:v',       'baseline',      // widest browser compatibility
+        '-profile:v',       'baseline',
         '-level',           '3.1',
-        '-g',               '30',
-        '-keyint_min',      '30',
-        '-sc_threshold',    '0',             // no scene-cut keyframes (keeps HLS segments clean)
-        // Audio: G.711A PCM → AAC
-        '-c:a',             'aac',
-        '-ar',              '8000',
-        '-ac',              '1',
-        '-b:a',             '32k',
+        '-x264opts',        'keyint=30:min-keyint=30:no-scenecut',
+        '-an',              // no audio input in raw hevc pipe
         // HLS output
         '-f',               'hls',
         '-hls_time',        '1',
@@ -407,8 +401,17 @@ const tcpServer = net.createServer(socket => {
                         socket.write(buildAck(phone, seq, msgId));
                         if (!socket._recordingsQueried) {
                             socket._recordingsQueried = true;
-                            console.log(`[Recordings] Querying after first location report...`);
-                            setTimeout(() => socket.write(buildQueryRecordings(phone)), 500);
+                            // Retry up to 3 times with increasing delays
+                            // Device may still be indexing SD card
+                            let attempt = 0;
+                            const queryRecordings = () => {
+                                attempt++;
+                                console.log(`[Recordings] Query attempt ${attempt}...`);
+                                socket.write(buildQueryRecordings(phone));
+                            };
+                            setTimeout(queryRecordings, 1000);
+                            setTimeout(queryRecordings, 10000);
+                            setTimeout(queryRecordings, 30000);
                         }
 
                         const alarmFlags = body.readUInt32BE(0);
@@ -475,9 +478,31 @@ const tcpServer = net.createServer(socket => {
                             if (err) console.error('[GPS LOG] write error:', err.message);
                         });
 
+                    } else if (msgId === 0x0001) {
+                        // General response from device — ACK to our commands, no reply needed
+                        const replySeq    = body.readUInt16BE(0);
+                        const replyMsgId  = body.readUInt16BE(2);
+                        const result      = body[4];
+                        const resultStr   = ['Success','Failed','MsgErr','NotSupported','AlarmACK','Update'][result] || `0x${result.toString(16)}`;
+                        console.log(`[signalling] Device ACK: replyTo=0x${replyMsgId.toString(16).padStart(4,'0')} seq=${replySeq} result=${resultStr}`);
+
+                    } else if (msgId === 0x0002) {
+                        // Heartbeat — just ACK it
+                        socket.write(buildAck(phone, seq, msgId));
+
+                    } else if (msgId === 0x1003) {
+                        // Terminal uploads audio/video attributes (T/98 §5.3.3)
+                        // Log the codec info — useful for confirming H.265
+                        if (body.length >= 2) {
+                            const videoCodec = body[7] || body[1];
+                            const codecName  = {98:'H.264', 99:'H.265/HEVC', 100:'AVS'}[videoCodec] || `code${videoCodec}`;
+                            console.log(`[signalling] Terminal AV attributes: videoCodec=${codecName}`);
+                        }
+                        socket.write(buildAck(phone, seq, msgId));
+
                     } else {
-                        // Log any unexpected message IDs — helps diagnose recordings issues
-                        console.log(`[signalling] ⚠️  Unhandled msgId=0x${msgId.toString(16).padStart(4,'0')} bodyLen=${body.length} hex=${body.slice(0,32).toString('hex')}`);
+                        // Truly unknown — log but still ACK
+                        console.log(`[signalling] ⚠️  Unhandled msgId=0x${msgId.toString(16).padStart(4,'0')} bodyLen=${body.length}`);
                         socket.write(buildAck(phone, seq, msgId));
                     }
 
