@@ -47,27 +47,23 @@ http.createServer((req, res) => {
     });
 }).listen(CONFIG.httpPort, () => console.log(`✓ HTTP on :${CONFIG.httpPort}`));
 
-// ── FFmpeg for HLS (AVS video + AAC audio) ───────────────────────────────────
-// Camera sends AVS video (codec 100, T/98 Table 12) + G.711A or AAC audio.
-// We wrap both in MPEG-TS and let FFmpeg transcode to H.264+AAC for HLS.
+// ── FFmpeg for HLS (H.265/HEVC video + G.711A audio) ─────────────────────────
+// Camera sends raw H.265 bytestream (codec 99 per T/98 Table 12).
+// -f hevc = raw HEVC annex-B input. -c:v copy = no transcode, just remux.
+// HLS with H.265 works in Chrome 107+, Safari 14+, Edge.
 function startFFmpeg(channel) {
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
         '-fflags',          '+genpts+discardcorrupt+igndts',
         '-err_detect',      'ignore_err',
-        '-f',               'mpegts',
+        '-f',               'hevc',          // raw H.265 annex-B bytestream
         '-probesize',       '500000',
-        '-analyzeduration', '1000000',
+        '-analyzeduration', '0',
         '-i',               'pipe:0',
-        // Video: transcode AVS → H.264
-        '-c:v',             'libx264',
-        '-preset',          'ultrafast',
-        '-tune',            'zerolatency',
-        '-g',               '50',
-        '-keyint_min',      '25',
-        // Audio: transcode whatever codec → AAC for browser HLS
+        '-c:v',             'copy',          // remux directly — no re-encode needed
+        // Audio: G.711A → AAC for browser compatibility
         '-c:a',             'aac',
-        '-ar',              '8000',   // G.711A is 8 kHz; AAC inherits sample rate
-        '-ac',              '1',      // mono
+        '-ar',              '8000',
+        '-ac',              '1',
         '-b:a',             '32k',
         // HLS output
         '-f',               'hls',
@@ -98,112 +94,10 @@ const channels = {
 };
 channels[1].ffmpeg = startFFmpeg(1);
 
-// ── MPEG-TS muxer (AVS video + G.711A/AAC audio) ─────────────────────────────
-// PIDs:  0=PAT  4096=PMT  256=video  257=audio
-// Stream types: 0x42=AVS video  0x90=G.711A audio (private)
-const TS_PACKET_SIZE = 188;
-const VIDEO_PID      = 256;
-const AUDIO_PID      = 257;
-const PMT_PID        = 4096;
-
-// Continuity counters per PID (must increment per packet on the same PID)
-const cc = { [VIDEO_PID]: 0, [AUDIO_PID]: 0, [PMT_PID]: 0, 0: 0 };
-
-function buildPAT() {
-    const pkt = Buffer.alloc(TS_PACKET_SIZE, 0xFF);
-    pkt[0] = 0x47; pkt[1] = 0x40; pkt[2] = 0x00;
-    pkt[3] = 0x10 | (cc[0]++ & 0x0F);
-    pkt[4] = 0x00; // pointer field
-    const s = pkt.slice(5);
-    s[0]  = 0x00;              // table_id = PAT
-    s[1]  = 0xB0; s[2] = 0x0D;
-    s[3]  = 0x00; s[4] = 0x01; // ts_id=1
-    s[5]  = 0xC1; s[6] = 0x00; s[7] = 0x00;
-    s[8]  = 0x00; s[9] = 0x01; // program 1
-    s[10] = (PMT_PID >> 8) | 0xE0;
-    s[11] = PMT_PID & 0xFF;
-    return pkt;
-}
-
-function buildPMT() {
-    // Two stream entries: video (0x42=AVS) + audio (0x90=G.711A private)
-    const pkt = Buffer.alloc(TS_PACKET_SIZE, 0xFF);
-    pkt[0] = 0x47;
-    pkt[1] = 0x40 | ((PMT_PID >> 8) & 0x1F);
-    pkt[2] = PMT_PID & 0xFF;
-    pkt[3] = 0x10 | (cc[PMT_PID]++ & 0x0F);
-    pkt[4] = 0x00;
-    const s = pkt.slice(5);
-    s[0]  = 0x02;
-    s[1]  = 0xB0; s[2] = 0x1C; // section length = 28
-    s[3]  = 0x00; s[4] = 0x01;
-    s[5]  = 0xC1; s[6] = 0x00; s[7] = 0x00;
-    s[8]  = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
-    s[9]  = VIDEO_PID & 0xFF;  // PCR PID
-    s[10] = 0xF0; s[11] = 0x00;
-    // Video stream: type 0x42 = AVS
-    s[12] = 0x42;
-    s[13] = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
-    s[14] = VIDEO_PID & 0xFF;
-    s[15] = 0xF0; s[16] = 0x00;
-    // Audio stream: type 0x90 = private (G.711A / PCM_ALAW)
-    // FFmpeg will detect from the PES stream_id 0xC0
-    s[17] = 0x90;
-    s[18] = 0xE0 | ((AUDIO_PID >> 8) & 0x1F);
-    s[19] = AUDIO_PID & 0xFF;
-    s[20] = 0xF0; s[21] = 0x00;
-    return pkt;
-}
-
-function wrapInTS(pid, pesData, isStart) {
-    const packets = [];
-    let pos = 0; let first = isStart;
-
-    while (pos < pesData.length) {
-        const pkt  = Buffer.alloc(TS_PACKET_SIZE, 0xFF);
-        pkt[0] = 0x47;
-        pkt[1] = (first ? 0x40 : 0x00) | ((pid >> 8) & 0x1F);
-        pkt[2] = pid & 0xFF;
-        pkt[3] = 0x10 | (cc[pid] & 0x0F);
-        cc[pid] = (cc[pid] + 1) & 0x0F;
-
-        const room  = TS_PACKET_SIZE - 4;
-        const chunk = pesData.slice(pos, pos + room);
-        chunk.copy(pkt, 4);
-        pos  += chunk.length;
-        first = false;
-        packets.push(pkt);
-    }
-    return packets;
-}
-
-function makePES(streamId, payload) {
-    const hdr = Buffer.from([
-        0x00, 0x00, 0x01,  // start code
-        streamId,          // 0xE0 = video, 0xC0 = audio
-        0x00, 0x00,        // packet_length = 0 (unbounded for video); for audio FFmpeg is fine
-        0x80, 0x00, 0x00,  // flags, no PTS
-    ]);
-    return Buffer.concat([hdr, payload]);
-}
-
-let patPmtSent = false;
-
-function sendToFFmpeg(channel, pid, rawPayload, streamId) {
-    const ch = channels[channel];
-    if (!ch || !ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
-
-    if (!patPmtSent) {
-        ch.ffmpeg.stdin.write(buildPAT());
-        ch.ffmpeg.stdin.write(buildPMT());
-        patPmtSent = true;
-        console.log(`ch${channel} 📺 Sent PAT+PMT (AVS video 0x42 + G.711A audio 0x90)`);
-    }
-
-    const pes     = makePES(streamId, rawPayload);
-    const packets = wrapInTS(pid, pes, true);
-    for (const pkt of packets) ch.ffmpeg.stdin.write(pkt);
-}
+// ── Frame delivery to FFmpeg ─────────────────────────────────────────────────
+// Camera sends raw H.265 annex-B bytestream. FFmpeg -f hevc reads it directly —
+// no MPEG-TS wrapping needed for video. Audio (G.711A, dataType=3) is currently
+// dropped because -f hevc is video-only; audio would need a separate pipe/process.
 
 // ── Handle one complete stream frame ─────────────────────────────────────────
 // dataType per T/98 §5.5.3 Table 19:
@@ -213,11 +107,8 @@ function handleVideoFrame(frameData, channel, dataType) {
     const ch = channels[channel];
     if (!ch) return;
 
-    if (dataType === 3) {
-        // Audio frame — G.711A (stream_id 0xC0 = audio)
-        sendToFFmpeg(channel, AUDIO_PID, frameData, 0xC0);
-        return;
-    }
+    // Skip audio and transparent data for now (separate pipe needed for audio)
+    if (dataType === 3 || dataType === 4) return;
 
     const isVideo = (dataType === 0 || dataType === 1 || dataType === 2);
     if (!isVideo) return;
@@ -226,12 +117,24 @@ function handleVideoFrame(frameData, channel, dataType) {
         ch.gotIFrame = true;
         console.log(`ch${channel} ✅ I_FRAME size:${frameData.length}`);
     } else {
-        if (!ch.gotIFrame) return;
-        console.log(`ch${channel} ${dataType === 1 ? 'P' : 'B'}_FRAME size:${frameData.length}`);
+        if (!ch.gotIFrame) return;  // drop P/B until first keyframe
     }
 
-    // Video — AVS (stream_id 0xE0 = video)
-    sendToFFmpeg(channel, VIDEO_PID, frameData, 0xE0);
+    if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
+
+    // Raw H.265 annex-B: frames must start with 0x00000001 start code
+    // The camera usually includes this, but ensure it's present
+    const hasStartCode = frameData.length >= 4 &&
+        frameData[0] === 0 && frameData[1] === 0 &&
+        (frameData[2] === 1 || (frameData[2] === 0 && frameData[3] === 1));
+
+    if (hasStartCode) {
+        ch.ffmpeg.stdin.write(frameData);
+    } else {
+        // Prepend 4-byte start code
+        const sc = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+        ch.ffmpeg.stdin.write(Buffer.concat([sc, frameData]));
+    }
 }
 
 // ── Reassemble subpackets ─────────────────────────────────────────────────────
@@ -324,15 +227,14 @@ function buildVideoRequest(phone, serverIp, serverPort, channel) {
     return buildFrame(0x9101, body, phone);
 }
 
-// T/98 §5.6.1 Table 21 — query resource list (all channels, no time/alarm filter)
+// T/98 §5.6.1 Table 21 — query resource list
+// Body = 24 bytes: ch(1) + startBCD(6) + endBCD(6) + alarmFlag(8) + avType(1) + streamType(1) + memType(1)
 function buildQueryRecordings(phone) {
-    const body = Buffer.alloc(23);
-    body[0]  = 0;      // channel 0 = all channels
-    // bytes 1-6:  start time BCD all-zero = no filter
-    // bytes 7-12: end time BCD all-zero = no filter
-    // bytes 13-20: alarm logo all-zero = no filter
-    body[21] = 2;      // resource type: 2=Video only
-    body[22] = 0;      // stream type: 0=all
+    const body = Buffer.alloc(24, 0); // all-zero = no filters
+    body[0]  = 1;   // logical channel 1 (not 0=all, some firmware ignores 0)
+    body[21] = 3;   // avType 3 = Video OR Audio+Video (catches everything)
+    body[22] = 0;   // streamType 0 = all streams
+    body[23] = 0;   // memType 0 = all storage
     return buildFrame(0x9205, body, phone);
 }
 
@@ -449,14 +351,29 @@ const tcpServer = net.createServer(socket => {
 
                     const inner     = buffer.slice(offset + 1, end);
                     const unescaped = unescapeBuffer(inner);
-                    if (unescaped.length < 12) { offset = end + 1; continue; }
+                    if (unescaped.length < 13) { offset = end + 1; continue; }
 
-                    const msgId = unescaped.readUInt16BE(0);
-                    phone = unescaped.slice(4, 10)
+                    // ── Checksum validation (XOR of all bytes except checksum itself) ──
+                    // Last byte of unescaped is the checksum
+                    const csReceived = unescaped[unescaped.length - 1];
+                    let csCalc = 0;
+                    for (let ci = 0; ci < unescaped.length - 1; ci++) csCalc ^= unescaped[ci];
+                    if (csCalc !== csReceived) {
+                        // Not a valid JT/T 808 frame — skip this 0x7E and keep scanning
+                        offset++;
+                        continue;
+                    }
+
+                    // Strip checksum byte before parsing
+                    const frame = unescaped.slice(0, -1);
+                    if (frame.length < 12) { offset = end + 1; continue; }
+
+                    const msgId = frame.readUInt16BE(0);
+                    phone = frame.slice(4, 10)
                         .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`)
                         .join('').replace(/^0+/, '');
-                    const seq  = unescaped.readUInt16BE(10);
-                    const body = unescaped.slice(12);
+                    const seq  = frame.readUInt16BE(10);
+                    const body = frame.slice(12);
                     console.log(`[signalling] msgId: 0x${msgId.toString(16).padStart(4,'0')} phone: ${phone}`);
 
                     if (msgId === 0x0100) {
