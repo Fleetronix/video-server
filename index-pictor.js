@@ -47,46 +47,149 @@ http.createServer((req, res) => {
     });
 }).listen(CONFIG.httpPort, () => console.log(`✓ HTTP on :${CONFIG.httpPort}`));
 
-// ── FFmpeg for HLS (H.265/HEVC video + G.711A audio) ─────────────────────────
-// Camera sends raw H.265 bytestream (codec 99 per T/98 Table 12).
-// -f hevc = raw HEVC annex-B input. -c:v copy = no transcode, just remux.
-// HLS with H.265 works in Chrome 107+, Safari 14+, Edge.
+// ── FFmpeg: H.265 → H.264/HLS ────────────────────────────────────────────────
+// Root cause of fast-forward: camera sends H.265 frames with no timestamps.
+// When piped raw as -f hevc, FFmpeg assigns sequential frame numbers as PTS.
+// If the camera bursts 120 frames (= 4s at 30fps) in 0.5s real time, FFmpeg
+// encodes them all instantly and stamps them as 0s..4s — so the browser sees
+// 4 seconds of content arriving in 0.5s and plays it 8x fast to catch up.
+//
+// Fix: We assign wall-clock PTS/DTS ourselves before writing to FFmpeg's pipe.
+// We wrap each frame in a minimal MPEG-TS PES with a real 90kHz PCR/PTS
+// derived from Date.now(). FFmpeg then uses those timestamps directly.
+// Input is -f mpegts (not -f hevc) so it reads our stamped TS packets.
+
+const TS_PKT   = 188;
+const VIDEO_PID = 256;
+const PMT_PID   = 4096;
+const PCR_PID   = VIDEO_PID;
+
+// Continuity counters
+const cc = {};
+function nextCC(pid) { cc[pid] = ((cc[pid] || 0) + 1) & 0x0F; return cc[pid]; }
+
+function writePAT(dst) {
+    const p = Buffer.alloc(TS_PKT, 0xFF);
+    p[0]=0x47; p[1]=0x40; p[2]=0x00; p[3]=0x10|nextCC(0); p[4]=0x00;
+    const s=p.slice(5);
+    s[0]=0x00; s[1]=0xB0; s[2]=0x0D;
+    s[3]=0x00; s[4]=0x01; s[5]=0xC1; s[6]=0x00; s[7]=0x00;
+    s[8]=0x00; s[9]=0x01;
+    s[10]=(PMT_PID>>8)|0xE0; s[11]=PMT_PID&0xFF;
+    dst.write(p);
+}
+
+function writePMT(dst) {
+    const p = Buffer.alloc(TS_PKT, 0xFF);
+    p[0]=0x47; p[1]=0x40|(PMT_PID>>8); p[2]=PMT_PID&0xFF; p[3]=0x10|nextCC(PMT_PID); p[4]=0x00;
+    const s=p.slice(5);
+    s[0]=0x02; s[1]=0xB0; s[2]=0x12;
+    s[3]=0x00; s[4]=0x01; s[5]=0xC1; s[6]=0x00; s[7]=0x00;
+    s[8]=(PCR_PID>>8)|0xE0; s[9]=PCR_PID&0xFF;
+    s[10]=0xF0; s[11]=0x00;
+    // stream type 0x1B = H.264 — we declare H.264 because that's what FFmpeg outputs
+    // (FFmpeg sees our PES, decodes the raw H.265 annex-B payload, re-encodes to H.264)
+    // Actually we declare 0x24 = HEVC so FFmpeg knows what to decode from PES
+    s[12]=0x24; // HEVC stream type
+    s[13]=(VIDEO_PID>>8)|0xE0; s[14]=VIDEO_PID&0xFF;
+    s[15]=0xF0; s[16]=0x00;
+    dst.write(p);
+}
+
+// Write one TS adaptation field packet with PCR
+function writePCR(dst, pcrVal90k) {
+    const p = Buffer.alloc(TS_PKT, 0xFF);
+    p[0]=0x47;
+    p[1]=(VIDEO_PID>>8)&0x1F;
+    p[2]=VIDEO_PID&0xFF;
+    p[3]=0x20|nextCC(VIDEO_PID); // adaptation only, no payload
+    p[4]=183; // adaptation field length = rest of packet
+    p[5]=0x10; // PCR flag set
+    // PCR base (33 bits) + reserved (6 bits) + ext (9 bits)
+    const base = Math.floor(pcrVal90k) & 0x1FFFFFFFF;
+    p[6]  = (base >> 25) & 0xFF;
+    p[7]  = (base >> 17) & 0xFF;
+    p[8]  = (base >>  9) & 0xFF;
+    p[9]  = (base >>  1) & 0xFF;
+    p[10] = ((base & 1) << 7) | 0x7E; // reserved 6 bits = 1, ext high = 0
+    p[11] = 0x00; // ext low byte
+    dst.write(p);
+}
+
+function writePES(dst, payload, pts90k) {
+    // Build PES header with PTS
+    const pts = Math.floor(pts90k) & 0x1FFFFFFFF;
+    const ptsBytes = Buffer.alloc(5);
+    ptsBytes[0] = 0x21 | ((pts >> 29) & 0x0E); // '0010' marker + pts[32:30]
+    ptsBytes[1] = (pts >> 22) & 0xFF;
+    ptsBytes[2] = 0x01 | ((pts >> 14) & 0xFE);
+    ptsBytes[3] = (pts >>  7) & 0xFF;
+    ptsBytes[4] = 0x01 | ((pts <<  1) & 0xFE);
+
+    const hdr = Buffer.from([
+        0x00,0x00,0x01,  // start code
+        0xE0,            // stream_id: video
+        0x00,0x00,       // PES length = 0 (unbounded)
+        0x80,            // flags: PTS present
+        0x80,            // PTS_DTS_flags = PTS only
+        0x05,            // header_data_length = 5
+    ]);
+    const pes = Buffer.concat([hdr, ptsBytes, payload]);
+
+    // Slice into 188-byte TS packets
+    let pos=0; let first=true;
+    while (pos < pes.length) {
+        const p = Buffer.alloc(TS_PKT, 0xFF);
+        p[0]=0x47;
+        p[1]=(first?0x40:0x00)|((VIDEO_PID>>8)&0x1F);
+        p[2]=VIDEO_PID&0xFF;
+        p[3]=0x10|nextCC(VIDEO_PID);
+        const room=TS_PKT-4;
+        pes.slice(pos,pos+room).copy(p,4);
+        pos+=room; first=false;
+        dst.write(p);
+    }
+}
+
+// ── FFmpeg process ────────────────────────────────────────────────────────────
 function startFFmpeg(channel) {
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
-        '-fflags',          '+genpts+discardcorrupt+igndts',
-        '-err_detect',      'ignore_err',
-        '-f',               'hevc',          // raw H.265 annex-B input
-        '-i',               'pipe:0',
-        // hls.js/MSE cannot decode H.265 — transcode to H.264
-        '-vf',              'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-        '-c:v',             'libx264',
-        '-preset',          'ultrafast',
-        '-tune',            'zerolatency',
-        '-profile:v',       'baseline',
-        '-level',           '3.1',
-        '-g',               '60',            // keyframe every 60 frames (~2s at 30fps)
-        '-keyint_min',      '30',
-        '-sc_threshold',    '0',
-        '-force_key_frames','expr:gte(t,n_forced*2)', // force keyframe every 2s
-        '-an',              // no audio in raw hevc pipe (audio needs separate handling)
+        '-fflags',       '+genpts+discardcorrupt',
+        '-err_detect',   'ignore_err',
+        '-f',            'mpegts',      // input: MPEG-TS with real wall-clock PTS we inject
+        '-i',            'pipe:0',
+        // Decode H.265 from PES, transcode to H.264 baseline for hls.js/MSE
+        '-vf',           'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+        '-c:v',          'libx264',
+        '-preset',       'ultrafast',
+        '-tune',         'zerolatency',
+        '-profile:v',    'baseline',
+        '-level',        '3.1',
+        '-g',            '30',
+        '-keyint_min',   '15',
+        '-sc_threshold', '0',
+        '-an',
         // HLS output
-        '-f',               'hls',
-        '-hls_time',        '1',
-        '-hls_list_size',   '3',
-        '-hls_flags',       'delete_segments+append_list',
+        '-f',            'hls',
+        '-hls_time',     '2',
+        '-hls_list_size','5',
+        '-hls_flags',    'delete_segments+append_list+independent_segments',
         '-hls_segment_filename', `./public/ch${channel}_%03d.ts`,
         `./public/ch${channel}.m3u8`,
     ]);
 
     ffmpeg.stderr.on('data', d => {
         const msg = d.toString().trim();
-        if (msg.includes('Error') || msg.includes('Invalid') || msg.includes('error')) {
+        // Only log actual fatal errors, not normal hevc decode noise
+        if (/error|Error|invalid|Invalid/i.test(msg) && !/Could not find ref|frame RPS|undecodable NALU/i.test(msg)) {
             console.error(`FFmpeg ch${channel}:`, msg);
         }
     });
 
     ffmpeg.on('close', code => {
-        console.log(`FFmpeg ch${channel} closed (code ${code}), restarting in 1s...`);
+        console.log(`FFmpeg ch${channel} closed (code=${code}), restarting...`);
+        channels[channel].gotIFrame = false;
+        channels[channel].ptsInit   = null;
         setTimeout(() => { channels[channel].ffmpeg = startFFmpeg(channel); }, 1000);
     });
 
@@ -94,112 +197,91 @@ function startFFmpeg(channel) {
 }
 
 const channels = {
-    1: { ffmpeg: null, gotIFrame: false, subpackets: [] },
+    1: { ffmpeg: null, gotIFrame: false, subpackets: [], subpacketDType: 0, ptsInit: null, patPmtSent: false },
 };
 channels[1].ffmpeg = startFFmpeg(1);
 
-// ── H.265 NAL unit helpers ───────────────────────────────────────────────────
-// Detect whether a reassembled frame contains an IDR/CRA keyframe by inspecting
-// the H.265 NAL unit type. We do NOT trust the T/98 dataType field for this
-// because sub-packet reassembly loses the original first-packet dataType.
-//
-// H.265 NAL unit types (nal_unit_type, bits [9:15] of the 2-byte NAL header):
-//   16-21 = BLA/IDR/CRA (all are random-access / keyframe types)
-//   32    = VPS   33 = SPS   34 = PPS   39 = SEI prefix
-// A keyframe is signalled by nal_unit_type in range [16,21].
-
+// ── H.265 keyframe detection from NAL unit type ───────────────────────────────
+// NAL types 16-21 = BLA/IDR/CRA = keyframe in H.265 spec
 function isH265Keyframe(buf) {
-    // Scan annex-B start codes and check each NAL type
     let i = 0;
     while (i < buf.length - 4) {
-        // Find 0x000001 or 0x00000001
-        let scLen = 0;
-        if (buf[i] === 0 && buf[i+1] === 0 && buf[i+2] === 0 && buf[i+3] === 1) scLen = 4;
-        else if (buf[i] === 0 && buf[i+1] === 0 && buf[i+2] === 1) scLen = 3;
-
-        if (scLen > 0) {
-            const nalHdrOffset = i + scLen;
-            if (nalHdrOffset + 1 < buf.length) {
-                // H.265 NAL header: byte0 = [forbidden(1) | nal_unit_type(6) | layer_id_hi(1)]
-                const nalType = (buf[nalHdrOffset] >> 1) & 0x3F;
-                if (nalType >= 16 && nalType <= 21) return true; // BLA/IDR/CRA
+        let sc = 0;
+        if      (buf[i]===0&&buf[i+1]===0&&buf[i+2]===0&&buf[i+3]===1) sc=4;
+        else if (buf[i]===0&&buf[i+1]===0&&buf[i+2]===1)                sc=3;
+        if (sc > 0) {
+            const o = i+sc;
+            if (o < buf.length) {
+                const nalType = (buf[o] >> 1) & 0x3F;
+                if (nalType >= 16 && nalType <= 21) return true;
+                if (nalType >= 32) { i = o+1; continue; } // parameter set, skip
             }
-            // Jump past this start code to find next
-            i = nalHdrOffset + 1;
-        } else {
-            i++;
-        }
+            i = o+1;
+        } else { i++; }
     }
     return false;
 }
 
-// ── Reassemble subpackets then deliver to FFmpeg ──────────────────────────────
-// dataType per T/98 §5.5.3 Table 19:
-//   0x00=I-frame  0x01=P-frame  0x02=B-frame  0x03=Audio  0x04=Transparent
-//
-// IMPORTANT: dataType is carried on the FIRST sub-packet only. Middle and last
-// sub-packets have dataType from their own header which may differ. So we save
-// the dataType from sub-packet marker=1 (first) and use it for the whole frame.
+// ── Sub-packet reassembly ─────────────────────────────────────────────────────
 function processVideoPacket(rawData, channel, dataType, subpktMarker) {
     const ch = channels[channel];
     if (!ch) return;
 
     if (subpktMarker === 0) {
-        // Atomic packet — complete frame in one piece
         deliverFrame(rawData, channel, dataType);
-
     } else if (subpktMarker === 1) {
-        // First sub-packet — start accumulation, save the dataType
-        ch.subpackets      = [rawData];
-        ch.subpacketDType  = dataType;   // ← save dataType from first packet
-
+        ch.subpackets     = [rawData];
+        ch.subpacketDType = dataType;
     } else if (subpktMarker === 3) {
-        // Middle sub-packet
-        if (ch.subpackets && ch.subpackets.length > 0) ch.subpackets.push(rawData);
-
+        if (ch.subpackets.length > 0) ch.subpackets.push(rawData);
     } else if (subpktMarker === 2) {
-        // Last sub-packet — reassemble and deliver
-        if (ch.subpackets && ch.subpackets.length > 0) {
+        if (ch.subpackets.length > 0) {
             ch.subpackets.push(rawData);
             const complete = Buffer.concat(ch.subpackets);
-            const dtype    = ch.subpacketDType; // use saved first-packet dataType
+            const dtype    = ch.subpacketDType;
             ch.subpackets  = [];
-            ch.subpacketDType = 0;
             deliverFrame(complete, channel, dtype);
         }
     }
 }
 
+// ── Deliver one complete video frame to FFmpeg with wall-clock timestamps ─────
 function deliverFrame(frameData, channel, dataType) {
     const ch = channels[channel];
     if (!ch) return;
+    if (dataType === 3 || dataType === 4) return; // audio / transparent
 
-    // Audio / transparent — skip (no audio pipe)
-    if (dataType === 3 || dataType === 4) return;
-
-    const isVideo = (dataType === 0 || dataType === 1 || dataType === 2);
-    if (!isVideo) return;
-
-    // Detect keyframe from actual H.265 NAL content (don't trust dataType alone
-    // since it can be wrong after sub-packet reassembly)
     const keyframe = (dataType === 0) || isH265Keyframe(frameData);
 
     if (keyframe) {
+        if (!ch.gotIFrame) console.log(`ch${channel} ✅ First keyframe — starting stream`);
         ch.gotIFrame = true;
-        console.log(`ch${channel} ✅ KEYFRAME size:${frameData.length}`);
     } else {
-        if (!ch.gotIFrame) return; // still waiting for first keyframe
+        if (!ch.gotIFrame) return;
     }
 
     if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
 
-    // Ensure annex-B 4-byte start code prefix
-    const hasStartCode = frameData.length >= 4 &&
-        frameData[0] === 0 && frameData[1] === 0 && frameData[2] === 0 && frameData[3] === 1;
+    // Wall-clock PTS in 90kHz units (MPEG-TS standard clock)
+    const nowMs  = Date.now();
+    if (!ch.ptsInit) ch.ptsInit = nowMs;
+    const pts90k = ((nowMs - ch.ptsInit) * 90) & 0x1FFFFFFFF; // 90kHz, wrap at 33 bits
 
-    ch.ffmpeg.stdin.write(hasStartCode ? frameData : Buffer.concat([
-        Buffer.from([0x00, 0x00, 0x00, 0x01]), frameData
-    ]));
+    // Send PAT+PMT once per FFmpeg session
+    if (!ch.patPmtSent) {
+        writePAT(ch.ffmpeg.stdin);
+        writePMT(ch.ffmpeg.stdin);
+        ch.patPmtSent = true;
+    }
+
+    // PCR packet before each keyframe keeps decoder clock in sync
+    if (keyframe) writePCR(ch.ffmpeg.stdin, pts90k);
+
+    // Ensure 4-byte annex-B start code
+    const sc4 = buf => buf[0]===0&&buf[1]===0&&buf[2]===0&&buf[3]===1;
+    const payload = sc4(frameData) ? frameData : Buffer.concat([Buffer.from([0,0,0,1]), frameData]);
+
+    writePES(ch.ffmpeg.stdin, payload, pts90k);
 }
 
 // ── JT/T 808 protocol helpers ─────────────────────────────────────────────────
