@@ -341,7 +341,8 @@ function buildFrame(msgId, body, phone) {
     const header = Buffer.alloc(12);
     header.writeUInt16BE(msgId,       0);
     header.writeUInt16BE(body.length, 2);
-    Buffer.from(phone.match(/.{2}/g).map(h => parseInt(h, 16))).copy(header, 4);
+    const phonePadded = phone.padStart(12, '0'); // BCD phone = 6 bytes = 12 hex digits
+    Buffer.from(phonePadded.match(/.{2}/g).map(h => parseInt(h, 16))).copy(header, 4);
     header.writeUInt16BE(Math.floor(Math.random() * 0xFFFF), 10);
     const payload = Buffer.concat([header, body]);
     let cs = 0; payload.forEach(b => cs ^= b);
@@ -388,7 +389,7 @@ function buildVideoRequest(phone, serverIp, serverPort, channel) {
 // Body = 24 bytes: ch(1) + startBCD(6) + endBCD(6) + alarmFlag(8) + avType(1) + streamType(1) + memType(1)
 function buildQueryRecordings(phone) {
     const body = Buffer.alloc(24, 0); // all-zero = no filters
-    body[0]  = 1;   // logical channel 1 (not 0=all, some firmware ignores 0)
+    body[0]  = 0;   // 0 = all channels (vendor dashboard uses 0, not 1)
     body[21] = 3;   // avType 3 = Video OR Audio+Video (catches everything)
     body[22] = 0;   // streamType 0 = all streams
     body[23] = 0;   // memType 0 = all storage
@@ -477,7 +478,6 @@ const tcpServer = net.createServer(socket => {
 
     socket.on('data', data => {
         try {
-            console.log("DATA RECEIVED:", data.length, "bytes");
             // Log first packet of every connection to diagnose video stream
             if (buffer.length === 0) {
                 console.log(`[TCP] First data from ${remote}: ${data.slice(0,32).toString('hex')} (${data.length} bytes)`);
@@ -486,7 +486,6 @@ const tcpServer = net.createServer(socket => {
             let offset = 0;
 
             while (offset < buffer.length - 4) {
-                console.log(`[TCP] Scanning for packets at offset ${buffer[offset]}...`);
                 // ── Stream data packet (T/98 §5.5.3 — magic 0x30316364 = "01cd") ──
                 if (buffer[offset]   === 0x30 && buffer[offset+1] === 0x31 &&
                     buffer[offset+2] === 0x63 && buffer[offset+3] === 0x64) {
@@ -562,17 +561,14 @@ const tcpServer = net.createServer(socket => {
                         socket.write(buildAck(phone, seq, msgId));
                         if (!socket._recordingsQueried) {
                             socket._recordingsQueried = true;
-                            // Retry up to 3 times with increasing delays
-                            // Device may still be indexing SD card
-                            let attempt = 0;
-                            const queryRecordings = () => {
-                                attempt++;
+                            const query = (attempt) => {
                                 console.log(`[Recordings] Query attempt ${attempt}...`);
                                 socket.write(buildQueryRecordings(phone));
                             };
-                            setTimeout(queryRecordings, 1000);
-                            setTimeout(queryRecordings, 10000);
-                            setTimeout(queryRecordings, 30000);
+                            // Query at 1s, 15s, 60s after first location report
+                            setTimeout(() => query(1), 1000);
+                            setTimeout(() => query(2), 15000);
+                            setTimeout(() => query(3), 60000);
                         }
 
                         const alarmFlags = body.readUInt32BE(0);
