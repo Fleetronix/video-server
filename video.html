@@ -150,10 +150,12 @@
 
     // ── Quality state ─────────────────────────────────────────────
     const STREAMS = { main: '/public/ch1.m3u8', sub: '/public/ch1_sub.m3u8' };
-    let qualityMode   = 'auto';  // 'auto' | 'main' | 'sub'
-    let currentStream = 'main';
-    let hlsInst       = null;
-    let retryTimer    = null;
+    let qualityMode    = 'auto';  // 'auto' | 'main' | 'sub'
+    let currentStream  = 'main';
+    let hlsInst        = null;
+    let retryTimer     = null;
+    let subStreamReady = false;   // set true when server broadcasts streamReady
+    let pendingLowSwitch = false; // user clicked Low before sub was ready
 
     // ── Adaptive thresholds ───────────────────────────────────────
     const SLOW_THRESH_MS    = 2500; // frag load time that counts as "slow"
@@ -194,8 +196,22 @@
     function setQualityMode(mode) {
         qualityMode = mode;
         updateButtons();
-        if (mode !== 'auto') {
-            switchToStream(mode, false);
+        if (mode === 'sub') {
+            if (subStreamReady) {
+                switchToStream('sub', false);
+            } else {
+                // Sub stream not ready yet — queue the switch and tell user
+                pendingLowSwitch = true;
+                setStatus('⏳ Preparing Low quality stream... please wait');
+                qualBadge.textContent = 'Low (preparing)';
+                qualBadge.className   = 'quality-badge low';
+            }
+        } else if (mode === 'main') {
+            pendingLowSwitch = false;
+            switchToStream('main', false);
+        } else {
+            // auto — just update mode, next adaptQuality tick will decide
+            pendingLowSwitch = false;
         }
     }
 
@@ -219,6 +235,10 @@
         const slow = avg > SLOW_THRESH_MS && fragLoadTimes.length >= 3;
 
         if (currentStream === 'main' && (lag > LAG_THRESH_S || slowCount >= DOWNGRADE_TRIGGER)) {
+            if (!subStreamReady) {
+                setStatus('Slow network detected — Low quality not ready yet, hang tight...');
+                return;
+            }
             console.log('Downgrade lag=' + lag.toFixed(1) + 's avg=' + avg.toFixed(0) + 'ms slow=' + slowCount);
             setStatus('Network slow — switching to Low quality...');
             lastUpgradeAt = 0;
@@ -351,6 +371,20 @@
             try {
                 const msg = JSON.parse(e.data);
                 if (msg.type === 'recordings') showRecordings(msg.data);
+                if (msg.type === 'streamReady' && msg.stream === 'sub') {
+                    subStreamReady = true;
+                    console.log('Sub-stream is ready');
+                    if (pendingLowSwitch) {
+                        // User was waiting — switch now
+                        pendingLowSwitch = false;
+                        switchToStream('sub', false);
+                        setStatus('Low quality stream ready');
+                    } else if (qualityMode === 'auto' && currentStream === 'main') {
+                        // Auto mode: if we were already struggling, downgrade now
+                        // (next LEVEL_UPDATED tick will pick this up naturally)
+                        setStatus('Low quality stream ready (auto mode active)');
+                    }
+                }
                 if (msg.type === 'location') {
                     updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
                     document.getElementById('info-lat').textContent        = 'Latitude: '   + msg.lat.toFixed(6) + '\u00b0';

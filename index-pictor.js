@@ -130,8 +130,19 @@ function startFFmpeg(channel, quality = 'main') {
         }
         setTimeout(() => {
             if (channels[channel]) {
-                if (quality === 'main') channels[channel].ffmpeg    = startFFmpeg(channel, 'main');
-                else                   channels[channel].ffmpegSub  = startFFmpeg(channel, 'sub');
+                if (quality === 'main') {
+                    channels[channel].ffmpeg = startFFmpeg(channel, 'main');
+                } else {
+                    channels[channel].ffmpegSub = startFFmpeg(channel, 'sub');
+                    // Re-notify browsers once the m3u8 reappears after restart
+                    const subM3u8 = `./public/ch${channel}_sub.m3u8`;
+                    const pollReady = setInterval(() => {
+                        if (fs.existsSync(subM3u8)) {
+                            clearInterval(pollReady);
+                            wsBroadcast({ type: 'streamReady', stream: 'sub', channel });
+                        }
+                    }, 500);
+                }
             }
         }, 2000);
     });
@@ -149,9 +160,9 @@ const channels = {
         frameQueueSub: [], drainingQueeSub: false, frameTimerSub: null,
     },
 };
-channels[1].ffmpeg    = startFFmpeg(1, 'main');
-channels[1].ffmpegSub = startFFmpeg(1, 'sub');
-console.log('✓ Dual FFmpeg streams started: main + sub (low-quality)');
+channels[1].ffmpeg = startFFmpeg(1, 'main');
+// Sub FFmpeg starts only after first main keyframe so it has real data immediately
+console.log('✓ Main FFmpeg started; sub-stream will start on first keyframe');
 
 // ── H.265 keyframe detection ──────────────────────────────────────────────────
 // NAL unit types 16-21 = BLA_W_LP / BLA_W_RADL / BLA_N_LP / IDR_W_RADL /
@@ -281,8 +292,22 @@ function deliverFrame(frameData, channel, dataType) {
     }
 
     // ── Sub stream (same raw H.265 → separate lower-res FFmpeg encoder) ───────
+    // Start sub FFmpeg on the first main keyframe (lazy start ensures it gets real data)
+    if (keyframe && !ch.ffmpegSub) {
+        console.log(`ch${channel} Starting sub-stream FFmpeg (first keyframe received)`);
+        ch.ffmpegSub = startFFmpeg(channel, 'sub');
+        // Watch for the m3u8 file to appear, then notify browsers
+        const subM3u8 = `./public/ch${channel}_sub.m3u8`;
+        const pollReady = setInterval(() => {
+            if (fs.existsSync(subM3u8)) {
+                clearInterval(pollReady);
+                console.log(`ch${channel} sub-stream m3u8 ready — notifying browsers`);
+                wsBroadcast({ type: 'streamReady', stream: 'sub', channel });
+            }
+        }, 500);
+    }
     if (keyframe) {
-        if (!ch.gotIFrameSub) console.log(`ch${channel} ✅ First keyframe — sub-stream starting`);
+        if (!ch.gotIFrameSub) console.log(`ch${channel} ✅ First keyframe — feeding sub-stream`);
         ch.gotIFrameSub = true;
     }
     if (ch.gotIFrameSub && ch.ffmpegSub && ch.ffmpegSub.stdin.writable) {
