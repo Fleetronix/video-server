@@ -48,176 +48,79 @@ http.createServer((req, res) => {
 }).listen(CONFIG.httpPort, () => console.log(`✓ HTTP on :${CONFIG.httpPort}`));
 
 // ── FFmpeg: H.265 → H.264/HLS ────────────────────────────────────────────────
-// Root cause of fast-forward: camera sends H.265 frames with no timestamps.
-// When piped raw as -f hevc, FFmpeg assigns sequential frame numbers as PTS.
-// If the camera bursts 120 frames (= 4s at 30fps) in 0.5s real time, FFmpeg
-// encodes them all instantly and stamps them as 0s..4s — so the browser sees
-// 4 seconds of content arriving in 0.5s and plays it 8x fast to catch up.
-//
-// Fix: We assign wall-clock PTS/DTS ourselves before writing to FFmpeg's pipe.
-// We wrap each frame in a minimal MPEG-TS PES with a real 90kHz PCR/PTS
-// derived from Date.now(). FFmpeg then uses those timestamps directly.
-// Input is -f mpegts (not -f hevc) so it reads our stamped TS packets.
+// The camera sends H.265 frames with NO timestamps — just raw annex-B bytes.
+// We use -f hevc (raw H.265 input) with -use_wallclock_as_timestamps 1 which
+// makes FFmpeg stamp each frame at the moment it reads it from stdin.
+// To prevent burst playback we rate-limit writes to stdin using a token bucket:
+// we only write a frame if enough real time has passed for that frame to be "due".
 
-const TS_PKT   = 188;
-const VIDEO_PID = 256;
-const PMT_PID   = 4096;
-const PCR_PID   = VIDEO_PID;
-
-// Continuity counters
-const cc = {};
-function nextCC(pid) { cc[pid] = ((cc[pid] || 0) + 1) & 0x0F; return cc[pid]; }
-
-function writePAT(dst) {
-    const p = Buffer.alloc(TS_PKT, 0xFF);
-    p[0]=0x47; p[1]=0x40; p[2]=0x00; p[3]=0x10|nextCC(0); p[4]=0x00;
-    const s=p.slice(5);
-    s[0]=0x00; s[1]=0xB0; s[2]=0x0D;
-    s[3]=0x00; s[4]=0x01; s[5]=0xC1; s[6]=0x00; s[7]=0x00;
-    s[8]=0x00; s[9]=0x01;
-    s[10]=(PMT_PID>>8)|0xE0; s[11]=PMT_PID&0xFF;
-    dst.write(p);
-}
-
-function writePMT(dst) {
-    const p = Buffer.alloc(TS_PKT, 0xFF);
-    p[0]=0x47; p[1]=0x40|(PMT_PID>>8); p[2]=PMT_PID&0xFF; p[3]=0x10|nextCC(PMT_PID); p[4]=0x00;
-    const s=p.slice(5);
-    s[0]=0x02; s[1]=0xB0; s[2]=0x12;
-    s[3]=0x00; s[4]=0x01; s[5]=0xC1; s[6]=0x00; s[7]=0x00;
-    s[8]=(PCR_PID>>8)|0xE0; s[9]=PCR_PID&0xFF;
-    s[10]=0xF0; s[11]=0x00;
-    // stream type 0x1B = H.264 — we declare H.264 because that's what FFmpeg outputs
-    // (FFmpeg sees our PES, decodes the raw H.265 annex-B payload, re-encodes to H.264)
-    // Actually we declare 0x24 = HEVC so FFmpeg knows what to decode from PES
-    s[12]=0x24; // HEVC stream type
-    s[13]=(VIDEO_PID>>8)|0xE0; s[14]=VIDEO_PID&0xFF;
-    s[15]=0xF0; s[16]=0x00;
-    dst.write(p);
-}
-
-// Write one TS adaptation field packet with PCR
-function writePCR(dst, pcrVal90k) {
-    const p = Buffer.alloc(TS_PKT, 0xFF);
-    p[0]=0x47;
-    p[1]=(VIDEO_PID>>8)&0x1F;
-    p[2]=VIDEO_PID&0xFF;
-    p[3]=0x20|nextCC(VIDEO_PID); // adaptation only, no payload
-    p[4]=183; // adaptation field length = rest of packet
-    p[5]=0x10; // PCR flag set
-    // PCR base (33 bits) + reserved (6 bits) + ext (9 bits)
-    const base = Math.floor(pcrVal90k) & 0x1FFFFFFFF;
-    p[6]  = (base >> 25) & 0xFF;
-    p[7]  = (base >> 17) & 0xFF;
-    p[8]  = (base >>  9) & 0xFF;
-    p[9]  = (base >>  1) & 0xFF;
-    p[10] = ((base & 1) << 7) | 0x7E; // reserved 6 bits = 1, ext high = 0
-    p[11] = 0x00; // ext low byte
-    dst.write(p);
-}
-
-function writePES(dst, payload, pts90k) {
-    // Build PES header with PTS
-    const pts = Math.floor(pts90k) & 0x1FFFFFFFF;
-    const ptsBytes = Buffer.alloc(5);
-    ptsBytes[0] = 0x21 | ((pts >> 29) & 0x0E); // '0010' marker + pts[32:30]
-    ptsBytes[1] = (pts >> 22) & 0xFF;
-    ptsBytes[2] = 0x01 | ((pts >> 14) & 0xFE);
-    ptsBytes[3] = (pts >>  7) & 0xFF;
-    ptsBytes[4] = 0x01 | ((pts <<  1) & 0xFE);
-
-    const hdr = Buffer.from([
-        0x00,0x00,0x01,  // start code
-        0xE0,            // stream_id: video
-        0x00,0x00,       // PES length = 0 (unbounded)
-        0x80,            // flags: PTS present
-        0x80,            // PTS_DTS_flags = PTS only
-        0x05,            // header_data_length = 5
-    ]);
-    const pes = Buffer.concat([hdr, ptsBytes, payload]);
-
-    // Slice into 188-byte TS packets
-    let pos=0; let first=true;
-    while (pos < pes.length) {
-        const p = Buffer.alloc(TS_PKT, 0xFF);
-        p[0]=0x47;
-        p[1]=(first?0x40:0x00)|((VIDEO_PID>>8)&0x1F);
-        p[2]=VIDEO_PID&0xFF;
-        p[3]=0x10|nextCC(VIDEO_PID);
-        const room=TS_PKT-4;
-        pes.slice(pos,pos+room).copy(p,4);
-        pos+=room; first=false;
-        dst.write(p);
-    }
-}
-
-// ── FFmpeg process ────────────────────────────────────────────────────────────
 function startFFmpeg(channel) {
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
-        '-fflags',       '+genpts+discardcorrupt',
-        '-err_detect',   'ignore_err',
-        '-f',            'mpegts',      // input: MPEG-TS with real wall-clock PTS we inject
-        '-i',            'pipe:0',
-        // Decode H.265 from PES, transcode to H.264 baseline for hls.js/MSE
-        '-vf',           'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-        '-c:v',          'libx264',
-        '-preset',       'ultrafast',
-        '-tune',         'zerolatency',
-        '-profile:v',    'baseline',
-        '-level',        '3.1',
-        '-g',            '30',
-        '-keyint_min',   '15',
-        '-sc_threshold', '0',
+        '-fflags',          '+genpts+discardcorrupt+igndts',
+        '-err_detect',      'ignore_err',
+        '-use_wallclock_as_timestamps', '1',
+        '-f',               'hevc',
+        '-i',               'pipe:0',
+        '-vf',              'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+        '-c:v',             'libx264',
+        '-preset',          'ultrafast',
+        '-tune',            'zerolatency',
+        '-profile:v',       'baseline',
+        '-level',           '3.1',
+        '-g',               '25',
+        '-keyint_min',      '25',
+        '-sc_threshold',    '0',
         '-an',
-        // HLS output
-        '-f',            'hls',
-        '-hls_time',     '2',
-        '-hls_list_size','5',
-        '-hls_flags',    'delete_segments+append_list+independent_segments',
-        '-hls_segment_filename', `./public/ch${channel}_%03d.ts`,
+        '-f',               'hls',
+        '-hls_time',        '1',
+        '-hls_list_size',   '6',
+        '-hls_flags',       'delete_segments+append_list+independent_segments',
+        '-hls_segment_type','mpegts',
+        '-hls_segment_filename', `./public/ch${channel}_%05d.ts`,
         `./public/ch${channel}.m3u8`,
     ]);
 
     ffmpeg.stderr.on('data', d => {
         const msg = d.toString().trim();
-        // Only log actual fatal errors, not normal hevc decode noise
-        if (/error|Error|invalid|Invalid/i.test(msg) && !/Could not find ref|frame RPS|undecodable NALU/i.test(msg)) {
-            console.error(`FFmpeg ch${channel}:`, msg);
+        if (/error|invalid/i.test(msg) && !/ref with POC|frame RPS|undecodable NALU/i.test(msg)) {
+            console.error(`FFmpeg ch${channel}: ${msg}`);
         }
     });
 
     ffmpeg.on('close', code => {
-        console.log(`FFmpeg ch${channel} closed (code=${code}), restarting...`);
-        channels[channel].gotIFrame = false;
-        channels[channel].ptsInit   = null;
-        setTimeout(() => { channels[channel].ffmpeg = startFFmpeg(channel); }, 1000);
+        console.log(`FFmpeg ch${channel} exited (${code}), restarting in 2s...`);
+        const ch = channels[channel];
+        if (ch) { ch.gotIFrame = false; ch.frameTimer = null; }
+        setTimeout(() => {
+            if (channels[channel]) channels[channel].ffmpeg = startFFmpeg(channel);
+        }, 2000);
     });
 
     return ffmpeg;
 }
 
 const channels = {
-    1: { ffmpeg: null, gotIFrame: false, subpackets: [], subpacketDType: 0, ptsInit: null, patPmtSent: false },
+    1: { ffmpeg: null, gotIFrame: false, subpackets: [], subpacketDType: 0,
+         frameTimer: null, frameQueue: [], draining: false },
 };
 channels[1].ffmpeg = startFFmpeg(1);
 
-// ── H.265 keyframe detection from NAL unit type ───────────────────────────────
-// NAL types 16-21 = BLA/IDR/CRA = keyframe in H.265 spec
+// ── H.265 keyframe detection ──────────────────────────────────────────────────
+// NAL unit types 16-21 = BLA_W_LP / BLA_W_RADL / BLA_N_LP / IDR_W_RADL /
+//                        IDR_N_LP / CRA_NUT — all are keyframes in H.265
 function isH265Keyframe(buf) {
-    let i = 0;
-    while (i < buf.length - 4) {
+    for (let i = 0; i < buf.length - 4; i++) {
         let sc = 0;
-        if      (buf[i]===0&&buf[i+1]===0&&buf[i+2]===0&&buf[i+3]===1) sc=4;
-        else if (buf[i]===0&&buf[i+1]===0&&buf[i+2]===1)                sc=3;
+        if (buf[i]===0 && buf[i+1]===0 && buf[i+2]===0 && buf[i+3]===1) sc = 4;
+        else if (buf[i]===0 && buf[i+1]===0 && buf[i+2]===1) sc = 3;
         if (sc > 0) {
-            const o = i+sc;
+            const o = i + sc;
             if (o < buf.length) {
-                const nalType = (buf[o] >> 1) & 0x3F;
-                if (nalType >= 16 && nalType <= 21) return true;
-                if (nalType >= 32) { i = o+1; continue; } // parameter set, skip
+                const t = (buf[o] >> 1) & 0x3F;
+                if (t >= 16 && t <= 21) return true;
             }
-            i = o+1;
-        } else { i++; }
+            i = i + sc; // skip past start code
+        }
     }
     return false;
 }
@@ -237,15 +140,51 @@ function processVideoPacket(rawData, channel, dataType, subpktMarker) {
     } else if (subpktMarker === 2) {
         if (ch.subpackets.length > 0) {
             ch.subpackets.push(rawData);
-            const complete = Buffer.concat(ch.subpackets);
-            const dtype    = ch.subpacketDType;
-            ch.subpackets  = [];
-            deliverFrame(complete, channel, dtype);
+            const frame = Buffer.concat(ch.subpackets);
+            const dtype = ch.subpacketDType;
+            ch.subpackets = [];
+            deliverFrame(frame, channel, dtype);
         }
     }
 }
 
-// ── Deliver one complete video frame to FFmpeg with wall-clock timestamps ─────
+// ── Rate-limited frame delivery ───────────────────────────────────────────────
+// The camera bursts many frames at once. Without rate-limiting, FFmpeg gets
+// all frames instantly, encodes them all, and stamps them with future PTS —
+// causing the browser to see "2 minutes of video" that plays in fast-forward.
+//
+// Fix: use a token-bucket queue. Frames are queued and released at TARGET_FPS.
+// This makes FFmpeg receive frames at real-time rate regardless of camera bursts.
+
+const TARGET_FPS    = 25;                       // release one frame every this many ms
+const FRAME_INTERVAL_MS = 1000 / TARGET_FPS;   // = 40ms per frame
+
+function scheduleQueue(ch) {
+    if (ch.draining || ch.frameQueue.length === 0) return;
+    ch.draining = true;
+
+    function drainOne() {
+        if (ch.frameQueue.length === 0) { ch.draining = false; return; }
+
+        const frame = ch.frameQueue.shift();
+        if (ch.ffmpeg && ch.ffmpeg.stdin.writable) {
+            ch.ffmpeg.stdin.write(frame);
+        }
+
+        // If queue is building up (>2s worth), drop oldest non-keyframe to catch up
+        const maxQueue = TARGET_FPS * 2;
+        while (ch.frameQueue.length > maxQueue) {
+            const dropped = ch.frameQueue.shift();
+            // Only drop if not a keyframe (keyframes start with 0 0 0 1 + IDR NAL)
+            if (isH265Keyframe(dropped)) { ch.frameQueue.unshift(dropped); break; }
+        }
+
+        ch.frameTimer = setTimeout(drainOne, FRAME_INTERVAL_MS);
+    }
+
+    drainOne();
+}
+
 function deliverFrame(frameData, channel, dataType) {
     const ch = channels[channel];
     if (!ch) return;
@@ -254,34 +193,21 @@ function deliverFrame(frameData, channel, dataType) {
     const keyframe = (dataType === 0) || isH265Keyframe(frameData);
 
     if (keyframe) {
-        if (!ch.gotIFrame) console.log(`ch${channel} ✅ First keyframe — starting stream`);
+        if (!ch.gotIFrame) console.log(`ch${channel} ✅ First keyframe — stream starting`);
         ch.gotIFrame = true;
     } else {
-        if (!ch.gotIFrame) return;
+        if (!ch.gotIFrame) return; // wait for first keyframe
     }
 
     if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
 
-    // Wall-clock PTS in 90kHz units (MPEG-TS standard clock)
-    const nowMs  = Date.now();
-    if (!ch.ptsInit) ch.ptsInit = nowMs;
-    const pts90k = ((nowMs - ch.ptsInit) * 90) & 0x1FFFFFFFF; // 90kHz, wrap at 33 bits
+    // Ensure 4-byte annex-B start code prefix
+    const frame = (frameData[0]===0 && frameData[1]===0 && frameData[2]===0 && frameData[3]===1)
+        ? frameData
+        : Buffer.concat([Buffer.from([0,0,0,1]), frameData]);
 
-    // Send PAT+PMT once per FFmpeg session
-    if (!ch.patPmtSent) {
-        writePAT(ch.ffmpeg.stdin);
-        writePMT(ch.ffmpeg.stdin);
-        ch.patPmtSent = true;
-    }
-
-    // PCR packet before each keyframe keeps decoder clock in sync
-    if (keyframe) writePCR(ch.ffmpeg.stdin, pts90k);
-
-    // Ensure 4-byte annex-B start code
-    const sc4 = buf => buf[0]===0&&buf[1]===0&&buf[2]===0&&buf[3]===1;
-    const payload = sc4(frameData) ? frameData : Buffer.concat([Buffer.from([0,0,0,1]), frameData]);
-
-    writePES(ch.ffmpeg.stdin, payload, pts90k);
+    ch.frameQueue.push(frame);
+    scheduleQueue(ch);
 }
 
 // ── JT/T 808 protocol helpers ─────────────────────────────────────────────────
