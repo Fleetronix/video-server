@@ -163,6 +163,8 @@
     let retryTimer     = null;
     let subStreamReady = false;   // set true when server broadcasts streamReady
     let pendingLowSwitch = false; // user clicked Low before sub was ready
+    let lastManifestFingerprint = '';
+    let watchdogBusy = false;
 
     // ── Adaptive thresholds ───────────────────────────────────────
     const SLOW_THRESH_MS    = 2500; // frag load time that counts as "slow"
@@ -185,6 +187,24 @@
     }
 
     function setStatus(msg) { statusMsg.textContent = msg; }
+
+    function cacheBusted(src, key) {
+        return src + (src.includes('?') ? '&' : '?') + key + '=' + Date.now();
+    }
+
+    function fingerprintManifest(text) {
+        const seq = (text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/) || [,''])[1];
+        const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+        const segs = lines.filter(l => !l.startsWith('#') && l.endsWith('.ts'));
+        return [seq, segs.slice(-3).join('|'), text.includes('#EXT-X-ENDLIST') ? 'ended' : 'live'].join('|');
+    }
+
+    function fingerprintDetails(details) {
+        if (!details) return '';
+        const frags = details.fragments || [];
+        const last = frags.slice(-3).map(f => f.relurl || f.url || f.sn).join('|');
+        return [details.mediaSequence || '', details.endSN || '', last, details.live === false ? 'ended' : 'live'].join('|');
+    }
 
     function updateBadge(stream, isAuto) {
         qualBadge.textContent = stream === 'main'
@@ -269,7 +289,7 @@
 
         if (!Hls.isSupported()) {
             if (video.canPlayType('application/vnd.apple.mpegurl')) {
-                video.src = src;
+                video.src = cacheBusted(src, 'native');
                 video.play().catch(() => overlay.classList.add('visible'));
             } else { setStatus('HLS not supported'); }
             return;
@@ -279,7 +299,7 @@
             liveSyncDurationCount:          1,
             liveMaxLatencyDurationCount:    3,
             liveBackBufferLength:           2,
-            maxBufferLength:                4,
+            maxBufferLength:                5,
             maxMaxBufferLength:             8,
             backBufferLength:               2,
             liveDurationInfinity:           true,
@@ -292,7 +312,8 @@
             fragLoadingMaxRetry:            6,
         });
         hlsInst = hls;
-        hls.loadSource(src);
+        lastLevelUpdate = Date.now();
+        hls.loadSource(cacheBusted(src, 'hls'));
         hls.attachMedia(video);
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -316,6 +337,8 @@
         // Live edge + adaptive trigger
         hls.on(Hls.Events.LEVEL_UPDATED, (_, data) => {
             lastLevelUpdate = Date.now();
+            const fp = fingerprintDetails(data.details);
+            if (fp) lastManifestFingerprint = fp;
             const liveSyncPos = hls.liveSyncPosition;
             if (liveSyncPos !== null && video.currentTime < liveSyncPos - 5)
                 video.currentTime = liveSyncPos;
@@ -367,14 +390,31 @@
     video.addEventListener('ended',   () => nudgeToLiveEdge('ended'));
 
     // Watchdog: if HLS.js hasn't fired LEVEL_UPDATED in >8s, force a reload.
-    setInterval(() => {
+    setInterval(async () => {
         if (!hlsInst) return;
         const idle = Date.now() - lastLevelUpdate;
-        if (idle > 8000) {
-            console.warn('[watchdog] no LEVEL_UPDATED for', idle, 'ms — restarting HLS');
-            setStatus('Stream paused — reconnecting...');
+        if (idle > 8000 && !watchdogBusy) {
+            watchdogBusy = true;
+            let playlistChanged = true;
+            try {
+                const r = await fetch(cacheBusted(STREAMS[currentStream], 'probe'), { cache: 'no-store' });
+                const fp = fingerprintManifest(await r.text());
+                playlistChanged = !!fp && fp !== lastManifestFingerprint;
+                lastManifestFingerprint = fp || lastManifestFingerprint;
+            } catch (_) {}
+
+            if (!playlistChanged) {
+                console.warn('[watchdog] playlist is not changing — waiting for new camera/server segments');
+                setStatus('Waiting for new video segments from camera/server...');
+                watchdogBusy = false;
+                return;
+            }
+
+            console.warn('[watchdog] no LEVEL_UPDATED for', idle, 'ms — restarting HLS with fresh manifest');
+            setStatus('Stream paused — reconnecting with fresh manifest...');
             startHLS(STREAMS[currentStream]);
             lastLevelUpdate = Date.now();
+            watchdogBusy = false;
         }
     }, 5000);
 

@@ -97,13 +97,20 @@ http.createServer((req, res) => {
 // ── FFmpeg quality profiles ───────────────────────────────────────────────────
 // 'main' = full resolution main stream
 // 'sub'  = scaled-down low-bitrate sub-stream for slow networks
+// Real T98 cameras typically push 12-18 fps in bursts. 20 fps gives headroom
+// without leaving the queue empty for long stretches.
+const TARGET_FPS        = 20;
+const FRAME_INTERVAL_MS = 1000 / TARGET_FPS;
+const QUEUE_MAX_FACTOR  = 4; // allow up to 4s of buffered frames before dropping
+const FFMPEG_GOP        = String(TARGET_FPS); // one encoder keyframe per ~1s
+
 const FFMPEG_PROFILES = {
     main: {
         extraArgs: [
             '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
             '-profile:v', 'baseline', '-level', '3.1',
-            '-g', '25', '-keyint_min', '25', '-sc_threshold', '0',
+            '-g', FFMPEG_GOP, '-keyint_min', FFMPEG_GOP, '-sc_threshold', '0',
         ],
         suffix: '',       // ch1.m3u8
     },
@@ -113,16 +120,30 @@ const FFMPEG_PROFILES = {
             '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
             '-profile:v', 'baseline', '-level', '3.0',
             '-b:v', '400k', '-maxrate', '500k', '-bufsize', '800k',
-            '-g', '25', '-keyint_min', '25', '-sc_threshold', '0',
+            '-g', FFMPEG_GOP, '-keyint_min', FFMPEG_GOP, '-sc_threshold', '0',
         ],
         suffix: '_sub',   // ch1_sub.m3u8
     },
 };
 
+function cleanupHlsFiles(channel, suffix = '') {
+    const tsRe = new RegExp(`^ch${channel}${suffix}_\\d+\\.ts$`);
+    const m3u8 = `ch${channel}${suffix}.m3u8`;
+    try {
+        for (const f of fs.readdirSync('./public')) {
+            if (f === m3u8 || tsRe.test(f)) fs.unlinkSync(path.join('./public', f));
+        }
+    } catch (e) {
+        console.warn(`[HLS] cleanup failed for ch${channel}${suffix}: ${e.message}`);
+    }
+}
+
 function startFFmpeg(channel, quality = 'main') {
     const profile = FFMPEG_PROFILES[quality] || FFMPEG_PROFILES.main;
     const seg     = `./public/ch${channel}${profile.suffix}_%05d.ts`;
     const m3u8    = `./public/ch${channel}${profile.suffix}.m3u8`;
+
+    cleanupHlsFiles(channel, profile.suffix);
 
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
         '-fflags',          '+genpts+discardcorrupt+igndts',
@@ -136,7 +157,8 @@ function startFFmpeg(channel, quality = 'main') {
         '-hls_time',        '1',
         '-hls_list_size',   '10',
         '-hls_init_time',   '1',
-        '-hls_flags',       'delete_segments+append_list+independent_segments',
+        '-hls_delete_threshold', '3',
+        '-hls_flags',       'delete_segments+independent_segments+omit_endlist',
         '-hls_segment_type','mpegts',
         '-hls_segment_filename', seg,
         m3u8,
@@ -184,10 +206,10 @@ const channels = {
     1: {
         // Main stream
         ffmpeg: null, gotIFrame: false, subpackets: [], subpacketDType: 0,
-        frameTimer: null, frameQueue: [], draining: false,
+        frameTimer: null, frameQueue: [], draining: false, lastVideoPacketAt: 0,
         // Sub stream (shares same incoming frames, separate encoder)
         ffmpegSub: null, gotIFrameSub: false,
-        frameQueueSub: [], drainingQueeSub: false, frameTimerSub: null,
+        frameQueueSub: [], drainingSub: false, frameTimerSub: null,
     },
 };
 channels[1].ffmpeg = startFFmpeg(1, 'main');
@@ -244,12 +266,6 @@ function processVideoPacket(rawData, channel, dataType, subpktMarker) {
 //
 // Fix: use a token-bucket queue. Frames are queued and released at TARGET_FPS.
 // This makes FFmpeg receive frames at real-time rate regardless of camera bursts.
-
-// Real T98 cameras typically push 12-18 fps in bursts. 20 fps gives headroom
-// without leaving the queue empty for long stretches.
-const TARGET_FPS    = 20;                       // release one frame every this many ms
-const FRAME_INTERVAL_MS = 1000 / TARGET_FPS;   // = 50ms per frame
-const QUEUE_MAX_FACTOR  = 4;                   // allow up to 4s of buffered frames before dropping
 
 function scheduleQueue(ch) {
     if (ch.draining || ch.frameQueue.length === 0) return;
@@ -308,6 +324,8 @@ function deliverFrame(frameData, channel, dataType) {
     const ch = channels[channel];
     if (!ch) return;
     if (dataType === 3 || dataType === 4) return; // audio / transparent
+
+    ch.lastVideoPacketAt = Date.now();
 
     const keyframe = (dataType === 0) || isH265Keyframe(frameData);
 
