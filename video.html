@@ -19,6 +19,22 @@
             border-radius: 4px; font-size: 11px; margin-left: 8px;
             vertical-align: middle;
         }
+        .quality-badge {
+            padding: 2px 8px; border-radius: 4px; font-size: 11px;
+            margin-left: 6px; vertical-align: middle; font-weight: bold;
+            transition: background 0.4s;
+        }
+        .quality-badge.hd  { background: #00c853; color: #000; }
+        .quality-badge.low { background: #ff6d00; color: #fff; }
+        .quality-controls {
+            margin: 6px 0; display: flex; align-items: center; gap: 10px;
+        }
+        .q-btn {
+            background: #222; color: #aaa; border: 1px solid #444;
+            padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;
+        }
+        .q-btn.active { background: #00d4ff; color: #000; border-color: #00d4ff; font-weight: bold; }
+        .q-btn:hover:not(.active) { background: #333; }
         /* Click-to-play overlay — shown when autoplay is blocked */
         #playOverlay {
             display: none; position: absolute; inset: 0;
@@ -63,7 +79,9 @@
 <body>
 
   <!-- Live Video -->
-  <h3>Channel 1 — Front Camera <span class="live-badge">LIVE</span></h3>
+  <h3>Channel 1 — Front Camera <span class="live-badge">LIVE</span>
+      <span id="qualityBadge" class="quality-badge hd">HD</span>
+  </h3>
   <div class="video-wrap">
     <video id="ch1" muted playsinline controls></video>
     <div id="playOverlay">
@@ -73,7 +91,15 @@
       <p>Click to start live stream</p>
     </div>
   </div>
-  <div id="statusMsg">⏳ Connecting to stream...</div>
+  <div class="quality-controls">
+    <div id="statusMsg">⏳ Connecting to stream...</div>
+    <div style="margin-left:auto;display:flex;align-items:center;gap:6px;">
+      <span style="font-size:12px;color:#888;">Quality:</span>
+      <button class="q-btn active" id="btnAuto" onclick="setQualityMode('auto')">&#x1F504; Auto</button>
+      <button class="q-btn"        id="btnHD"   onclick="setQualityMode('main')">&#x1F535; HD</button>
+      <button class="q-btn"        id="btnLow"  onclick="setQualityMode('sub')">&#x1F7E0; Low</button>
+    </div>
+  </div>
 
   <!-- Map -->
   <h3>Vehicle Location</h3>
@@ -111,169 +137,241 @@
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // ── HLS player ────────────────────────────────────────────────────────────
-    const video      = document.getElementById('ch1');
-    const overlay    = document.getElementById('playOverlay');
-    const statusMsg  = document.getElementById('statusMsg');
-    let   hlsInst    = null;
-    let   retryTimer = null;
+    // ============================================================
+    //  Adaptive Quality HLS Player
+    //  Monitors frag load time + HLS lag -> auto-switches between
+    //  ch1.m3u8 (HD main) and ch1_sub.m3u8 (Low sub-stream)
+    //  Manual override via HD / Low / Auto buttons
+    // ============================================================
+    const video     = document.getElementById('ch1');
+    const overlay   = document.getElementById('playOverlay');
+    const statusMsg = document.getElementById('statusMsg');
+    const qualBadge = document.getElementById('qualityBadge');
+
+    // ── Quality state ─────────────────────────────────────────────
+    const STREAMS = { main: '/public/ch1.m3u8', sub: '/public/ch1_sub.m3u8' };
+    let qualityMode   = 'auto';  // 'auto' | 'main' | 'sub'
+    let currentStream = 'main';
+    let hlsInst       = null;
+    let retryTimer    = null;
+
+    // ── Adaptive thresholds ───────────────────────────────────────
+    const SLOW_THRESH_MS    = 2500; // frag load time that counts as "slow"
+    const LAG_THRESH_S      = 8;    // seconds behind live edge
+    const DOWNGRADE_TRIGGER = 3;    // consecutive slow frags before downgrade
+    const UPGRADE_COOLDOWN  = 30000;// ms to wait before retrying HD
+
+    let fragLoadTimes = [];  // recent frag durations (ring buffer, max 5)
+    let slowCount     = 0;   // consecutive slow fragments
+    let lastUpgradeAt = 0;
+
+    function recordFragLoad(ms) {
+        fragLoadTimes.push(ms);
+        if (fragLoadTimes.length > 5) fragLoadTimes.shift();
+    }
+    function avgFragLoad() {
+        return fragLoadTimes.length
+            ? fragLoadTimes.reduce((a,b)=>a+b,0)/fragLoadTimes.length : 0;
+    }
 
     function setStatus(msg) { statusMsg.textContent = msg; }
 
-    function startHLS() {
+    function updateBadge(stream, isAuto) {
+        qualBadge.textContent = stream === 'main'
+            ? (isAuto ? 'HD (Auto)' : 'HD')
+            : (isAuto ? 'Low (Auto)' : 'Low');
+        qualBadge.className = 'quality-badge ' + (stream === 'main' ? 'hd' : 'low');
+    }
+
+    function updateButtons() {
+        ['auto','main','sub'].forEach(m => {
+            const el = document.getElementById('btn' + {auto:'Auto',main:'HD',sub:'Low'}[m]);
+            if (el) el.classList.toggle('active', qualityMode === m);
+        });
+    }
+
+    // ── Manual quality selector ───────────────────────────────────
+    function setQualityMode(mode) {
+        qualityMode = mode;
+        updateButtons();
+        if (mode !== 'auto') {
+            switchToStream(mode, false);
+        }
+    }
+
+    // ── Stream switcher ───────────────────────────────────────────
+    function switchToStream(target, isAuto) {
+        if (target === currentStream) return;
+        console.log('Quality switch:', currentStream, '->', target, '(auto=' + isAuto + ')');
+        currentStream = target;
+        updateBadge(target, isAuto);
+        startHLS(STREAMS[target]);
+        if (ws && ws.readyState === 1)
+            ws.send(JSON.stringify({ type: 'setQuality', quality: target, auto: isAuto }));
+    }
+
+    // ── Adaptive decision ─────────────────────────────────────────
+    function adaptQuality(hlsObj) {
+        if (qualityMode !== 'auto') return;
+        const liveSyncPos = hlsObj.liveSyncPosition;
+        const lag  = liveSyncPos ? Math.max(0, liveSyncPos - video.currentTime) : 0;
+        const avg  = avgFragLoad();
+        const slow = avg > SLOW_THRESH_MS && fragLoadTimes.length >= 3;
+
+        if (currentStream === 'main' && (lag > LAG_THRESH_S || slowCount >= DOWNGRADE_TRIGGER)) {
+            console.log('Downgrade lag=' + lag.toFixed(1) + 's avg=' + avg.toFixed(0) + 'ms slow=' + slowCount);
+            setStatus('Network slow — switching to Low quality...');
+            lastUpgradeAt = 0;
+            switchToStream('sub', true);
+        } else if (currentStream === 'sub' && !slow && lag < LAG_THRESH_S / 2) {
+            const now = Date.now();
+            if (now - lastUpgradeAt > UPGRADE_COOLDOWN) {
+                console.log('Upgrade: network recovered');
+                setStatus('Network recovered — switching back to HD...');
+                lastUpgradeAt = now;
+                switchToStream('main', true);
+            }
+        }
+    }
+
+    // ── HLS core ─────────────────────────────────────────────────
+    function startHLS(src) {
         if (hlsInst) { hlsInst.destroy(); hlsInst = null; }
+        clearTimeout(retryTimer);
 
         if (!Hls.isSupported()) {
-            // Safari — native HLS
             if (video.canPlayType('application/vnd.apple.mpegurl')) {
-                video.src = '/public/ch1.m3u8';
+                video.src = src;
                 video.play().catch(() => overlay.classList.add('visible'));
-            } else {
-                setStatus('❌ HLS not supported in this browser');
-            }
+            } else { setStatus('HLS not supported'); }
             return;
         }
 
         const hls = new Hls({
-            // ── Minimal buffer — stay as close to live as possible ──
-            liveSyncDurationCount:          1,   // stay 1 segment behind live
-            liveMaxLatencyDurationCount:    3,   // if >3 segs behind, jump to live edge
-            liveBackBufferLength:           2,   // only keep 2s back buffer
-            maxBufferLength:               4,   // max 4s forward buffer
-            maxMaxBufferLength:            8,
-            backBufferLength:              2,
-            liveDurationInfinity:          true,
-            // Speed up playback rate to catch live edge when behind
-            // (instead of fast-forwarding a big buffer)
-            nudgeMaxRetry:                 5,
-            nudgeOffset:                   0.2,
-            // Retry manifest while stream is starting
-            manifestLoadingMaxRetry:       30,
-            manifestLoadingRetryDelay:     1000,
-            manifestLoadingMaxRetryTimeout:3000,
-            levelLoadingMaxRetry:          10,
-            fragLoadingMaxRetry:           6,
+            liveSyncDurationCount:          1,
+            liveMaxLatencyDurationCount:    3,
+            liveBackBufferLength:           2,
+            maxBufferLength:                4,
+            maxMaxBufferLength:             8,
+            backBufferLength:               2,
+            liveDurationInfinity:           true,
+            nudgeMaxRetry:                  5,
+            nudgeOffset:                    0.2,
+            manifestLoadingMaxRetry:        30,
+            manifestLoadingRetryDelay:      1000,
+            manifestLoadingMaxRetryTimeout: 3000,
+            levelLoadingMaxRetry:           10,
+            fragLoadingMaxRetry:            6,
         });
         hlsInst = hls;
-
-        hls.loadSource('/public/ch1.m3u8');
+        hls.loadSource(src);
         hls.attachMedia(video);
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            setStatus('▶ Stream ready');
+            setStatus('Stream ready');
             video.play().catch(() => {
-                // Autoplay blocked — show click overlay
                 overlay.classList.add('visible');
-                setStatus('👆 Click the video to start');
+                setStatus('Click to start');
             });
         });
 
-        hls.on(Hls.Events.FRAG_LOADED, () => {
+        // Track fragment load time
+        let fragStart = 0;
+        hls.on(Hls.Events.FRAG_LOADING, () => { fragStart = Date.now(); });
+        hls.on(Hls.Events.FRAG_LOADED,  () => {
             overlay.classList.remove('visible');
+            const dur = Date.now() - fragStart;
+            recordFragLoad(dur);
+            slowCount = dur > SLOW_THRESH_MS ? slowCount + 1 : Math.max(0, slowCount - 1);
         });
 
-        // ── Live edge enforcement ──────────────────────────────────────────
-        // If the player falls more than 10s behind live, snap to live edge.
-        // This prevents the "2 minutes of fast-forward" catchup behaviour.
+        // Live edge + adaptive trigger
         hls.on(Hls.Events.LEVEL_UPDATED, (_, data) => {
             const liveSyncPos = hls.liveSyncPosition;
-            if (liveSyncPos !== null && video.currentTime < liveSyncPos - 5) {
-                console.log(`Snapping to live edge (was ${(liveSyncPos - video.currentTime).toFixed(1)}s behind)`);
+            if (liveSyncPos !== null && video.currentTime < liveSyncPos - 5)
                 video.currentTime = liveSyncPos;
-            }
             const behind = liveSyncPos ? (liveSyncPos - video.currentTime).toFixed(1) : '?';
-            setStatus(`🟢 Live  (${behind}s behind)`);
+            const qLabel = currentStream === 'main' ? 'HD' : 'Low';
+            setStatus('Live [' + qLabel + '] (' + behind + 's behind)  avg:' + avgFragLoad().toFixed(0) + 'ms');
+            adaptQuality(hls);
         });
 
         hls.on(Hls.Events.ERROR, (event, data) => {
             if (data.fatal) {
                 if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                    setStatus('⏳ Waiting for stream...');
-                    // Stream not ready yet — retry in 3s
-                    clearTimeout(retryTimer);
-                    retryTimer = setTimeout(startHLS, 3000);
+                    setStatus('Waiting for stream...');
+                    retryTimer = setTimeout(() => startHLS(STREAMS[currentStream]), 3000);
                 } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                    setStatus('⚠ Media error — recovering...');
+                    setStatus('Media error - recovering...');
                     hls.recoverMediaError();
                 } else {
-                    setStatus('❌ Fatal error — restarting...');
-                    clearTimeout(retryTimer);
-                    retryTimer = setTimeout(startHLS, 5000);
+                    setStatus('Fatal error - restarting...');
+                    retryTimer = setTimeout(() => startHLS(STREAMS[currentStream]), 5000);
                 }
             }
         });
     }
 
-    // Click-to-play overlay handler
-    overlay.addEventListener('click', () => {
-        overlay.classList.remove('visible');
-        video.play();
-    });
+    overlay.addEventListener('click', () => { overlay.classList.remove('visible'); video.play(); });
+    updateBadge('main', true);
+    updateButtons();
+    startHLS(STREAMS.main);
 
-    startHLS();
-
-    // ── Leaflet Map ───────────────────────────────────────────────────────────
+    // ── Leaflet Map ───────────────────────────────────────────────
     const map = L.map('map').setView([20, 78], 5);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '© OpenStreetMap contributors'
+        attribution: '\u00a9 OpenStreetMap contributors'
     }).addTo(map);
 
     const vehicleIcon = L.divIcon({
-        html: `<div style="background:#00d4ff;width:18px;height:18px;border-radius:50%;
-               border:3px solid #fff;box-shadow:0 0 8px #00d4ff;"></div>`,
+        html: '<div style="background:#00d4ff;width:18px;height:18px;border-radius:50%;border:3px solid #fff;box-shadow:0 0 8px #00d4ff;"></div>',
         iconSize: [18,18], iconAnchor: [9,9], className: ''
     });
-
     let marker = null, polyline = null, trail = [];
 
     function updateMap(lat, lon, speed, dir) {
         const pos = [lat, lon];
-        if (!marker) {
-            marker = L.marker(pos, { icon: vehicleIcon }).addTo(map);
-            map.setView(pos, 15);
-        } else {
-            marker.setLatLng(pos);
-            map.panTo(pos);
-        }
-        marker.bindPopup(`<b>Vehicle</b><br>Lat: ${lat.toFixed(6)}<br>Lon: ${lon.toFixed(6)}<br>Speed: ${speed} km/h<br>Dir: ${dir}°`);
+        if (!marker) { marker = L.marker(pos, { icon: vehicleIcon }).addTo(map); map.setView(pos, 15); }
+        else         { marker.setLatLng(pos); map.panTo(pos); }
+        marker.bindPopup('<b>Vehicle</b><br>Lat: '+lat.toFixed(6)+'<br>Lon: '+lon.toFixed(6)+'<br>Speed: '+speed+' km/h<br>Dir: '+dir+'\u00b0');
         trail.push(pos);
         if (trail.length > 100) trail.shift();
         if (polyline) map.removeLayer(polyline);
         polyline = L.polyline(trail, { color: '#00d4ff', weight: 2 }).addTo(map);
     }
 
-    // ── WebSocket ─────────────────────────────────────────────────────────────
+    // ── WebSocket ─────────────────────────────────────────────────
+    let ws = null;
     function connectWS() {
-        const ws = new WebSocket(`ws://${location.hostname}:8801`);
+        ws = new WebSocket('ws://' + location.hostname + ':8801');
         ws.onopen  = () => console.log('WS connected');
         ws.onerror = () => {};
-        ws.onclose = () => setTimeout(connectWS, 3000); // auto-reconnect
-
+        ws.onclose = () => { ws = null; setTimeout(connectWS, 3000); };
         ws.onmessage = e => {
             try {
                 const msg = JSON.parse(e.data);
                 if (msg.type === 'recordings') showRecordings(msg.data);
                 if (msg.type === 'location') {
                     updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
-                    document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}°`;
-                    document.getElementById('info-lon').textContent        = `Longitude: ${msg.lon.toFixed(6)}°`;
-                    document.getElementById('info-speed').textContent      = `Speed: ${msg.speed} km/h`;
-                    document.getElementById('info-dir').textContent        = `Direction: ${msg.direction}°`;
-                    document.getElementById('info-elev').textContent       = `Elevation: ${msg.elevation} m`;
-                    document.getElementById('info-dt').textContent         = `DateTime: ${msg.datetime}`;
-                    document.getElementById('info-acc').textContent        = `ACC: ${msg.accOn  ? '🟢 ON' : '🔴 OFF'}`;
-                    document.getElementById('info-located').textContent    = `Located: ${msg.located ? '✅ Yes' : '❌ No'}`;
-                    document.getElementById('info-mileage').textContent    = `Mileage: ${msg.mileage || '--'}`;
-                    document.getElementById('info-voltage').textContent    = `Voltage: ${msg.voltage || '--'}`;
-                    document.getElementById('info-satellites').textContent = `Satellites: ${msg.satellites || '--'}`;
-                    document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms && msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
+                    document.getElementById('info-lat').textContent        = 'Latitude: '   + msg.lat.toFixed(6) + '\u00b0';
+                    document.getElementById('info-lon').textContent        = 'Longitude: '  + msg.lon.toFixed(6) + '\u00b0';
+                    document.getElementById('info-speed').textContent      = 'Speed: '      + msg.speed + ' km/h';
+                    document.getElementById('info-dir').textContent        = 'Direction: '  + msg.direction + '\u00b0';
+                    document.getElementById('info-elev').textContent       = 'Elevation: '  + msg.elevation + ' m';
+                    document.getElementById('info-dt').textContent         = 'DateTime: '   + msg.datetime;
+                    document.getElementById('info-acc').textContent        = 'ACC: '        + (msg.accOn   ? '\ud83d\udfe2 ON'  : '\ud83d\udd34 OFF');
+                    document.getElementById('info-located').textContent    = 'Located: '    + (msg.located ? '\u2705 Yes' : '\u274c No');
+                    document.getElementById('info-mileage').textContent    = 'Mileage: '    + (msg.mileage    || '--');
+                    document.getElementById('info-voltage').textContent    = 'Voltage: '    + (msg.voltage    || '--');
+                    document.getElementById('info-satellites').textContent = 'Satellites: ' + (msg.satellites || '--');
+                    document.getElementById('info-alarms').textContent     = 'Alarms: '     + (msg.alarms && msg.alarms.length ? msg.alarms.join(', ') : 'None');
                 }
             } catch (_) {}
         };
     }
     connectWS();
 
-    // ── Recordings ────────────────────────────────────────────────────────────
+    // ── Recordings ────────────────────────────────────────────────
     const avTypeLabel = t => (['AV','Audio','Video','AV/Video'][t] || '?');
 
     function showRecordings(list) {
@@ -282,41 +380,29 @@
             tbody.innerHTML = '<tr><td colspan="7" id="noRec" style="color:#666;font-style:italic">No recordings on device</td></tr>';
             return;
         }
-
-        // Group by date
         const grouped = {};
         list.forEach((r, i) => {
             const date = r.startTime.split(' ')[0];
             if (!grouped[date]) grouped[date] = [];
             grouped[date].push({ ...r, index: i });
         });
-
         let html = '';
         Object.keys(grouped).sort().reverse().forEach(date => {
-            html += `<tr><td colspan="7" style="background:#1a2a3a;color:#00d4ff;font-weight:bold;padding:8px 10px;">📅 ${date}</td></tr>`;
+            html += '<tr><td colspan="7" style="background:#1a2a3a;color:#00d4ff;font-weight:bold;padding:8px 10px;">\ud83d\udcc5 ' + date + '</td></tr>';
             grouped[date].forEach(r => {
                 const start = r.startTime.split(' ')[1];
                 const end   = r.endTime.split(' ')[1];
                 const kb    = r.size > 0 ? (r.size / 1024).toFixed(0) + ' KB' : '--';
-                html += `<tr>
-                    <td>CH${r.ch}</td>
-                    <td>${r.startTime.split(' ')[0]}</td>
-                    <td>${start}</td>
-                    <td>${end}</td>
-                    <td>${kb}</td>
-                    <td>${avTypeLabel(r.avType)}</td>
-                    <td><button class="btn" onclick="playRecording(${r.index})">▶ Play</button></td>
-                </tr>`;
+                html += '<tr><td>CH' + r.ch + '</td><td>' + r.startTime.split(' ')[0] + '</td><td>' + start + '</td><td>' + end + '</td><td>' + kb + '</td><td>' + avTypeLabel(r.avType) + '</td><td><button class="btn" onclick="playRecording(' + r.index + ')">\u25b6 Play</button></td></tr>';
             });
         });
-
         tbody.innerHTML = html;
         window._recordings = list;
     }
 
     function playRecording(index) {
         const rec = window._recordings[index];
-        alert(`Playback for CH${rec.ch} ${rec.startTime} → ${rec.endTime}\n(Playback stream not yet implemented)`);
+        alert('Playback for CH' + rec.ch + ' ' + rec.startTime + ' \u2192 ' + rec.endTime + '\n(Playback stream not yet implemented)');
     }
   </script>
 </body>

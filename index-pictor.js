@@ -28,6 +28,19 @@ function wsBroadcast(obj) {
     wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
 }
 
+// Handle browser → server messages (e.g. manual quality override)
+wss.on('connection', ws => {
+    ws.on('message', raw => {
+        try {
+            const msg = JSON.parse(raw);
+            if (msg.type === 'setQuality') {
+                console.log(`[WS] Browser switched to quality: ${msg.quality} (auto=${!!msg.auto})`);
+                wsBroadcast({ type: 'qualityChanged', quality: msg.quality, auto: !!msg.auto });
+            }
+        } catch (_) {}
+    });
+});
+
 // ── HTTP server ───────────────────────────────────────────────────────────────
 http.createServer((req, res) => {
     const filePath = req.url === '/' ? './video.html' : `.${req.url}`;
@@ -54,45 +67,72 @@ http.createServer((req, res) => {
 // To prevent burst playback we rate-limit writes to stdin using a token bucket:
 // we only write a frame if enough real time has passed for that frame to be "due".
 
-function startFFmpeg(channel) {
+// ── FFmpeg quality profiles ───────────────────────────────────────────────────
+// 'main' = full resolution main stream
+// 'sub'  = scaled-down low-bitrate sub-stream for slow networks
+const FFMPEG_PROFILES = {
+    main: {
+        extraArgs: [
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+            '-profile:v', 'baseline', '-level', '3.1',
+            '-g', '25', '-keyint_min', '25', '-sc_threshold', '0',
+        ],
+        suffix: '',       // ch1.m3u8
+    },
+    sub: {
+        extraArgs: [
+            '-vf', 'scale=480:trunc(ow/a/2)*2',   // ~360p width-constrained
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+            '-profile:v', 'baseline', '-level', '3.0',
+            '-b:v', '400k', '-maxrate', '500k', '-bufsize', '800k',
+            '-g', '25', '-keyint_min', '25', '-sc_threshold', '0',
+        ],
+        suffix: '_sub',   // ch1_sub.m3u8
+    },
+};
+
+function startFFmpeg(channel, quality = 'main') {
+    const profile = FFMPEG_PROFILES[quality] || FFMPEG_PROFILES.main;
+    const seg     = `./public/ch${channel}${profile.suffix}_%05d.ts`;
+    const m3u8    = `./public/ch${channel}${profile.suffix}.m3u8`;
+
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
         '-fflags',          '+genpts+discardcorrupt+igndts',
         '-err_detect',      'ignore_err',
         '-use_wallclock_as_timestamps', '1',
         '-f',               'hevc',
         '-i',               'pipe:0',
-        '-vf',              'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-        '-c:v',             'libx264',
-        '-preset',          'ultrafast',
-        '-tune',            'zerolatency',
-        '-profile:v',       'baseline',
-        '-level',           '3.1',
-        '-g',               '25',
-        '-keyint_min',      '25',
-        '-sc_threshold',    '0',
+        ...profile.extraArgs,
         '-an',
         '-f',               'hls',
         '-hls_time',        '1',
         '-hls_list_size',   '6',
         '-hls_flags',       'delete_segments+append_list+independent_segments',
         '-hls_segment_type','mpegts',
-        '-hls_segment_filename', `./public/ch${channel}_%05d.ts`,
-        `./public/ch${channel}.m3u8`,
+        '-hls_segment_filename', seg,
+        m3u8,
     ]);
 
     ffmpeg.stderr.on('data', d => {
         const msg = d.toString().trim();
         if (/error|invalid/i.test(msg) && !/ref with POC|frame RPS|undecodable NALU/i.test(msg)) {
-            console.error(`FFmpeg ch${channel}: ${msg}`);
+            console.error(`FFmpeg ch${channel}[${quality}]: ${msg}`);
         }
     });
 
     ffmpeg.on('close', code => {
-        console.log(`FFmpeg ch${channel} exited (${code}), restarting in 2s...`);
+        console.log(`FFmpeg ch${channel}[${quality}] exited (${code}), restarting in 2s...`);
         const ch = channels[channel];
-        if (ch) { ch.gotIFrame = false; ch.frameTimer = null; }
+        if (ch) {
+            if (quality === 'main') { ch.gotIFrame = false; ch.frameTimer = null; }
+            else                   { ch.gotIFrameSub = false; ch.frameTimerSub = null; }
+        }
         setTimeout(() => {
-            if (channels[channel]) channels[channel].ffmpeg = startFFmpeg(channel);
+            if (channels[channel]) {
+                if (quality === 'main') channels[channel].ffmpeg    = startFFmpeg(channel, 'main');
+                else                   channels[channel].ffmpegSub  = startFFmpeg(channel, 'sub');
+            }
         }, 2000);
     });
 
@@ -100,10 +140,18 @@ function startFFmpeg(channel) {
 }
 
 const channels = {
-    1: { ffmpeg: null, gotIFrame: false, subpackets: [], subpacketDType: 0,
-         frameTimer: null, frameQueue: [], draining: false },
+    1: {
+        // Main stream
+        ffmpeg: null, gotIFrame: false, subpackets: [], subpacketDType: 0,
+        frameTimer: null, frameQueue: [], draining: false,
+        // Sub stream (shares same incoming frames, separate encoder)
+        ffmpegSub: null, gotIFrameSub: false,
+        frameQueueSub: [], drainingQueeSub: false, frameTimerSub: null,
+    },
 };
-channels[1].ffmpeg = startFFmpeg(1);
+channels[1].ffmpeg    = startFFmpeg(1, 'main');
+channels[1].ffmpegSub = startFFmpeg(1, 'sub');
+console.log('✓ Dual FFmpeg streams started: main + sub (low-quality)');
 
 // ── H.265 keyframe detection ──────────────────────────────────────────────────
 // NAL unit types 16-21 = BLA_W_LP / BLA_W_RADL / BLA_N_LP / IDR_W_RADL /
@@ -185,6 +233,31 @@ function scheduleQueue(ch) {
     drainOne();
 }
 
+// Same drain logic for the sub-stream encoder
+function scheduleQueueSub(ch) {
+    if (ch.drainingSub || ch.frameQueueSub.length === 0) return;
+    ch.drainingSub = true;
+
+    function drainOne() {
+        if (ch.frameQueueSub.length === 0) { ch.drainingSub = false; return; }
+
+        const frame = ch.frameQueueSub.shift();
+        if (ch.ffmpegSub && ch.ffmpegSub.stdin.writable) {
+            ch.ffmpegSub.stdin.write(frame);
+        }
+
+        const maxQueue = TARGET_FPS * 2;
+        while (ch.frameQueueSub.length > maxQueue) {
+            const dropped = ch.frameQueueSub.shift();
+            if (isH265Keyframe(dropped)) { ch.frameQueueSub.unshift(dropped); break; }
+        }
+
+        ch.frameTimerSub = setTimeout(drainOne, FRAME_INTERVAL_MS);
+    }
+
+    drainOne();
+}
+
 function deliverFrame(frameData, channel, dataType) {
     const ch = channels[channel];
     if (!ch) return;
@@ -192,22 +265,30 @@ function deliverFrame(frameData, channel, dataType) {
 
     const keyframe = (dataType === 0) || isH265Keyframe(frameData);
 
-    if (keyframe) {
-        if (!ch.gotIFrame) console.log(`ch${channel} ✅ First keyframe — stream starting`);
-        ch.gotIFrame = true;
-    } else {
-        if (!ch.gotIFrame) return; // wait for first keyframe
-    }
-
-    if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
-
-    // Ensure 4-byte annex-B start code prefix
+    // Ensure 4-byte annex-B start code prefix (shared for both streams)
     const frame = (frameData[0]===0 && frameData[1]===0 && frameData[2]===0 && frameData[3]===1)
         ? frameData
         : Buffer.concat([Buffer.from([0,0,0,1]), frameData]);
 
-    ch.frameQueue.push(frame);
-    scheduleQueue(ch);
+    // ── Main stream ───────────────────────────────────────────────────────────
+    if (keyframe) {
+        if (!ch.gotIFrame) console.log(`ch${channel} ✅ First keyframe — main stream starting`);
+        ch.gotIFrame = true;
+    }
+    if (ch.gotIFrame && ch.ffmpeg && ch.ffmpeg.stdin.writable) {
+        ch.frameQueue.push(frame);
+        scheduleQueue(ch);
+    }
+
+    // ── Sub stream (same raw H.265 → separate lower-res FFmpeg encoder) ───────
+    if (keyframe) {
+        if (!ch.gotIFrameSub) console.log(`ch${channel} ✅ First keyframe — sub-stream starting`);
+        ch.gotIFrameSub = true;
+    }
+    if (ch.gotIFrameSub && ch.ffmpegSub && ch.ffmpegSub.stdin.writable) {
+        ch.frameQueueSub.push(frame);
+        scheduleQueueSub(ch);
+    }
 }
 
 // ── JT/T 808 protocol helpers ─────────────────────────────────────────────────
