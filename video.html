@@ -144,6 +144,19 @@
   <!-- Recordings -->
   <div class="recordings">
     <h3>📹 Saved Recordings</h3>
+
+    <div style="margin-bottom:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label style="color:#aaa; font-size:13px;">From:</label>
+      <input type="date" id="searchFrom" style="background:#222; color:#fff; border:1px solid #444;
+             padding:6px 10px; border-radius:4px; font-size:13px;" />
+      <label style="color:#aaa; font-size:13px;">To:</label>
+      <input type="date" id="searchTo" style="background:#222; color:#fff; border:1px solid #444;
+             padding:6px 10px; border-radius:4px; font-size:13px;" />
+      <button class="btn" onclick="fetchRecordings()">🔍 Search</button>
+      <button class="btn" style="background:#444; color:#fff;" onclick="clearSearch()">✖ Clear</button>
+      <span id="searchStatus" style="color:#888; font-size:12px;"></span>
+    </div>
+
     <table>
       <thead>
         <tr>
@@ -242,44 +255,98 @@
     ws.onopen  = () => console.log('WS connected');
     ws.onerror = e => console.error('WS error', e);
 
-    ws.onmessage = e => {
-        try {
-            const msg = JSON.parse(e.data);
-
-            if (msg.type === 'recordings') {
-                showRecordings(msg.data);
-            }
-
-            if (msg.type === 'location') {
-                // Update map
-                updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
-
-                // Update info boxes
-                document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}`;
-                document.getElementById('info-lon').textContent        = `Longitude: ${msg.lon.toFixed(6)}`;
-                document.getElementById('info-speed').textContent      = `Speed: ${msg.speed} km/h`;
-                document.getElementById('info-dir').textContent        = `Direction: ${msg.direction}°`;
-                document.getElementById('info-elev').textContent       = `Elevation: ${msg.elevation} m`;
-                document.getElementById('info-dt').textContent         = `DateTime: ${msg.datetime}`;
-                document.getElementById('info-acc').textContent        = `ACC: ${msg.accOn ? 'ON' : 'OFF'}`;
-                document.getElementById('info-located').textContent    = `Located: ${msg.located ? 'Yes' : 'No'}`;
-                document.getElementById('info-mileage').textContent    = `Mileage: ${msg.mileage || '--'}`;
-                document.getElementById('info-voltage').textContent    = `Voltage: ${msg.voltage || '--'}`;
-                document.getElementById('info-satellites').textContent = `Satellites: ${msg.satellites || '--'}`;
-                document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
-            }
-
-        } catch (_) {}
+    // ── WebSocket receive ─────────────────────────────────────────────────────
+    ws.onopen  = () => {
+        console.log('[WS] Connected to server');
+        // Auto-fetch today on connect
+        const today = new Date().toISOString().split('T')[0];
+        document.getElementById('searchFrom').value = today;
+        document.getElementById('searchTo').value   = today;
+        fetchRecordings();
     };
 
-    // ── Recordings ────────────────────────────────────────────────────────
+    ws.onclose = () => console.warn('[WS] Disconnected');
+    ws.onerror = e  => console.error('[WS] Error:', e);
+
+    ws.onmessage = e => {
+        let msg;
+        try { msg = JSON.parse(e.data); }
+        catch(err) { console.error('[WS] Bad JSON:', e.data); return; }
+
+        console.log('[WS] Received type:', msg.type);
+
+        if (msg.type === 'location') {
+            updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
+            document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}`;
+            document.getElementById('info-lon').textContent        = `Longitude: ${msg.lon.toFixed(6)}`;
+            document.getElementById('info-speed').textContent      = `Speed: ${msg.speed} km/h`;
+            document.getElementById('info-dir').textContent        = `Direction: ${msg.direction}°`;
+            document.getElementById('info-elev').textContent       = `Elevation: ${msg.elevation} m`;
+            document.getElementById('info-dt').textContent         = `DateTime: ${msg.datetime}`;
+            document.getElementById('info-acc').textContent        = `ACC: ${msg.accOn ? 'ON' : 'OFF'}`;
+            document.getElementById('info-located').textContent    = `Located: ${msg.located ? 'Yes' : 'No'}`;
+            document.getElementById('info-mileage').textContent    = `Mileage: ${msg.mileage || '--'}`;
+            document.getElementById('info-voltage').textContent    = `Voltage: ${msg.voltage || '--'}`;
+            document.getElementById('info-satellites').textContent = `Satellites: ${msg.satellites || '--'}`;
+            document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
+        }
+
+        if (msg.type === 'recordings') {
+            console.log('[WS] recordings received, count:', msg.data ? msg.data.length : 0);
+            showRecordings(msg.data);
+        }
+
+        if (msg.type === 'playback_url') {
+            console.log('[WS] playback_url:', msg.url);
+            startPlayback(msg.url);
+        }
+
+        if (msg.type === 'playback_error') {
+            console.warn('[WS] playback_error:', msg.message);
+            document.getElementById('searchStatus').textContent = '❌ ' + msg.message;
+        }
+    };
+// ── Recordings: request from server ──────────────────────────────────────
+    function fetchRecordings() {
+        const from   = document.getElementById('searchFrom').value;
+        const to     = document.getElementById('searchTo').value;
+        const status = document.getElementById('searchStatus');
+        console.log('[Rec] fetchRecordings() from:', from, 'to:', to, 'ws.readyState:', ws.readyState);
+
+        if (ws.readyState !== WebSocket.OPEN) {
+            console.warn('[Rec] WS not open, state:', ws.readyState);
+            status.textContent = '❌ Not connected';
+            return;
+        }
+        const payload = { type: 'query_recordings', startDate: from || null, endDate: to || null };
+        console.log('[Rec] Sending:', JSON.stringify(payload));
+        ws.send(JSON.stringify(payload));
+        status.textContent = '⏳ Loading...';
+    }
+
+    function clearSearch() {
+        document.getElementById('searchFrom').value = '';
+        document.getElementById('searchTo').value   = '';
+        document.getElementById('searchStatus').textContent = '';
+        console.log('[Rec] clearSearch — fetching all');
+        fetchRecordings();
+    }
+
     function showRecordings(list) {
-        const tbody = document.getElementById('recordingList');
+        console.log('[Rec] showRecordings() count:', list ? list.length : 0);
+        const tbody  = document.getElementById('recordingList');
+        const status = document.getElementById('searchStatus');
+
         if (!list || list.length === 0) {
             tbody.innerHTML = '<tr><td colspan="5" style="color:#666">No recordings found</td></tr>';
+            if (status) status.textContent = '⚠️ No recordings found';
             return;
         }
 
+        if (status) status.textContent = `✅ ${list.length} recording(s)`;
+        window._recordings = list;
+
+        // Group by date
         const grouped = {};
         list.forEach((r, i) => {
             const date = r.startTime.split(' ')[0];
@@ -289,46 +356,76 @@
 
         let html = '';
         Object.keys(grouped).sort().reverse().forEach(date => {
-            html += `<tr><td colspan="5" style="background:#222; color:#00d4ff; 
+            html += `<tr><td colspan="5" style="background:#222; color:#00d4ff;
                 font-weight:bold; padding:10px;">📅 ${date}</td></tr>`;
             grouped[date].forEach(r => {
-                const startHHMM = r.startTime.split(' ')[1];
-                const endHHMM   = r.endTime.split(' ')[1];
+                const startT = r.startTime.split(' ')[1] || '--';
+                const endT   = r.endTime   ? r.endTime.split(' ')[1] : '--';
                 html += `
                     <tr>
                         <td>CH${r.ch}</td>
-                        <td>${startHHMM}</td>
-                        <td>${endHHMM}</td>
+                        <td>${startT}</td>
+                        <td>${endT}</td>
                         <td>${(r.size / 1024).toFixed(1)} KB</td>
                         <td>
-                            <button class="btn" onclick="playRecording(${r.index})">
-                                ▶ Play
-                            </button>
+                            <button class="btn" onclick="playRecording(${r.index})">▶ Play</button>
                         </td>
                     </tr>`;
             });
         });
-
         tbody.innerHTML = html;
-        window._recordings = list;
+        console.log('[Rec] Table rendered, groups:', Object.keys(grouped));
     }
 
-    // ── Playback ──────────────────────────────────────────────────────────
+    // ── Playback ──────────────────────────────────────────────────────────────
     function playRecording(index) {
-        const rec = window._recordings[index];
-        ws.send(JSON.stringify({
-            type:      'playback_request',
-            channel:   rec.ch,
-            startTime: rec.startTime,
-            endTime:   rec.endTime,
-        }));
+        const rec = window._recordings && window._recordings[index];
+        if (!rec) { console.error('[Play] No recording at index', index); return; }
 
-        document.getElementById('playbackSection').style.display = 'block';
+        console.log('[Play] playRecording() index:', index, 'rec:', JSON.stringify(rec));
+
+        if (ws.readyState !== WebSocket.OPEN) {
+            console.warn('[Play] WS not open');
+            return;
+        }
+
+        const payload = { type: 'playback_request', channel: rec.ch, startTime: rec.startTime, endTime: rec.endTime };
+        console.log('[Play] Sending playback_request:', JSON.stringify(payload));
+        ws.send(JSON.stringify(payload));
+        document.getElementById('searchStatus').textContent = '⏳ Loading playback...';
+    }
+
+    function startPlayback(url) {
+        console.log('[Play] startPlayback() url:', url);
+        const section = document.getElementById('playbackSection');
+        section.style.display = 'block';
+        section.scrollIntoView({ behavior: 'smooth' });
+
         const video = document.getElementById('playback');
-        const hls   = new Hls();
-        hls.loadSource(`/public/ch${rec.ch}.m3u8`);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+
+        if (window._playbackHls) {
+            console.log('[Play] Destroying previous HLS instance');
+            window._playbackHls.destroy();
+            window._playbackHls = null;
+        }
+
+        if (Hls.isSupported()) {
+            const hls = new Hls();
+            window._playbackHls = hls;
+            hls.on(Hls.Events.ERROR,           (e, d) => console.error('[Play][HLS] Error:', d.type, d.details));
+            hls.on(Hls.Events.MANIFEST_PARSED, ()     => {
+                console.log('[Play][HLS] Manifest parsed, playing');
+                video.play().catch(err => console.warn('[Play] play() blocked:', err));
+            });
+            hls.loadSource(url);
+            hls.attachMedia(video);
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            // Safari native HLS
+            video.src = url;
+            video.play().catch(err => console.warn('[Play] Safari play() blocked:', err));
+        } else {
+            console.error('[Play] HLS not supported in this browser');
+        }
     }
   </script>
 </body>
