@@ -7,52 +7,37 @@ const path = require('path');
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
 const { spawn } = require('child_process');
-const { env } = require('process');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CONFIG = {
     tcpPort:  3007,
     httpPort: 8080,
     wsPort:   8801,
-    serverIp: process.env.SERVER_IP
+    serverIp: process.env.SERVER_IP,
 };
 console.log(`Server IP: ${CONFIG.serverIp}`);
-// ── Create output folder ──────────────────────────────────────────────────────
+
 if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 
 // ── WebSocket server ──────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ port: CONFIG.wsPort });
 console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
 
-// ── HTTP server (serves video.html) ──────────────────────────────────────────
+function wsBroadcast(obj) {
+    const msg = JSON.stringify(obj);
+    wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
+}
+
+// ── HTTP server ───────────────────────────────────────────────────────────────
 http.createServer((req, res) => {
-    let filePath;
-    
-    if (req.url === '/') {
-        filePath = './video.html';
-    } else if (req.url.startsWith('/public/')) {
-        filePath = `.${req.url}`;  // → ./public/ch1.m3u8
-    } else {
-        filePath = `.${req.url}`;
-    }
-
-    console.log('Serving:', filePath); // ← add this to debug
-
+    const filePath = req.url === '/' ? './video.html' : `.${req.url}`;
     const ext = path.extname(filePath).toLowerCase();
     const contentTypes = {
-        '.html': 'text/html',
-        '.js':   'application/javascript',
-        '.m3u8': 'application/vnd.apple.mpegurl',
-        '.ts':   'video/mp2t',
+        '.html': 'text/html', '.js': 'application/javascript',
+        '.m3u8': 'application/vnd.apple.mpegurl', '.ts': 'video/mp2t',
     };
-
     fs.readFile(filePath, (err, data) => {
-        if (err) { 
-            console.error('File not found:', filePath);
-            res.writeHead(404); 
-            res.end('Not found'); 
-            return; 
-        }
+        if (err) { res.writeHead(404); res.end('Not found'); return; }
         res.writeHead(200, {
             'Content-Type': contentTypes[ext] || 'text/plain',
             'Access-Control-Allow-Origin': '*',
@@ -60,164 +45,164 @@ http.createServer((req, res) => {
         });
         res.end(data);
     });
-}).listen(CONFIG.httpPort, () => {
-    console.log(`✓ HTTP on :${CONFIG.httpPort}`);
-});
+}).listen(CONFIG.httpPort, () => console.log(`✓ HTTP on :${CONFIG.httpPort}`));
 
-// ── FFmpeg for HLS ────────────────────────────────────────────────────────────
+// ── FFmpeg for HLS (H.265/HEVC video + G.711A audio) ─────────────────────────
+// Camera sends raw H.265 bytestream (codec 99 per T/98 Table 12).
+// -f hevc = raw HEVC annex-B input. -c:v copy = no transcode, just remux.
+// HLS with H.265 works in Chrome 107+, Safari 14+, Edge.
 function startFFmpeg(channel) {
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
-    '-fflags',        '+genpts+discardcorrupt+igndts',
-    '-err_detect',    'ignore_err',
-    '-f',             'h264',
-    '-i',             'pipe:0',
-    '-c:v',           'libx264',
-    '-preset',        'ultrafast',
-    '-tune',          'zerolatency',
-    '-f',             'hls',
-    '-hls_time',      '1',
-    '-hls_list_size', '3',
-    '-hls_flags',     'delete_segments+append_list',
-    `./public/ch${channel}.m3u8`,
-]);
-    ffmpeg.stderr.on('data', d => console.log(`FFmpeg ch${channel}:`, d.toString().trim()));
+        '-fflags',          '+genpts+discardcorrupt+igndts',
+        '-err_detect',      'ignore_err',
+        '-f',               'hevc',          // raw H.265 annex-B input
+        '-i',               'pipe:0',
+        // hls.js/MSE cannot decode H.265 — transcode to H.264
+        '-vf',              'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+        '-c:v',             'libx264',
+        '-preset',          'ultrafast',
+        '-tune',            'zerolatency',
+        '-profile:v',       'baseline',
+        '-level',           '3.1',
+        '-g',               '60',            // keyframe every 60 frames (~2s at 30fps)
+        '-keyint_min',      '30',
+        '-sc_threshold',    '0',
+        '-force_key_frames','expr:gte(t,n_forced*2)', // force keyframe every 2s
+        '-an',              // no audio in raw hevc pipe (audio needs separate handling)
+        // HLS output
+        '-f',               'hls',
+        '-hls_time',        '1',
+        '-hls_list_size',   '3',
+        '-hls_flags',       'delete_segments+append_list',
+        '-hls_segment_filename', `./public/ch${channel}_%03d.ts`,
+        `./public/ch${channel}.m3u8`,
+    ]);
+
+    ffmpeg.stderr.on('data', d => {
+        const msg = d.toString().trim();
+        if (msg.includes('Error') || msg.includes('Invalid') || msg.includes('error')) {
+            console.error(`FFmpeg ch${channel}:`, msg);
+        }
+    });
+
     ffmpeg.on('close', code => {
-        console.log(`FFmpeg ch${channel} closed, restarting...`);
+        console.log(`FFmpeg ch${channel} closed (code ${code}), restarting in 1s...`);
         setTimeout(() => { channels[channel].ffmpeg = startFFmpeg(channel); }, 1000);
     });
+
     return ffmpeg;
 }
 
 const channels = {
     1: { ffmpeg: null, gotIFrame: false, subpackets: [] },
-    2: { ffmpeg: null, gotIFrame: false, subpackets: [] },
 };
-
 channels[1].ffmpeg = startFFmpeg(1);
-channels[2].ffmpeg = startFFmpeg(2);
 
-// ── Handle complete H.264 frame ───────────────────────────────────────────────
-function handleVideoFrame(h264Data, channel, dataType) {
-    const ch = channels[channel];
-    if (!ch) return;
+// ── H.265 NAL unit helpers ───────────────────────────────────────────────────
+// Detect whether a reassembled frame contains an IDR/CRA keyframe by inspecting
+// the H.265 NAL unit type. We do NOT trust the T/98 dataType field for this
+// because sub-packet reassembly loses the original first-packet dataType.
+//
+// H.265 NAL unit types (nal_unit_type, bits [9:15] of the 2-byte NAL header):
+//   16-21 = BLA/IDR/CRA (all are random-access / keyframe types)
+//   32    = VPS   33 = SPS   34 = PPS   39 = SEI prefix
+// A keyframe is signalled by nal_unit_type in range [16,21].
 
-    if (dataType === 0) {
-        ch.gotIFrame = true;
-        console.log(`ch${channel} ✅ I_FRAME size:${h264Data.length}`);
-    }
-
-    if (!ch.gotIFrame) return;
-
-    // Collect NAL units
-    const nalUnits = [];
+function isH265Keyframe(buf) {
+    // Scan annex-B start codes and check each NAL type
     let i = 0;
-    while (i < h264Data.length - 4) {
-        if (h264Data[i] === 0 && h264Data[i+1] === 0 && 
-            h264Data[i+2] === 0 && h264Data[i+3] === 1) {
-            
-            // Find next NAL start
-            let next = h264Data.length;
-            for (let j = i + 4; j < h264Data.length - 4; j++) {
-                if (h264Data[j] === 0 && h264Data[j+1] === 0 && 
-                    h264Data[j+2] === 0 && h264Data[j+3] === 1) {
-                    next = j;
-                    break;
-                }
-            }
+    while (i < buf.length - 4) {
+        // Find 0x000001 or 0x00000001
+        let scLen = 0;
+        if (buf[i] === 0 && buf[i+1] === 0 && buf[i+2] === 0 && buf[i+3] === 1) scLen = 4;
+        else if (buf[i] === 0 && buf[i+1] === 0 && buf[i+2] === 1) scLen = 3;
 
-            const nalType = h264Data[i+4] & 0x1F;
-            const nalData = h264Data.slice(i, next);
-            nalUnits.push({ type: nalType, data: nalData });
-            console.log(`ch${channel} NAL type:${nalType} size:${nalData.length}`);
-            i = next;
+        if (scLen > 0) {
+            const nalHdrOffset = i + scLen;
+            if (nalHdrOffset + 1 < buf.length) {
+                // H.265 NAL header: byte0 = [forbidden(1) | nal_unit_type(6) | layer_id_hi(1)]
+                const nalType = (buf[nalHdrOffset] >> 1) & 0x3F;
+                if (nalType >= 16 && nalType <= 21) return true; // BLA/IDR/CRA
+            }
+            // Jump past this start code to find next
+            i = nalHdrOffset + 1;
         } else {
             i++;
         }
     }
-
-    // Check if data partitioning (types 2,3,4)
-    const hasDP = nalUnits.some(n => n.type === 2);
-    if (hasDP) {
-        const converted = convertDataPartitioning(h264Data);
-        if (ch.ffmpeg && ch.ffmpeg.stdin.writable) {
-        ch.ffmpeg.stdin.write(converted);
-        }
-        return;
-        // const part2 = nalUnits.find(n => n.type === 2);
-        // const part3 = nalUnits.find(n => n.type === 3);
-        // const part4 = nalUnits.find(n => n.type === 4);
-
-        // // Combine all parts into one frame
-        // const parts = [part2, part3, part4].filter(Boolean).map(n => n.data);
-        // const combined = Buffer.concat(parts);
-        // console.log(`ch${channel} DP combined size:${combined.length}`);
-
-        // if (ch.ffmpeg && ch.ffmpeg.stdin.writable) {
-        //     ch.ffmpeg.stdin.write(combined);
-        // }
-        return;
-    }
-
-    // Normal frame
-    if (ch.ffmpeg && ch.ffmpeg.stdin.writable) {
-        ch.ffmpeg.stdin.write(h264Data);
-    }
+    return false;
 }
-function convertDataPartitioning(h264Data) {
-    const output = Buffer.from(h264Data); // copy
-    let i = 0;
-    while (i < output.length - 5) {
-        if (output[i] === 0 && output[i+1] === 0 && 
-            output[i+2] === 0 && output[i+3] === 1) {
-            
-            const nalType = output[i+4] & 0x1F;
-            const nalRef  = (output[i+4] >> 5) & 0x03;
 
-            if (nalType === 2) {
-                // Convert partition A → normal slice (type 1)
-                output[i+4] = (nalRef << 5) | 1;
-                console.log('Converted NAL 2 → 1');
-            } else if (nalType === 3 || nalType === 4) {
-                // Remove partition B and C by zeroing them out
-                output[i+4] = 0;
-            }
-            i += 4;
-        } else {
-            i++;
-        }
-    }
-    return output;
-}
-// ── Reassemble subpackets ─────────────────────────────────────────────────────
-function processVideoPacket(h264Data, channel, dataType, subpktMarker) {
+// ── Reassemble subpackets then deliver to FFmpeg ──────────────────────────────
+// dataType per T/98 §5.5.3 Table 19:
+//   0x00=I-frame  0x01=P-frame  0x02=B-frame  0x03=Audio  0x04=Transparent
+//
+// IMPORTANT: dataType is carried on the FIRST sub-packet only. Middle and last
+// sub-packets have dataType from their own header which may differ. So we save
+// the dataType from sub-packet marker=1 (first) and use it for the whole frame.
+function processVideoPacket(rawData, channel, dataType, subpktMarker) {
     const ch = channels[channel];
     if (!ch) return;
-
-    console.log(`ch${channel} subpkt:${subpktMarker} dataType:${dataType} bytes:${h264Data.length}`);
 
     if (subpktMarker === 0) {
-        // Atomic — complete frame
-        handleVideoFrame(h264Data, channel, dataType);
+        // Atomic packet — complete frame in one piece
+        deliverFrame(rawData, channel, dataType);
 
     } else if (subpktMarker === 1) {
-        // First piece
-        ch.subpackets = [h264Data];
+        // First sub-packet — start accumulation, save the dataType
+        ch.subpackets      = [rawData];
+        ch.subpacketDType  = dataType;   // ← save dataType from first packet
 
     } else if (subpktMarker === 3) {
-        // Middle piece
-        ch.subpackets.push(h264Data);
+        // Middle sub-packet
+        if (ch.subpackets && ch.subpackets.length > 0) ch.subpackets.push(rawData);
 
     } else if (subpktMarker === 2) {
-        // Last piece — join all
-        ch.subpackets.push(h264Data);
-        const complete = Buffer.concat(ch.subpackets);
-        ch.subpackets = [];
-        console.log(`ch${channel} complete frame NAL: ${complete[0].toString(16)} ${complete[1].toString(16)} ${complete[2].toString(16)} ${complete[3].toString(16)}`);
-        handleVideoFrame(complete, channel, dataType);
+        // Last sub-packet — reassemble and deliver
+        if (ch.subpackets && ch.subpackets.length > 0) {
+            ch.subpackets.push(rawData);
+            const complete = Buffer.concat(ch.subpackets);
+            const dtype    = ch.subpacketDType; // use saved first-packet dataType
+            ch.subpackets  = [];
+            ch.subpacketDType = 0;
+            deliverFrame(complete, channel, dtype);
+        }
     }
 }
 
-// ── Helper functions ──────────────────────────────────────────────────────────
+function deliverFrame(frameData, channel, dataType) {
+    const ch = channels[channel];
+    if (!ch) return;
+
+    // Audio / transparent — skip (no audio pipe)
+    if (dataType === 3 || dataType === 4) return;
+
+    const isVideo = (dataType === 0 || dataType === 1 || dataType === 2);
+    if (!isVideo) return;
+
+    // Detect keyframe from actual H.265 NAL content (don't trust dataType alone
+    // since it can be wrong after sub-packet reassembly)
+    const keyframe = (dataType === 0) || isH265Keyframe(frameData);
+
+    if (keyframe) {
+        ch.gotIFrame = true;
+        console.log(`ch${channel} ✅ KEYFRAME size:${frameData.length}`);
+    } else {
+        if (!ch.gotIFrame) return; // still waiting for first keyframe
+    }
+
+    if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
+
+    // Ensure annex-B 4-byte start code prefix
+    const hasStartCode = frameData.length >= 4 &&
+        frameData[0] === 0 && frameData[1] === 0 && frameData[2] === 0 && frameData[3] === 1;
+
+    ch.ffmpeg.stdin.write(hasStartCode ? frameData : Buffer.concat([
+        Buffer.from([0x00, 0x00, 0x00, 0x01]), frameData
+    ]));
+}
+
+// ── JT/T 808 protocol helpers ─────────────────────────────────────────────────
 function unescapeBuffer(buf) {
     const out = []; let i = 0;
     while (i < buf.length) {
@@ -257,7 +242,7 @@ function buildAck(phone, replySeq, replyMsgId) {
     const body = Buffer.alloc(5);
     body.writeUInt16BE(replySeq,   0);
     body.writeUInt16BE(replyMsgId, 2);
-    body[4] = 0;
+    body[4] = 0; // success
     return buildFrame(0x8001, body, phone);
 }
 
@@ -270,18 +255,83 @@ function buildRegisterResponse(phone, replySeq, result, authCode) {
     return buildFrame(0x8100, body, phone);
 }
 
+// T/98 §5.5.1 Table 17 — real-time audio+video request
 function buildVideoRequest(phone, serverIp, serverPort, channel) {
     const ipBuf = Buffer.from(serverIp, 'ascii');
     const N     = ipBuf.length;
     const body  = Buffer.alloc(8 + N);
     body[0] = N;
     ipBuf.copy(body, 1);
-    body.writeUInt16BE(serverPort, 1 + N);
-    body.writeUInt16BE(0,          3 + N);
+    body.writeUInt16BE(serverPort, 1 + N); // TCP port
+    body.writeUInt16BE(0,          3 + N); // UDP port = 0
     body[5 + N] = channel;
-    body[6 + N] = 1; // video only
+    body[6 + N] = 0; // dataType 0 = Audio+Video (was 1=VideoOnly before)
     body[7 + N] = 0; // main stream
     return buildFrame(0x9101, body, phone);
+}
+
+// T/98 §5.6.1 Table 21 — query resource list
+// Body = 24 bytes: ch(1) + startBCD(6) + endBCD(6) + alarmFlag(8) + avType(1) + streamType(1) + memType(1)
+function buildQueryRecordings(phone) {
+    const body = Buffer.alloc(24, 0); // all-zero = no filters
+    body[0]  = 1;   // logical channel 1 (not 0=all, some firmware ignores 0)
+    body[21] = 3;   // avType 3 = Video OR Audio+Video (catches everything)
+    body[22] = 0;   // streamType 0 = all streams
+    body[23] = 0;   // memType 0 = all storage
+    return buildFrame(0x9205, body, phone);
+}
+
+// Parse BCD date from terminal response (6 bytes: YY MM DD HH MM SS)
+function parseBCD6(buf, offset) {
+    const b = i => ((buf[offset+i] >> 4) * 10 + (buf[offset+i] & 0x0F));
+    return `20${String(b(0)).padStart(2,'0')}-${String(b(1)).padStart(2,'0')}-${String(b(2)).padStart(2,'0')} ${String(b(3)).padStart(2,'0')}:${String(b(4)).padStart(2,'0')}:${String(b(5)).padStart(2,'0')}`;
+}
+
+// T/98 §5.6.2 Table 22+23 — parse terminal's recording list response
+function parseRecordingList(body) {
+    console.log(`[Recordings] raw body hex (first 80 bytes): ${body.slice(0, 80).toString('hex')}`);
+    console.log(`[Recordings] body length: ${body.length}`);
+
+    if (body.length < 6) {
+        console.log(`[Recordings] ⚠️  Body too short`);
+        return [];
+    }
+
+    const seq   = body.readUInt16BE(0);
+    const total = body.readUInt32BE(2);
+    console.log(`[Recordings] seq=${seq} total_reported=${total}`);
+
+    if (total === 0) {
+        console.log(`[Recordings] ⚠️  Device reports 0 recordings`);
+        return [];
+    }
+
+    const recordings = [];
+    let i = 6;
+    let entry = 0;
+
+    while (i < body.length) {
+        const remaining = body.length - i;
+        if (remaining < 28) {
+            console.log(`[Recordings] ⚠️  Only ${remaining} bytes left at entry ${entry}, need 28 — stopping`);
+            break;
+        }
+        const ch         = body[i];
+        const startTime  = parseBCD6(body, i + 1);
+        const endTime    = parseBCD6(body, i + 7);
+        const alarmHex   = body.slice(i + 13, i + 21).toString('hex');
+        const avType     = body[i + 21];
+        const streamType = body[i + 22];
+        const memType    = body[i + 23];
+        const fileSize   = body.readUInt32BE(i + 24);
+        console.log(`[Recordings] entry[${entry}]: ch=${ch} start=${startTime} end=${endTime} avType=${avType} size=${fileSize} alarm=${alarmHex}`);
+        recordings.push({ ch, startTime, endTime, avType, streamType, memType, size: fileSize });
+        i += 28;
+        entry++;
+    }
+
+    console.log(`[Recordings] parsed ${recordings.length} of ${total} reported`);
+    return recordings;
 }
 
 function parseAdditionalInfo(buf) {
@@ -290,28 +340,14 @@ function parseAdditionalInfo(buf) {
     while (i < buf.length - 2) {
         const id  = buf[i];
         const len = buf[i+1];
-
-        // ← ADD THIS CHECK
         if (i + 2 + len > buf.length) break;
-
         const val = buf.slice(i+2, i+2+len);
-
         switch(id) {
-            case 0x01:
-                if (val.length >= 4) result.mileage = val.readUInt32BE(0) / 10 + ' km';
-                break;
-            case 0x03:
-                if (val.length >= 2) result.sensorSpeed = val.readUInt16BE(0) / 10 + ' km/h';
-                break;
-            case 0x25:
-                if (val.length >= 2) result.voltage = val.readUInt16BE(0) / 10 + ' V';
-                break;
-            case 0x30:
-                if (val.length >= 1) result.signalStrength = val[0];
-                break;
-            case 0x31:
-                if (val.length >= 1) result.satellites = val[0];
-                break;
+            case 0x01: if (val.length >= 4) result.mileage        = val.readUInt32BE(0) / 10 + ' km';   break;
+            case 0x03: if (val.length >= 2) result.sensorSpeed    = val.readUInt16BE(0) / 10 + ' km/h'; break;
+            case 0x25: if (val.length >= 2) result.voltage        = val.readUInt16BE(0) / 10 + ' V';    break;
+            case 0x30: if (val.length >= 1) result.signalStrength  = val[0];                            break;
+            case 0x31: if (val.length >= 1) result.satellites     = val[0];                             break;
         }
         i += 2 + len;
     }
@@ -322,7 +358,6 @@ function parseAdditionalInfo(buf) {
 const tcpServer = net.createServer(socket => {
     const remote = `${socket.remoteAddress}:${socket.remotePort}`;
     console.log(`Device connected: ${remote}`);
-    const deviceInfo = {}; // store per device
     let buffer = Buffer.alloc(0);
     let phone  = null;
 
@@ -333,12 +368,11 @@ const tcpServer = net.createServer(socket => {
 
             while (offset < buffer.length - 4) {
 
-                // ── Video frame ───────────────────────────────────────────────
+                // ── Stream data packet (T/98 §5.5.3 — magic 0x30316364) ──────
                 if (buffer[offset]   === 0x30 && buffer[offset+1] === 0x31 &&
                     buffer[offset+2] === 0x63 && buffer[offset+3] === 0x64) {
 
                     if (offset + 30 > buffer.length) break;
-
                     const dataBodyLen = buffer.readUInt16BE(offset + 28);
                     if (offset + 30 + dataBodyLen > buffer.length) break;
 
@@ -346,49 +380,81 @@ const tcpServer = net.createServer(socket => {
                     const dataType     = (byte15 >> 4) & 0x0F;
                     const subpktMarker = byte15 & 0x0F;
                     const channel      = buffer[offset + 14];
-                    const h264Data     = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
+                    const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    processVideoPacket(h264Data, channel, dataType, subpktMarker);
-
+                    processVideoPacket(rawData, channel, dataType, subpktMarker);
                     offset += 30 + dataBodyLen;
                     continue;
                 }
 
-                // ── Signalling frame ──────────────────────────────────────────
+                // ── Signalling packet (JT/T 808 — 0x7E framing) ─────────────
                 if (buffer[offset] === 0x7E) {
                     const end = buffer.indexOf(0x7E, offset + 1);
                     if (end === -1) break;
 
                     const inner     = buffer.slice(offset + 1, end);
                     const unescaped = unescapeBuffer(inner);
-                    if (unescaped.length < 12) { offset = end + 1; continue; }
+                    if (unescaped.length < 13) { offset = end + 1; continue; }
 
-                    const msgId = unescaped.readUInt16BE(0);
-                    phone = unescaped.slice(4, 10)
-                    .map(b => {
-                        const high = (b >> 4) & 0x0F;
-                        const low  =  b       & 0x0F;
-                        return `${high}${low}`;
-                    })
-                    .join('')
-                    .replace(/^0+/, '');
-                    const seq   = unescaped.readUInt16BE(10);
-                    const body  = unescaped.slice(12);
+                    // ── Checksum validation (XOR of all bytes except checksum itself) ──
+                    // Last byte of unescaped is the checksum
+                    const csReceived = unescaped[unescaped.length - 1];
+                    let csCalc = 0;
+                    for (let ci = 0; ci < unescaped.length - 1; ci++) csCalc ^= unescaped[ci];
+                    if (csCalc !== csReceived) {
+                        // Not a valid JT/T 808 frame — skip this 0x7E and keep scanning
+                        offset++;
+                        continue;
+                    }
+
+                    // Strip checksum byte before parsing
+                    const frame = unescaped.slice(0, -1);
+                    if (frame.length < 12) { offset = end + 1; continue; }
+
+                    const msgId = frame.readUInt16BE(0);
+                    phone = frame.slice(4, 10)
+                        .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`)
+                        .join('').replace(/^0+/, '');
+                    const seq  = frame.readUInt16BE(10);
+                    const body = frame.slice(12);
                     console.log(`[signalling] msgId: 0x${msgId.toString(16).padStart(4,'0')} phone: ${phone}`);
 
                     if (msgId === 0x0100) {
+                        // Registration
                         socket.write(buildRegisterResponse(phone, seq, 0, 'AUTH1234'));
+
                     } else if (msgId === 0x0102) {
-                        // Auth → request video
+                        // Auth success → start live stream
+                        // Recordings query is sent after the first location report (0x0200)
+                        // because the device needs time to mount/index its SD card after boot.
                         socket.write(buildAck(phone, seq, msgId));
                         socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
-                        socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 2));
 
-                    } 
-                    else if (msgId === 0x0200) {
+                    } else if (msgId === 0x1205) {
+                        // Terminal's recording list response (T/98 §5.6.2)
                         socket.write(buildAck(phone, seq, msgId));
-                        
-                        // Parse location
+                        const recordings = parseRecordingList(body);
+                        wsBroadcast({ type: 'recordings', data: recordings });
+
+                    } else if (msgId === 0x0200) {
+                        // Location report — query recordings on the FIRST report only
+                        // (device is fully booted and SD card indexed by this point)
+                        socket.write(buildAck(phone, seq, msgId));
+                        if (!socket._recordingsQueried) {
+                            socket._recordingsQueried = true;
+                            // Retry up to 3 times with increasing delays
+                            // Device may still be indexing SD card
+                            let attempt = 0;
+                            const queryRecordings = () => {
+                                attempt++;
+                                console.log(`[Recordings] Query attempt ${attempt}...`);
+                                socket.write(buildQueryRecordings(phone));
+                            };
+                            setTimeout(queryRecordings, 1000);
+                            setTimeout(queryRecordings, 10000);
+                            setTimeout(queryRecordings, 30000);
+                        }
+
                         const alarmFlags = body.readUInt32BE(0);
                         const statusBits = body.readUInt32BE(4);
                         const latRaw     = body.readUInt32BE(8);
@@ -399,84 +465,48 @@ const tcpServer = net.createServer(socket => {
 
                         const south   = !!(statusBits & (1 << 2));
                         const west    = !!(statusBits & (1 << 3));
-                        const lat     = latRaw  / 1e6 * (south ? -1 : 1);
-                        const lon     = lonRaw  / 1e6 * (west  ? -1 : 1);
+                        const lat     = latRaw / 1e6 * (south ? -1 : 1);
+                        const lon     = lonRaw / 1e6 * (west  ? -1 : 1);
                         const accOn   = !!(statusBits & (1 << 0));
                         const located = !!(statusBits & (1 << 1));
 
-                        // Parse BCD time
-                        // Replace your existing BCD time parsing with this:
-                        const bcd        = b => ((b >> 4) * 10 + (b & 0x0F));
-                        const timeOffset = 22; // ← change 21 to 22
-                        const yy = bcd(body[timeOffset]);
-                        const mo = bcd(body[timeOffset+1]);
-                        const dd = bcd(body[timeOffset+2]);
-                        const hh = bcd(body[timeOffset+3]);
-                        const mm = bcd(body[timeOffset+4]);
-                        const ss = bcd(body[timeOffset+5]);
-                        const dt = `20${String(yy).padStart(2,'0')}-${String(mo).padStart(2,'0')}-${String(dd).padStart(2,'0')} ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
-                        
-                        console.log(`datetime raw: ${body.slice(timeOffset, timeOffset+6).toString('hex')} → ${dt}`);
-                        
-                        // Parse alarm flags
+                        const bcd = b => ((b >> 4) * 10 + (b & 0x0F));
+                        const t   = 22;
+                        const dt  = `20${String(bcd(body[t])).padStart(2,'0')}-${String(bcd(body[t+1])).padStart(2,'0')}-${String(bcd(body[t+2])).padStart(2,'0')} ${String(bcd(body[t+3])).padStart(2,'0')}:${String(bcd(body[t+4])).padStart(2,'0')}:${String(bcd(body[t+5])).padStart(2,'0')}`;
+
                         const alarms = [];
-                        if (alarmFlags & (1 << 0)) alarms.push('Emergency');
-                        if (alarmFlags & (1 << 1)) alarms.push('Overspeed');
-                        if (alarmFlags & (1 << 4)) alarms.push('GNSS Fault');
-                        if (alarmFlags & (1 << 5)) alarms.push('GNSS Antenna Cut');
-                        if (alarmFlags & (1 << 7)) alarms.push('Low Voltage');
-                        if (alarmFlags & (1 << 8)) alarms.push('Power Off');
+                        if (alarmFlags & (1<<0)) alarms.push('Emergency');
+                        if (alarmFlags & (1<<1)) alarms.push('Overspeed');
+                        if (alarmFlags & (1<<4)) alarms.push('GNSS Fault');
+                        if (alarmFlags & (1<<5)) alarms.push('GNSS Antenna Cut');
+                        if (alarmFlags & (1<<7)) alarms.push('Low Voltage');
+                        if (alarmFlags & (1<<8)) alarms.push('Power Off');
 
                         const locationData = {
-                            type:      'location',
-                            phone,
-                            lat,
-                            lon,
-                            speed,
-                            direction,
-                            elevation,
-                            datetime:  dt,
-                            accOn,
-                            located,
-                            alarms,
-                            // Parse additional info items
+                            type: 'location', phone, lat, lon, speed, direction,
+                            elevation, datetime: dt, accOn, located, alarms,
                             ...parseAdditionalInfo(body.slice(27))
                         };
 
                         console.log(`[GPS] ${phone} lat=${lat} lon=${lon} speed=${speed}km/h dir=${direction}° dt=${dt}`);
-                        // Send to browser
-                        wss.clients.forEach(client => {
-                            if (client.readyState === 1) {
-                                client.send(JSON.stringify(locationData));
-                            }
-                        });
-// ── Save GPS data to file ─────────────────────────────────────────────
-                        let fileName = `gps_log_${new Date().toISOString().slice(0,10)}.txt`;
-                        const gpsLog = fs.createWriteStream(`./${fileName}`, { flags: 'a' });
+                        wsBroadcast(locationData);
 
-                        const info = deviceInfo[phone] || {};
-
+                        // GPS log
+                        const fileName  = `gps_log_${new Date().toISOString().slice(0,10)}.txt`;
                         const gpsRecord = {
-                            phone:         phone,
-                            model:         info.model || '--',
-                            plate:         info.plate || '--',
-                            datetime:      dt,
-                            latitude:      lat,
-                            longitude:     lon,
-                            speed_kmh:     speed,
-                            direction_deg: direction,
-                            elevation_m:   elevation,
-                            acc:           accOn   ? 'ON'  : 'OFF',
-                            located:       located ? 'YES' : 'NO',
-                            mileage:       locationData.mileage        || '--',
-                            voltage:       locationData.voltage        || '--',
-                            satellites:    locationData.satellites     || '--',
-                            signal:        locationData.signalStrength || '--',
-                            sensor_speed:  locationData.sensorSpeed    || '--',
-                            oil_circuit:   !!(statusBits & (1<<10)) ? 'CUT'  : 'NORMAL',
-                            vehicle_circuit: !!(statusBits & (1<<11)) ? 'CUT' : 'NORMAL',
-                            door:          !!(statusBits & (1<<13)) ? 'OPEN'  : 'CLOSED',
-                            alarms:        alarmFlags !== 0 ? [
+                            phone, datetime: dt, latitude: lat, longitude: lon,
+                            speed_kmh: speed, direction_deg: direction, elevation_m: elevation,
+                            acc:             accOn   ? 'ON'    : 'OFF',
+                            located:         located ? 'YES'   : 'NO',
+                            mileage:         locationData.mileage        || '--',
+                            voltage:         locationData.voltage        || '--',
+                            satellites:      locationData.satellites     || '--',
+                            signal:          locationData.signalStrength || '--',
+                            sensor_speed:    locationData.sensorSpeed    || '--',
+                            oil_circuit:     !!(statusBits & (1<<10)) ? 'CUT'  : 'NORMAL',
+                            vehicle_circuit: !!(statusBits & (1<<11)) ? 'CUT'  : 'NORMAL',
+                            door:            !!(statusBits & (1<<13)) ? 'OPEN' : 'CLOSED',
+                            alarms: alarmFlags !== 0 ? [
                                 (alarmFlags & (1<<0)) ? 'EMERGENCY'   : null,
                                 (alarmFlags & (1<<1)) ? 'OVERSPEED'   : null,
                                 (alarmFlags & (1<<4)) ? 'GNSS_FAULT'  : null,
@@ -485,14 +515,35 @@ const tcpServer = net.createServer(socket => {
                                 (alarmFlags & (1<<8)) ? 'POWER_OFF'   : null,
                             ].filter(Boolean).join('|') : 'NONE',
                         };
+                        fs.appendFile(`./${fileName}`, Object.values(gpsRecord).join(',') + '\n', err => {
+                            if (err) console.error('[GPS LOG] write error:', err.message);
+                        });
 
-                        // Write to file
-                        const line = Object.values(gpsRecord).join(',') + '\n';
-                        gpsLog.write(line);
-                        //console.log(`[GPS LOG] ${gpsRecord.imei} ${gpsRecord.datetime} lat=${gpsRecord.latitude} lon=${gpsRecord.longitude}`);
-                        
-                    }
-                    else {
+                    } else if (msgId === 0x0001) {
+                        // General response from device — ACK to our commands, no reply needed
+                        const replySeq    = body.readUInt16BE(0);
+                        const replyMsgId  = body.readUInt16BE(2);
+                        const result      = body[4];
+                        const resultStr   = ['Success','Failed','MsgErr','NotSupported','AlarmACK','Update'][result] || `0x${result.toString(16)}`;
+                        console.log(`[signalling] Device ACK: replyTo=0x${replyMsgId.toString(16).padStart(4,'0')} seq=${replySeq} result=${resultStr}`);
+
+                    } else if (msgId === 0x0002) {
+                        // Heartbeat — just ACK it
+                        socket.write(buildAck(phone, seq, msgId));
+
+                    } else if (msgId === 0x1003) {
+                        // Terminal uploads audio/video attributes (T/98 §5.3.3)
+                        // Log the codec info — useful for confirming H.265
+                        if (body.length >= 2) {
+                            const videoCodec = body[7] || body[1];
+                            const codecName  = {98:'H.264', 99:'H.265/HEVC', 100:'AVS'}[videoCodec] || `code${videoCodec}`;
+                            console.log(`[signalling] Terminal AV attributes: videoCodec=${codecName}`);
+                        }
+                        socket.write(buildAck(phone, seq, msgId));
+
+                    } else {
+                        // Truly unknown — log but still ACK
+                        console.log(`[signalling] ⚠️  Unhandled msgId=0x${msgId.toString(16).padStart(4,'0')} bodyLen=${body.length}`);
                         socket.write(buildAck(phone, seq, msgId));
                     }
 
@@ -503,7 +554,6 @@ const tcpServer = net.createServer(socket => {
                 offset++;
             }
 
-            // Keep unprocessed data
             buffer = buffer.slice(offset);
 
         } catch (err) {
