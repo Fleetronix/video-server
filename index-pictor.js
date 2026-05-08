@@ -507,7 +507,7 @@ const tcpServer = net.createServer(socket => {
                 }
 
                 // ── Signalling packet (JT/T 808 — 0x7E framing) ─────────────
-                if (buffer[offset] === 0x7E) {
+                else if (buffer[offset] === 0x7E) {
                     const end = buffer.indexOf(0x7E, offset + 1);
                     if (end === -1) break;
 
@@ -669,6 +669,9 @@ const tcpServer = net.createServer(socket => {
 
                     offset = end + 1;
                     continue;
+                }
+                else{
+                    console.log(`[TCP] No packet start at offset ${offset} (byte=0x${buffer[offset].toString(16)}) — skipping`);
                 }
 
                 offset++;
