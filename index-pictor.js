@@ -19,6 +19,9 @@ console.log(`Server IP: ${CONFIG.serverIp}`);
 
 if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 
+// Map<phone, socket> so HTTP handlers can find the right device
+const deviceSockets = new Map();
+
 // ── WebSocket server ──────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ port: CONFIG.wsPort });
 console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
@@ -43,7 +46,31 @@ wss.on('connection', ws => {
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
 http.createServer((req, res) => {
-    const filePath = req.url === '/' ? './video.html' : `.${req.url}`;
+    // ── API: trigger recording-list query for a given date ──
+    // GET /api/recordings?date=YYYY-MM-DD  (defaults to today)
+    if (req.url && req.url.startsWith('/api/recordings')) {
+        const url    = new URL(req.url, `http://${req.headers.host}`);
+        const dateQ  = url.searchParams.get('date');
+        const target = dateQ ? new Date(dateQ + 'T00:00:00') : new Date();
+        if (isNaN(target.getTime())) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid date' }));
+            return;
+        }
+        let sent = 0;
+        for (const [phone, socket] of deviceSockets.entries()) {
+            if (socket && !socket.destroyed) {
+                console.log(`[API] Recording query for ${phone} on ${target.toISOString().slice(0,10)}`);
+                socket.write(buildQueryRecordings(phone, target));
+                sent++;
+            }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ ok: true, devicesQueried: sent, date: target.toISOString().slice(0,10) }));
+        return;
+    }
+
+    const filePath = req.url === '/' ? './video.html' : `.${req.url.split('?')[0]}`;
     const ext = path.extname(filePath).toLowerCase();
     const contentTypes = {
         '.html': 'text/html', '.js': 'application/javascript',
@@ -107,7 +134,8 @@ function startFFmpeg(channel, quality = 'main') {
         '-an',
         '-f',               'hls',
         '-hls_time',        '1',
-        '-hls_list_size',   '6',
+        '-hls_list_size',   '10',
+        '-hls_init_time',   '1',
         '-hls_flags',       'delete_segments+append_list+independent_segments',
         '-hls_segment_type','mpegts',
         '-hls_segment_filename', seg,
@@ -124,11 +152,15 @@ function startFFmpeg(channel, quality = 'main') {
         const ch = channels[channel];
         if (ch) {
             if (quality === 'main') { ch.gotIFrame = false; ch.frameTimer = null; ch.draining = false; ch.frameQueue = []; }
-            else                   { ch.gotIFrameSub = false; ch.frameTimerSub = null; ch.drainingSub = false; ch.frameQueueSub = []; }
+            else {
+                ch.gotIFrameSub = false; ch.frameTimerSub = null; ch.drainingSub = false; ch.frameQueueSub = [];
+                // Tell browsers the sub-stream is gone so they don't try to switch to it mid-restart
+                wsBroadcast({ type: 'streamReady', stream: 'sub', channel, ready: false });
+            }
         }
         setTimeout(() => {
             if (channels[channel]) {
-                if (quality === 'main') {
+                    if (quality === 'main') {
                     channels[channel].ffmpeg = startFFmpeg(channel, 'main');
                 } else {
                     channels[channel].ffmpegSub = startFFmpeg(channel, 'sub');
@@ -137,7 +169,7 @@ function startFFmpeg(channel, quality = 'main') {
                     const pollReady = setInterval(() => {
                         if (fs.existsSync(subM3u8)) {
                             clearInterval(pollReady);
-                            wsBroadcast({ type: 'streamReady', stream: 'sub', channel });
+                            wsBroadcast({ type: 'streamReady', stream: 'sub', channel, ready: true });
                         }
                     }, 500);
                 }
@@ -213,8 +245,11 @@ function processVideoPacket(rawData, channel, dataType, subpktMarker) {
 // Fix: use a token-bucket queue. Frames are queued and released at TARGET_FPS.
 // This makes FFmpeg receive frames at real-time rate regardless of camera bursts.
 
-const TARGET_FPS    = 25;                       // release one frame every this many ms
-const FRAME_INTERVAL_MS = 1000 / TARGET_FPS;   // = 40ms per frame
+// Real T98 cameras typically push 12-18 fps in bursts. 20 fps gives headroom
+// without leaving the queue empty for long stretches.
+const TARGET_FPS    = 20;                       // release one frame every this many ms
+const FRAME_INTERVAL_MS = 1000 / TARGET_FPS;   // = 50ms per frame
+const QUEUE_MAX_FACTOR  = 4;                   // allow up to 4s of buffered frames before dropping
 
 function scheduleQueue(ch) {
     if (ch.draining || ch.frameQueue.length === 0) return;
@@ -230,8 +265,8 @@ function scheduleQueue(ch) {
             console.warn(`[Queue] ch${1} FFmpeg stdin not writable — ffmpeg=${!!ch.ffmpeg} writable=${ch.ffmpeg && ch.ffmpeg.stdin.writable}`);
         }
 
-        // If queue is building up (>2s worth), drop oldest non-keyframe to catch up
-        const maxQueue = TARGET_FPS * 2;
+        // If queue is building up, drop oldest non-keyframe to catch up
+        const maxQueue = TARGET_FPS * QUEUE_MAX_FACTOR;
         while (ch.frameQueue.length > maxQueue) {
             const dropped = ch.frameQueue.shift();
             // Only drop if not a keyframe (keyframes start with 0 0 0 1 + IDR NAL)
@@ -257,7 +292,7 @@ function scheduleQueueSub(ch) {
             ch.ffmpegSub.stdin.write(frame);
         }
 
-        const maxQueue = TARGET_FPS * 2;
+        const maxQueue = TARGET_FPS * QUEUE_MAX_FACTOR;
         while (ch.frameQueueSub.length > maxQueue) {
             const dropped = ch.frameQueueSub.shift();
             if (isH265Keyframe(dropped)) { ch.frameQueueSub.unshift(dropped); break; }
@@ -302,7 +337,7 @@ function deliverFrame(frameData, channel, dataType) {
             if (fs.existsSync(subM3u8)) {
                 clearInterval(pollReady);
                 console.log(`ch${channel} sub-stream m3u8 ready — notifying browsers`);
-                wsBroadcast({ type: 'streamReady', stream: 'sub', channel });
+                wsBroadcast({ type: 'streamReady', stream: 'sub', channel, ready: true });
             }
         }, 500);
     }
@@ -387,12 +422,34 @@ function buildVideoRequest(phone, serverIp, serverPort, channel) {
 
 // T/98 §5.6.1 Table 21 — query resource list
 // Body = 24 bytes: ch(1) + startBCD(6) + endBCD(6) + alarmFlag(8) + avType(1) + streamType(1) + memType(1)
-function buildQueryRecordings(phone) {
-    const body = Buffer.alloc(24, 0); // all-zero = no filters
-    body[0]  = 0;   // 0 = all channels
-    body[21] = 3;   // avType 3 = Video OR Audio+Video (catches everything)
-    body[22] = 0;   // streamType 0 = all streams
-    body[23] = 0;   // memType 0 = all storage
+//
+// IMPORTANT: T98 firmware (despite spec saying all-zero = no filter) returns
+// total=0 unless given an explicit date range, channel, and concrete avType/
+// streamType/memType. We therefore default to "today 00:00 → 23:59, channel 1,
+// Video, Main stream, Main storage" — exactly what the vendor app sends.
+function toBCD(n) { return ((Math.floor(n / 10) & 0x0F) << 4) | (n % 10 & 0x0F); }
+function writeBCD6(buf, off, d, h, m, s) {
+    buf[off]   = toBCD(d.getFullYear() % 100);
+    buf[off+1] = toBCD(d.getMonth() + 1);
+    buf[off+2] = toBCD(d.getDate());
+    buf[off+3] = toBCD(h);
+    buf[off+4] = toBCD(m);
+    buf[off+5] = toBCD(s);
+}
+function buildQueryRecordings(phone, date = new Date(), opts = {}) {
+    const channel    = opts.channel    != null ? opts.channel    : 1;
+    const avType     = opts.avType     != null ? opts.avType     : 2;  // 2 = Video
+    const streamType = opts.streamType != null ? opts.streamType : 1;  // 1 = Main
+    const memType    = opts.memType    != null ? opts.memType    : 1;  // 1 = Main storage
+    const body = Buffer.alloc(24, 0);
+    body[0]  = channel;
+    writeBCD6(body, 1, date, 0, 0, 0);   // start = today 00:00:00
+    writeBCD6(body, 7, date, 23, 59, 59); // end   = today 23:59:59
+    // bytes 13..20 alarm flag = 0 (no filter)
+    body[21] = avType;
+    body[22] = streamType;
+    body[23] = memType;
+    console.log(`[Recordings] Query body: ${body.toString('hex')} (date=${date.toISOString().slice(0,10)} ch=${channel} av=${avType} stream=${streamType} mem=${memType})`);
     return buildFrame(0x9205, body, phone);
 }
 
@@ -556,22 +613,22 @@ const tcpServer = net.createServer(socket => {
                         wsBroadcast({ type: 'recordings', data: recordings });
 
                     } else if (msgId === 0x0200) {
-                        // Location report — query recordings on the FIRST report only
-                        // (device is fully booted and SD card indexed by this point)
+                        // Location report — track this socket and warm-up query recordings
                         socket.write(buildAck(phone, seq, msgId));
+
+                        // Register/refresh the device socket so HTTP /api/recordings can find it
+                        if (phone) deviceSockets.set(phone, socket);
+
                         if (!socket._recordingsQueried) {
                             socket._recordingsQueried = true;
-                            // Retry up to 3 times with increasing delays
-                            // Device may still be indexing SD card
-                            let attempt = 0;
-                            const queryRecordings = () => {
-                                attempt++;
-                                console.log(`[Recordings] Query attempt ${attempt}...`);
-                                socket.write(buildQueryRecordings(phone));
+                            // Warm-up query for "today" once SD card has had time to index.
+                            // The browser drives subsequent queries through GET /api/recordings.
+                            const queryToday = () => {
+                                console.log(`[Recordings] Warm-up query for today (${phone})`);
+                                socket.write(buildQueryRecordings(phone, new Date()));
                             };
-                            setTimeout(queryRecordings, 1000);
-                            setTimeout(queryRecordings, 10000);
-                            setTimeout(queryRecordings, 30000);
+                            setTimeout(queryToday, 3000);
+                            setTimeout(queryToday, 15000);
                         }
 
                         const alarmFlags = body.readUInt32BE(0);
@@ -688,7 +745,10 @@ const tcpServer = net.createServer(socket => {
         }
     });
 
-    socket.on('close', () => console.log(`Device disconnected: ${remote}`));
+    socket.on('close', () => {
+        console.log(`Device disconnected: ${remote}`);
+        if (phone && deviceSockets.get(phone) === socket) deviceSockets.delete(phone);
+    });
     socket.on('error', err => console.error(`Socket error: ${err.message}`));
 });
 
@@ -704,11 +764,28 @@ setInterval(() => {
     const ffSubAlive = ch.ffmpegSub && !ch.ffmpegSub.killed && ch.ffmpegSub.stdin.writable;
     const qLen     = ch.frameQueue.length;
     const qSubLen  = ch.frameQueueSub.length;
-    const m3u8Age  = (() => { try { return Math.round((Date.now() - fs.statSync('./public/ch1.m3u8').mtimeMs)/1000) + 's ago'; } catch { return 'missing'; } })();
+    let m3u8AgeSec = -1;
+    try { m3u8AgeSec = Math.round((Date.now() - fs.statSync('./public/ch1.m3u8').mtimeMs) / 1000); } catch {}
+    const m3u8Age = m3u8AgeSec >= 0 ? `${m3u8AgeSec}s ago` : 'missing';
     console.log(`[Health] ffmpeg=${ffAlive} ffmpegSub=${ffSubAlive} queue=${qLen} queueSub=${qSubLen} gotIFrame=${ch.gotIFrame} draining=${ch.draining} m3u8_updated=${m3u8Age}`);
+
     // Auto-restart FFmpeg if stdin is closed but process is still running
     if (ch.gotIFrame && ch.ffmpeg && !ch.ffmpeg.stdin.writable && !ch.ffmpeg.killed) {
         console.warn('[Health] FFmpeg stdin closed but process alive — killing and restarting');
         ch.ffmpeg.kill();
+    }
+    // Silent-stall watchdog: m3u8 hasn't been touched in >8s but FFmpeg looks alive
+    // → segments are not flowing, kill it so the close handler restarts it cleanly.
+    if (ch.gotIFrame && ffAlive && m3u8AgeSec > 8) {
+        console.warn(`[Health] m3u8 stale (${m3u8AgeSec}s) — restarting main FFmpeg`);
+        try { ch.ffmpeg.kill('SIGKILL'); } catch {}
+    }
+    if (ch.gotIFrameSub && ffSubAlive) {
+        let subAge = -1;
+        try { subAge = Math.round((Date.now() - fs.statSync('./public/ch1_sub.m3u8').mtimeMs) / 1000); } catch {}
+        if (subAge > 8) {
+            console.warn(`[Health] sub m3u8 stale (${subAge}s) — restarting sub FFmpeg`);
+            try { ch.ffmpegSub.kill('SIGKILL'); } catch {}
+        }
     }
 }, 10000);

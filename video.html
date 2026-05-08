@@ -124,6 +124,13 @@
   <!-- Recordings -->
   <div class="recordings">
     <h3>📹 Saved Recordings</h3>
+    <div style="display:flex;align-items:center;gap:8px;margin:8px 0;flex-wrap:wrap;">
+      <label style="font-size:13px;color:#aaa;">Date:</label>
+      <input type="date" id="recDate" style="background:#1a1a1a;color:#fff;border:1px solid #333;border-radius:4px;padding:5px 8px;font-size:13px;">
+      <button class="btn" id="btnSearchRec">🔍 Search</button>
+      <button class="btn" id="btnRefreshRec" style="background:#444;color:#fff;">↻ Refresh Today</button>
+      <span id="recStatus" style="font-size:12px;color:#888;margin-left:8px;"></span>
+    </div>
     <table>
       <thead>
         <tr><th>CH</th><th>Date</th><th>Start</th><th>End</th><th>Size</th><th>Type</th><th></th></tr>
@@ -166,6 +173,7 @@
     let fragLoadTimes = [];  // recent frag durations (ring buffer, max 5)
     let slowCount     = 0;   // consecutive slow fragments
     let lastUpgradeAt = 0;
+    let lastLevelUpdate = Date.now(); // watchdog: when did we last hear from HLS
 
     function recordFragLoad(ms) {
         fragLoadTimes.push(ms);
@@ -307,6 +315,7 @@
 
         // Live edge + adaptive trigger
         hls.on(Hls.Events.LEVEL_UPDATED, (_, data) => {
+            lastLevelUpdate = Date.now();
             const liveSyncPos = hls.liveSyncPosition;
             if (liveSyncPos !== null && video.currentTime < liveSyncPos - 5)
                 video.currentTime = liveSyncPos;
@@ -317,20 +326,64 @@
         });
 
         hls.on(Hls.Events.ERROR, (event, data) => {
-            if (data.fatal) {
-                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                    setStatus('Waiting for stream...');
-                    retryTimer = setTimeout(() => startHLS(STREAMS[currentStream]), 3000);
-                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                    setStatus('Media error - recovering...');
-                    hls.recoverMediaError();
-                } else {
-                    setStatus('Fatal error - restarting...');
-                    retryTimer = setTimeout(() => startHLS(STREAMS[currentStream]), 5000);
+            // Non-fatal recovery for stalls (most common cause of "video stops")
+            if (!data.fatal) {
+                if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
+                    data.details === Hls.ErrorDetails.BUFFER_NUDGE_ON_STALL) {
+                    console.log('Non-fatal stall:', data.details, '— nudging to live edge');
+                    const lsp = hls.liveSyncPosition;
+                    if (lsp != null) video.currentTime = lsp;
+                    video.play().catch(() => {});
                 }
+                return;
+            }
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                setStatus('Waiting for stream...');
+                retryTimer = setTimeout(() => startHLS(STREAMS[currentStream]), 3000);
+            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                setStatus('Media error - recovering...');
+                hls.recoverMediaError();
+            } else {
+                setStatus('Fatal error - restarting...');
+                retryTimer = setTimeout(() => startHLS(STREAMS[currentStream]), 5000);
             }
         });
     }
+
+    // ── Native <video> stall recovery ─────────────────────────────
+    // HLS.js sometimes silently stops feeding the buffer; the <video>
+    // element fires waiting/stalled/ended even when HLS.js is "fine".
+    function nudgeToLiveEdge(reason) {
+        if (!hlsInst) return;
+        const lsp = hlsInst.liveSyncPosition;
+        console.log('[stall]', reason, '→ live edge', lsp);
+        if (lsp != null && Math.abs(video.currentTime - lsp) > 1) {
+            video.currentTime = lsp;
+        }
+        video.play().catch(() => {});
+    }
+    video.addEventListener('waiting', () => nudgeToLiveEdge('waiting'));
+    video.addEventListener('stalled', () => nudgeToLiveEdge('stalled'));
+    video.addEventListener('ended',   () => nudgeToLiveEdge('ended'));
+
+    // Watchdog: if HLS.js hasn't fired LEVEL_UPDATED in >8s, force a reload.
+    setInterval(() => {
+        if (!hlsInst) return;
+        const idle = Date.now() - lastLevelUpdate;
+        if (idle > 8000) {
+            console.warn('[watchdog] no LEVEL_UPDATED for', idle, 'ms — restarting HLS');
+            setStatus('Stream paused — reconnecting...');
+            startHLS(STREAMS[currentStream]);
+            lastLevelUpdate = Date.now();
+        }
+    }, 5000);
+
+    // When the tab becomes visible again, jump to live and resume
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+            nudgeToLiveEdge('visibilitychange');
+        }
+    });
 
     overlay.addEventListener('click', () => { overlay.classList.remove('visible'); video.play(); });
     updateBadge('main', true);
@@ -372,6 +425,17 @@
                 const msg = JSON.parse(e.data);
                 if (msg.type === 'recordings') showRecordings(msg.data);
                 if (msg.type === 'streamReady' && msg.stream === 'sub') {
+                    // Server may now send {ready:false} when sub FFmpeg dies/restarts
+                    if (msg.ready === false) {
+                        subStreamReady = false;
+                        console.log('Sub-stream went away (restarting)');
+                        if (currentStream === 'sub') {
+                            // We're currently watching the sub-stream — fall back to main
+                            switchToStream('main', false);
+                            setStatus('Low quality stream restarting — back on HD');
+                        }
+                        return;
+                    }
                     subStreamReady = true;
                     console.log('Sub-stream is ready');
                     if (pendingLowSwitch) {
@@ -438,6 +502,36 @@
         const rec = window._recordings[index];
         alert('Playback for CH' + rec.ch + ' ' + rec.startTime + ' \u2192 ' + rec.endTime + '\n(Playback stream not yet implemented)');
     }
+
+    // ── Recording date search ─────────────────────────────────────
+    const recDateInput  = document.getElementById('recDate');
+    const recStatus     = document.getElementById('recStatus');
+    const todayStr      = new Date().toISOString().slice(0, 10);
+    if (recDateInput) recDateInput.value = todayStr;
+
+    async function queryRecordings(dateStr) {
+        recStatus.textContent = 'Querying device for ' + dateStr + '...';
+        document.getElementById('recordingList').innerHTML =
+            '<tr><td colspan="7" style="color:#888;font-style:italic">Loading recordings for ' + dateStr + '...</td></tr>';
+        try {
+            const r = await fetch('/api/recordings?date=' + encodeURIComponent(dateStr));
+            const j = await r.json();
+            if (j.devicesQueried === 0) {
+                recStatus.textContent = '⚠️ No device connected';
+            } else {
+                recStatus.textContent = 'Sent query (waiting for device reply...)';
+            }
+        } catch (e) {
+            recStatus.textContent = '❌ ' + e.message;
+        }
+    }
+    document.getElementById('btnSearchRec').addEventListener('click', () => {
+        queryRecordings(recDateInput.value || todayStr);
+    });
+    document.getElementById('btnRefreshRec').addEventListener('click', () => {
+        recDateInput.value = todayStr;
+        queryRecordings(todayStr);
+    });
   </script>
 </body>
 </html>
