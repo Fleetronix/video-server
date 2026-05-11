@@ -24,44 +24,79 @@ if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 // Structure: { ch, startTime:'YYYY-MM-DD HH:MM:SS', endTime, filePath, size }
 const recordingsDB = [];
 
-function scanExistingRecordings() {
-    const files = fs.readdirSync('./public').filter(f => f.endsWith('.ts'));
-    files.forEach(f => {
-        const full = `./public/${f}`;
-        const stat = fs.statSync(full);
-        // filename pattern: ch1_001.ts — extract channel
-        const m = f.match(/^ch(\d+)_(\d+)\.ts$/);
-        if (!m) return;
-        const ch = parseInt(m[1]);
-        const dt = new Date(stat.mtimeMs);
-        const fmt = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
-        // approximate: startTime = mtime - 1s (HLS segment duration), endTime = mtime
-        const endDt   = new Date(stat.mtimeMs);
-        const startDt = new Date(stat.mtimeMs - 1000);
-        recordingsDB.push({ ch, startTime: fmt(startDt), endTime: fmt(endDt), filePath: f, size: stat.size });
-    });
-    console.log(`[RecDB] Scanned ${recordingsDB.length} existing .ts segments`);
-}
-scanExistingRecordings();
+// ── Recordings store ──────────────────────────────────────────────────────────
+// We store individual .ts segments with their timestamps.
+// Querying combines them into a single playlist covering the requested range.
+const segmentIndex = []; // { ch, filePath, mtime, size }
 
-// Watch for new .ts files written by FFmpeg
+function formatDT(d) {
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ` +
+           `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+}
+
+function scanExistingSegments() {
+    const files = fs.readdirSync('./public').filter(f => /^ch\d+_\d+\.ts$/.test(f));
+    files.forEach(f => {
+        const stat = fs.statSync(`./public/${f}`);
+        const m    = f.match(/^ch(\d+)_(\d+)\.ts$/);
+        if (!m) return;
+        segmentIndex.push({ ch: parseInt(m[1]), filePath: f, mtime: stat.mtimeMs, size: stat.size });
+    });
+    // sort oldest first
+    segmentIndex.sort((a, b) => a.mtime - b.mtime);
+    console.log(`[RecDB] Indexed ${segmentIndex.length} existing segments`);
+}
+scanExistingSegments();
+
 fs.watch('./public', (eventType, filename) => {
-    if (!filename || !filename.endsWith('.ts')) return;
+    if (!filename || !/^ch\d+_\d+\.ts$/.test(filename)) return;
     const full = `./public/${filename}`;
     if (!fs.existsSync(full)) return;
+    if (segmentIndex.find(s => s.filePath === filename)) return; // already indexed
     const stat = fs.statSync(full);
     const m    = filename.match(/^ch(\d+)_(\d+)\.ts$/);
     if (!m) return;
-    const ch   = parseInt(m[1]);
-    // Avoid duplicate entries
-    if (recordingsDB.find(r => r.filePath === filename)) return;
-    const fmt  = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
-    const endDt   = new Date(stat.mtimeMs);
-    const startDt = new Date(stat.mtimeMs - 1000);
-    const rec  = { ch, startTime: fmt(startDt), endTime: fmt(endDt), filePath: filename, size: stat.size };
-    recordingsDB.push(rec);
-    console.log(`[RecDB] New segment indexed: ${filename} ch${ch} size:${stat.size}`);
+    const entry = { ch: parseInt(m[1]), filePath: filename, mtime: stat.mtimeMs, size: stat.size };
+    segmentIndex.push(entry);
+    segmentIndex.sort((a, b) => a.mtime - b.mtime);
+    console.log(`[RecDB] New segment: ${filename} ch${entry.ch} mtime:${new Date(entry.mtime).toISOString()}`);
 });
+
+// Build a summarised recording list grouped into continuous runs (gap < 5s = same recording)
+function buildRecordingList(ch, fromMs, toMs) {
+    const GAP_MS = 5000; // segments more than 5s apart = new recording session
+    const HLS_DURATION = 1; // each .ts is 1 second
+
+    const segs = segmentIndex.filter(s => {
+        if (s.ch !== ch) return false;
+        const segStart = s.mtime - HLS_DURATION * 1000;
+        const segEnd   = s.mtime;
+        if (toMs   && segStart > toMs)   return false;
+        if (fromMs && segEnd   < fromMs) return false;
+        return true;
+    });
+
+    if (segs.length === 0) return [];
+
+    // Group into continuous runs
+    const runs = [];
+    let run = [segs[0]];
+    for (let i = 1; i < segs.length; i++) {
+        const gap = segs[i].mtime - segs[i-1].mtime;
+        if (gap > GAP_MS) { runs.push(run); run = []; }
+        run.push(segs[i]);
+    }
+    runs.push(run);
+
+    return runs.map(r => ({
+        ch,
+        startTime: formatDT(new Date(r[0].mtime - HLS_DURATION * 1000)),
+        endTime:   formatDT(new Date(r[r.length - 1].mtime)),
+        size:      r.reduce((sum, s) => sum + s.size, 0),
+        segments:  r.map(s => s.filePath),
+        count:     r.length,
+    }));
+}
 
 // ── WebSocket server ──────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ port: CONFIG.wsPort });
@@ -79,64 +114,75 @@ wss.on('connection', (ws, req) => {
 
         // ── query_recordings ─────────────────────────────────────────────
         if (msg.type === 'query_recordings') {
-            const { startDate, endDate } = msg;
-            console.log(`[WS] query_recordings | startDate:${startDate} endDate:${endDate}`);
+            const { startDate, endDate, channel } = msg;
+            console.log(`[WS] query_recordings | ch:${channel || 'all'} from:${startDate} to:${endDate}`);
 
-            let results = [...recordingsDB];
+            const fromMs = startDate ? new Date(startDate + ' 00:00:00').getTime() : null;
+            const toMs   = endDate   ? new Date(endDate   + ' 23:59:59').getTime() : null;
 
-            if (startDate) {
-                results = results.filter(r => r.startTime.split(' ')[0] >= startDate);
-                console.log(`[WS] After startDate filter (${startDate}): ${results.length} records`);
-            }
-            if (endDate) {
-                results = results.filter(r => r.startTime.split(' ')[0] <= endDate);
-                console.log(`[WS] After endDate filter (${endDate}): ${results.length} records`);
-            }
+            // Query all channels if not specified
+            const chs = channel ? [channel] : Object.keys(channels).map(Number);
+            let allRuns = [];
+            chs.forEach(ch => {
+                const runs = buildRecordingList(ch, fromMs, toMs);
+                console.log(`[WS] ch${ch} matched ${runs.length} recording session(s)`);
+                allRuns = allRuns.concat(runs);
+            });
 
-            console.log(`[WS] Sending ${results.length} recordings to browser`);
-            ws.send(JSON.stringify({ type: 'recordings', data: results }));
+            // Sort by startTime descending (newest first)
+            allRuns.sort((a, b) => b.startTime.localeCompare(a.startTime));
+
+            console.log(`[WS] Sending ${allRuns.length} combined recordings to browser`);
+            ws.send(JSON.stringify({ type: 'recordings', data: allRuns }));
         }
 
         // ── playback_request ─────────────────────────────────────────────
         if (msg.type === 'playback_request') {
-            console.log(`[WS] playback_request | ch:${msg.channel} start:${msg.startTime} end:${msg.endTime}`);
+            const { channel, startTime, endTime } = msg;
+            console.log(`[WS] playback_request | ch:${channel} from:${startTime} to:${endTime}`);
 
-            // Find matching segments in the date/time window
-            const segments = recordingsDB.filter(r => {
-                if (r.ch !== msg.channel) return false;
-                if (msg.startTime && r.endTime   < msg.startTime) return false;
-                if (msg.endTime   && r.startTime > msg.endTime)   return false;
+            const fromMs = startTime ? new Date(startTime).getTime() : null;
+            const toMs   = endTime   ? new Date(endTime).getTime()   : null;
+
+            // Collect all segments in this time range for this channel
+            const HLS_DURATION = 1;
+            const segs = segmentIndex.filter(s => {
+                if (s.ch !== channel) return false;
+                const segStart = s.mtime - HLS_DURATION * 1000;
+                const segEnd   = s.mtime;
+                if (toMs   && segStart > toMs)   return false;
+                if (fromMs && segEnd   < fromMs) return false;
                 return true;
             });
 
-            console.log(`[WS] playback_request matched ${segments.length} segment(s):`, segments.map(s => s.filePath));
+            console.log(`[WS] playback segments matched: ${segs.length}`);
+            segs.forEach(s => console.log(`  → ${s.filePath} mtime:${new Date(s.mtime).toISOString()}`));
 
-            if (segments.length === 0) {
-                console.warn('[WS] No matching segments for playback request');
+            if (segs.length === 0) {
+                console.warn('[WS] No segments found for playback range');
                 ws.send(JSON.stringify({ type: 'playback_error', message: 'No segments found for that time range' }));
                 return;
             }
 
-            // Build a temporary m3u8 playlist from the matched segments
-            const playlistName = `playback_ch${msg.channel}_${Date.now()}.m3u8`;
+            // Write combined m3u8 playlist
+            const playlistName = `playback_ch${channel}_${Date.now()}.m3u8`;
             const playlistPath = `./public/${playlistName}`;
-
-            const m3u8Lines = [
+            const m3u8 = [
                 '#EXTM3U',
                 '#EXT-X-VERSION:3',
-                '#EXT-X-TARGETDURATION:2',
+                `#EXT-X-TARGETDURATION:${HLS_DURATION}`,
                 '#EXT-X-MEDIA-SEQUENCE:0',
-                ...segments.map(s => `#EXTINF:1.0,\n${s.filePath}`),
+                ...segs.map(s => `#EXTINF:${HLS_DURATION}.0,\n${s.filePath}`),
                 '#EXT-X-ENDLIST',
-            ];
+            ].join('\n');
 
-            fs.writeFile(playlistPath, m3u8Lines.join('\n'), err => {
+            fs.writeFile(playlistPath, m3u8, err => {
                 if (err) {
-                    console.error('[WS] Failed to write playback playlist:', err.message);
-                    ws.send(JSON.stringify({ type: 'playback_error', message: 'Playlist write failed' }));
+                    console.error('[WS] Playlist write failed:', err.message);
+                    ws.send(JSON.stringify({ type: 'playback_error', message: 'Server error writing playlist' }));
                     return;
                 }
-                console.log(`[WS] Playback playlist written: ${playlistName}`);
+                console.log(`[WS] Playlist written: ${playlistName} with ${segs.length} segments`);
                 ws.send(JSON.stringify({ type: 'playback_url', url: `/public/${playlistName}` }));
             });
         }
