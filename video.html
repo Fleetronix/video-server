@@ -141,36 +141,6 @@
     <div class="info-box" id="info-alarms">Alarms: --</div>
   </div>
 
-  <!-- Recordings -->
-  <div class="recordings">
-    <h3>📹 Saved Recordings</h3>
-
-    <div style="margin-bottom:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-      <label style="color:#aaa; font-size:13px;">From:</label>
-      <input type="date" id="searchFrom" style="background:#222; color:#fff; border:1px solid #444;
-             padding:6px 10px; border-radius:4px; font-size:13px;" />
-      <label style="color:#aaa; font-size:13px;">To:</label>
-      <input type="date" id="searchTo" style="background:#222; color:#fff; border:1px solid #444;
-             padding:6px 10px; border-radius:4px; font-size:13px;" />
-      <button class="btn" onclick="fetchRecordings()">🔍 Search</button>
-      <button class="btn" style="background:#444; color:#fff;" onclick="clearSearch()">✖ Clear</button>
-      <span id="searchStatus" style="color:#888; font-size:12px;"></span>
-    </div>
-
-    <table>
-      <thead>
-        <tr>
-          <th>Channel</th>
-          <th>Start Time</th>
-          <th>End Time</th>
-          <th>Size</th>
-          <th>Action</th>
-        </tr>
-      </thead>
-      <tbody id="recordingList">
-        <tr><td colspan="5" style="color:#666">Waiting for recordings...</td></tr>
-      </tbody>
-    </table>
   </div>
 
   <!-- Playback -->
