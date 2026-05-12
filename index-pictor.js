@@ -20,30 +20,6 @@ console.log(`Server IP: ${CONFIG.serverIp}`);
 // ── Create output folder ──────────────────────────────────────────────────────
 if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 
-// ── Recordings store (in-memory index of saved .ts segments) ─────────────────
-// Structure: { ch, startTime:'YYYY-MM-DD HH:MM:SS', endTime, filePath, size }
-const recordingsDB = [];
-
-
-// Watch for new .ts files written by FFmpeg
-fs.watch('./public', (eventType, filename) => {
-    if (!filename || !filename.endsWith('.ts')) return;
-    const full = `./public/${filename}`;
-    if (!fs.existsSync(full)) return;
-    const stat = fs.statSync(full);
-    const m    = filename.match(/^ch(\d+)_(\d+)\.ts$/);
-    if (!m) return;
-    const ch   = parseInt(m[1]);
-    // Avoid duplicate entries
-    if (recordingsDB.find(r => r.filePath === filename)) return;
-    const fmt  = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
-    const endDt   = new Date(stat.mtimeMs);
-    const startDt = new Date(stat.mtimeMs - 1000);
-    const rec  = { ch, startTime: fmt(startDt), endTime: fmt(endDt), filePath: filename, size: stat.size };
-    recordingsDB.push(rec);
-    console.log(`[RecDB] New segment indexed: ${filename} ch${ch} size:${stat.size}`);
-});
-
 // ── WebSocket server ──────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ port: CONFIG.wsPort });
 console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
@@ -57,70 +33,6 @@ wss.on('connection', (ws, req) => {
             return;
         }
         console.log(`[WS] Message from browser: type=${msg.type}`, msg);
-
-        // ── query_recordings ─────────────────────────────────────────────
-        if (msg.type === 'query_recordings') {
-            const { startDate, endDate } = msg;
-            console.log(`[WS] query_recordings | startDate:${startDate} endDate:${endDate}`);
-
-            let results = [...recordingsDB];
-
-            if (startDate) {
-                results = results.filter(r => r.startTime.split(' ')[0] >= startDate);
-                console.log(`[WS] After startDate filter (${startDate}): ${results.length} records`);
-            }
-            if (endDate) {
-                results = results.filter(r => r.startTime.split(' ')[0] <= endDate);
-                console.log(`[WS] After endDate filter (${endDate}): ${results.length} records`);
-            }
-
-            console.log(`[WS] Sending ${results.length} recordings to browser`);
-            ws.send(JSON.stringify({ type: 'recordings', data: results }));
-        }
-
-        // ── playback_request ─────────────────────────────────────────────
-        if (msg.type === 'playback_request') {
-            console.log(`[WS] playback_request | ch:${msg.channel} start:${msg.startTime} end:${msg.endTime}`);
-
-            // Find matching segments in the date/time window
-            const segments = recordingsDB.filter(r => {
-                if (r.ch !== msg.channel) return false;
-                if (msg.startTime && r.endTime   < msg.startTime) return false;
-                if (msg.endTime   && r.startTime > msg.endTime)   return false;
-                return true;
-            });
-
-            console.log(`[WS] playback_request matched ${segments.length} segment(s):`, segments.map(s => s.filePath));
-
-            if (segments.length === 0) {
-                console.warn('[WS] No matching segments for playback request');
-                ws.send(JSON.stringify({ type: 'playback_error', message: 'No segments found for that time range' }));
-                return;
-            }
-
-            // Build a temporary m3u8 playlist from the matched segments
-            const playlistName = `playback_ch${msg.channel}_${Date.now()}.m3u8`;
-            const playlistPath = `./public/${playlistName}`;
-
-            const m3u8Lines = [
-                '#EXTM3U',
-                '#EXT-X-VERSION:3',
-                '#EXT-X-TARGETDURATION:2',
-                '#EXT-X-MEDIA-SEQUENCE:0',
-                ...segments.map(s => `#EXTINF:1.0,\n${s.filePath}`),
-                '#EXT-X-ENDLIST',
-            ];
-
-            fs.writeFile(playlistPath, m3u8Lines.join('\n'), err => {
-                if (err) {
-                    console.error('[WS] Failed to write playback playlist:', err.message);
-                    ws.send(JSON.stringify({ type: 'playback_error', message: 'Playlist write failed' }));
-                    return;
-                }
-                console.log(`[WS] Playback playlist written: ${playlistName}`);
-                ws.send(JSON.stringify({ type: 'playback_url', url: `/public/${playlistName}` }));
-            });
-        }
     });
 
     ws.on('close', () => console.log('[WS] Browser disconnected'));
