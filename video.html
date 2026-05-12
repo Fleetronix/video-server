@@ -256,14 +256,14 @@
     ws.onerror = e => console.error('WS error', e);
 
     // ── WebSocket receive ─────────────────────────────────────────────────────
-    ws.onopen  = () => {
-        console.log('[WS] Connected to server');
-        // Auto-fetch today on connect
-        const today = new Date().toISOString().split('T')[0];
-        document.getElementById('searchFrom').value = today;
-        document.getElementById('searchTo').value   = today;
-        fetchRecordings();
-    };
+    // ws.onopen  = () => {
+    //     console.log('[WS] Connected to server');
+    //     // Auto-fetch today on connect
+    //     const today = new Date().toISOString().split('T')[0];
+    //     document.getElementById('searchFrom').value = today;
+    //     document.getElementById('searchTo').value   = today;
+    //     fetchRecordings();
+    // };
 
     ws.onclose = () => console.warn('[WS] Disconnected');
     ws.onerror = e  => console.error('[WS] Error:', e);
@@ -306,127 +306,6 @@
             document.getElementById('searchStatus').textContent = '❌ ' + msg.message;
         }
     };
-// ── Recordings: request from server ──────────────────────────────────────
-    function fetchRecordings() {
-        const from   = document.getElementById('searchFrom').value;
-        const to     = document.getElementById('searchTo').value;
-        const status = document.getElementById('searchStatus');
-        console.log('[Rec] fetchRecordings() from:', from, 'to:', to, 'ws.readyState:', ws.readyState);
-
-        if (ws.readyState !== WebSocket.OPEN) {
-            console.warn('[Rec] WS not open, state:', ws.readyState);
-            status.textContent = '❌ Not connected';
-            return;
-        }
-        const payload = { type: 'query_recordings', startDate: from || null, endDate: to || null };
-        console.log('[Rec] Sending:', JSON.stringify(payload));
-        ws.send(JSON.stringify(payload));
-        status.textContent = '⏳ Loading...';
-    }
-
-    function clearSearch() {
-        document.getElementById('searchFrom').value = '';
-        document.getElementById('searchTo').value   = '';
-        document.getElementById('searchStatus').textContent = '';
-        console.log('[Rec] clearSearch — fetching all');
-        fetchRecordings();
-    }
-
-    function showRecordings(list) {
-        console.log('[Rec] showRecordings() count:', list ? list.length : 0);
-        const tbody  = document.getElementById('recordingList');
-        const status = document.getElementById('searchStatus');
-
-        if (!list || list.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="5" style="color:#666">No recordings found</td></tr>';
-            if (status) status.textContent = '⚠️ No recordings found';
-            return;
-        }
-
-        if (status) status.textContent = `✅ ${list.length} recording(s)`;
-        window._recordings = list;
-
-        // Group by date
-        const grouped = {};
-        list.forEach((r, i) => {
-            const date = r.startTime.split(' ')[0];
-            if (!grouped[date]) grouped[date] = [];
-            grouped[date].push({ ...r, index: i });
-        });
-
-        let html = '';
-        Object.keys(grouped).sort().reverse().forEach(date => {
-            html += `<tr><td colspan="5" style="background:#222; color:#00d4ff;
-                font-weight:bold; padding:10px;">📅 ${date}</td></tr>`;
-            grouped[date].forEach(r => {
-                const startT = r.startTime.split(' ')[1] || '--';
-                const endT   = r.endTime   ? r.endTime.split(' ')[1] : '--';
-                html += `
-                    <tr>
-                        <td>CH${r.ch}</td>
-                        <td>${startT}</td>
-                        <td>${endT}</td>
-                        <td>${(r.size / 1024).toFixed(1)} KB</td>
-                        <td>
-                            <button class="btn" onclick="playRecording(${r.index})">▶ Play</button>
-                        </td>
-                    </tr>`;
-            });
-        });
-        tbody.innerHTML = html;
-        console.log('[Rec] Table rendered, groups:', Object.keys(grouped));
-    }
-
-    // ── Playback ──────────────────────────────────────────────────────────────
-    function playRecording(index) {
-        const rec = window._recordings && window._recordings[index];
-        if (!rec) { console.error('[Play] No recording at index', index); return; }
-
-        console.log('[Play] playRecording() index:', index, 'rec:', JSON.stringify(rec));
-
-        if (ws.readyState !== WebSocket.OPEN) {
-            console.warn('[Play] WS not open');
-            return;
-        }
-
-        const payload = { type: 'playback_request', channel: rec.ch, startTime: rec.startTime, endTime: rec.endTime };
-        console.log('[Play] Sending playback_request:', JSON.stringify(payload));
-        ws.send(JSON.stringify(payload));
-        document.getElementById('searchStatus').textContent = '⏳ Loading playback...';
-    }
-
-    function startPlayback(url) {
-        console.log('[Play] startPlayback() url:', url);
-        const section = document.getElementById('playbackSection');
-        section.style.display = 'block';
-        section.scrollIntoView({ behavior: 'smooth' });
-
-        const video = document.getElementById('playback');
-
-        if (window._playbackHls) {
-            console.log('[Play] Destroying previous HLS instance');
-            window._playbackHls.destroy();
-            window._playbackHls = null;
-        }
-
-        if (Hls.isSupported()) {
-            const hls = new Hls();
-            window._playbackHls = hls;
-            hls.on(Hls.Events.ERROR,           (e, d) => console.error('[Play][HLS] Error:', d.type, d.details));
-            hls.on(Hls.Events.MANIFEST_PARSED, ()     => {
-                console.log('[Play][HLS] Manifest parsed, playing');
-                video.play().catch(err => console.warn('[Play] play() blocked:', err));
-            });
-            hls.loadSource(url);
-            hls.attachMedia(video);
-        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            // Safari native HLS
-            video.src = url;
-            video.play().catch(err => console.warn('[Play] Safari play() blocked:', err));
-        } else {
-            console.error('[Play] HLS not supported in this browser');
-        }
-    }
   </script>
 </body>
 </html>
