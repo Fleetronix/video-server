@@ -237,7 +237,7 @@ wss.on('connection', (ws, req) => {
                 return;
             }
             tcpSockets[targetPhone].write(
-                buildFtpUploadRequest(targetPhone, ch, startTime, endTime)
+                buildFtpUploadRequest(targetPhone, 0, startTime, endTime)
             );
             ws.send(JSON.stringify({ type: 'status', message: '⏳ Device uploading to FTP... please wait' }));
         }
