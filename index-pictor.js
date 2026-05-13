@@ -61,6 +61,14 @@ ftpServer.on('upload-end', ({ filePath }) => {
     });
 });
 
+ftpServer.on('PASV', ({ connection }) => {
+    console.log(`[FTP] PASV requested by ${connection.ip}`);
+});
+
+ftpServer.on('STOR', ({ connection, filePath }) => {
+    console.log(`[FTP] STOR started — file:${filePath} from:${connection.ip}`);
+});
+
 ftpServer.listen().then(() => console.log('✓ FTP server on :2121'));
 
 
