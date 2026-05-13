@@ -33,7 +33,8 @@ const ftpServer = new FtpSrv({
     pasv_min:  3500,
     pasv_max:  3600,
     anonymous: true,
-    log:       require('bunyan').createLogger({ name: 'ftp', level: 'trace' }),
+    greeting:  'FTP Server Ready',
+    tls:       false,
 });
 
 ftpServer.on('login', ({ connection, username, password }, resolve, reject) => {
