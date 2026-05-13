@@ -27,7 +27,7 @@ const deviceRecordings= {}; // { [phone]: [{ch,startTime,endTime,size}] }
 // Built-in FTP server so device can upload recordings to us
 // npm install ftp-srv  ←  run this once
 const FtpSrv = require('ftp-srv');
-const ftpServer = new ftpSrv({
+const ftpServer = new FtpSrv({
     url:       'ftp://0.0.0.0:2121',
     pasv_url:  () => '20.244.41.46',
     pasv_min:  3500,
