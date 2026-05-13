@@ -36,9 +36,17 @@ const ftpServer = new FtpSrv({
 });
 if (!fs.existsSync('./recordings')) fs.mkdirSync('./recordings');
 
-ftpServer.on('login', ({ connection }, resolve) => {
-    console.log('[FTP] Device logged in');
+ftpServer.on('login', ({ connection, username, password }, resolve, reject) => {
+    console.log(`[FTP] Login attempt — user:"${username}" pass:"${password}" from:${connection.ip}`);
     resolve({ root: path.resolve('./recordings') });
+});
+
+ftpServer.on('disconnect', ({ connection }) => {
+    console.log(`[FTP] Client disconnected: ${connection.ip}`);
+});
+
+ftpServer.on('client-error', ({ connection, context, error }) => {
+    console.error(`[FTP] Client error from ${connection.ip}:`, error.message, 'context:', context);
 });
 
 ftpServer.on('upload-end', ({ filePath }) => {
@@ -577,7 +585,14 @@ const tcpServer = net.createServer(socket => {
                     const seq  = unescaped.readUInt16BE(10);
                     const body = unescaped.slice(12);
                     console.log(`[signalling] msgId: 0x${msgId.toString(16).padStart(4,'0')} phone: ${phone}`);
-
+                    if (msgId === 0x0001) {
+                        // General response from device to our commands
+                        const replySeq    = body.readUInt16BE(0);
+                        const replyMsgId  = body.readUInt16BE(2);
+                        const replyResult = body[4];
+                        const resultText  = ['Success','Failed','Wrong Msg','Not Supported','Alarm Confirmed','Update Required'][replyResult] || `Unknown(${replyResult})`;
+                        console.log(`[ACK] 0x0001 replyTo:0x${replyMsgId.toString(16).padStart(4,'0')} seq:${replySeq} result:${replyResult} (${resultText})`);
+                    }
                     if (msgId === 0x0100) {
                         socket.write(buildRegisterResponse(phone, seq, 0, 'AUTH1234'));
 
@@ -721,11 +736,51 @@ const tcpServer = net.createServer(socket => {
                     } else if (msgId === 0x1206) {
                         // Device finished uploading file to our FTP server
                         socket.write(buildAck(phone, seq, msgId));
-                        const result = body[2];
-                        console.log(`[Rec] 0x1206 upload complete from ${phone} result:${result}`);
-                        if (result !== 0) {
+
+                        // Log the FULL raw body in hex so we can see exactly what device sent
+                        console.log(`[Rec] 0x1206 raw body (${body.length} bytes):`, body.toString('hex'));
+                        console.log(`[Rec] 0x1206 raw body ascii:`, body.toString('ascii').replace(/[^\x20-\x7E]/g, '.'));
+
+                        // T/98 §5.6.6 Table 27:
+                        // byte 0-1: reply serial number (WORD)
+                        // byte 2:   result (0=success, 1=failed)
+                        const replySerial = body.readUInt16BE(0);
+                        const result      = body[2];
+
+                        const resultMsg = {
+                            0: 'Success',
+                            1: 'Failed',
+                        }[result] || `Unknown(${result})`;
+
+                        console.log(`[Rec] 0x1206 replySerial:${replySerial} result:${result} (${resultMsg})`);
+
+                        if (result === 0) {
+                            console.log(`[Rec] ✅ FTP upload succeeded for ${phone}`);
+                            // File is now in ./recordings/ — FTP upload-end event will notify browser
+                        } else {
+                            console.error(`[Rec] ❌ FTP upload FAILED for ${phone} result:${result}`);
+
+                            // Common reasons:
+                            // 1 = FTP connection refused (wrong IP/port, firewall blocking port 2121)
+                            // 1 = FTP login failed (wrong user/pass)
+                            // 1 = FTP path not found
+                            // 1 = No file found for that time range on SD card
+
+                            const errorDetail = [
+                                `Result code: ${result}`,
+                                `Check: Is port 2121 open on your server firewall?`,
+                                `Check: Can device reach ${CONFIG.serverIp}:2121 ?`,
+                                `Check: Is the time range correct for that recording?`,
+                                `Check: Does the SD card have that file?`,
+                            ].join(' | ');
+
+                            console.error(`[Rec] Debug hints: ${errorDetail}`);
+
                             wss.clients.forEach(c => {
-                                if (c.readyState === 1) c.send(JSON.stringify({ type: 'error', message: 'Device FTP upload failed' }));
+                                if (c.readyState === 1) c.send(JSON.stringify({
+                                    type: 'error',
+                                    message: `FTP upload failed (code ${result}). Check server logs for details.`,
+                                }));
                             });
                         }
 
