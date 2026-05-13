@@ -237,7 +237,7 @@ wss.on('connection', (ws, req) => {
                 return;
             }
             tcpSockets[targetPhone].write(
-                buildFtpUploadRequest(targetPhone, 0, startTime, endTime)
+                buildFtpUploadRequest(targetPhone, ch, startTime, endTime)
             );
             ws.send(JSON.stringify({ type: 'status', message: '⏳ Device uploading to FTP... please wait' }));
         }
@@ -646,7 +646,7 @@ function buildFtpUploadRequest(phone, channel, startTime, endTime) {
     body[p++] = l;                               userBuf.copy(body, p); p += l;
     body[p++] = m;                               passBuf.copy(body, p); p += m;
     body[p++] = n;                               pathBuf.copy(body, p); p += n;
-    body[p++] = channel;
+    body[p++] = 0;
     toBCDBytes(sY%100,sM,sD,sH,sm,sS).copy(body, p); p += 6;
     toBCDBytes(eY%100,eM,eD,eH,em,eS).copy(body, p); p += 6;
     body.fill(0x00, p, p+8);                     p += 8; // no alarm filter
