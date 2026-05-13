@@ -653,7 +653,7 @@ function buildFtpUploadRequest(phone, channel, startTime, endTime) {
     body[p++] = 2;  // avType: video only
     body[p++] = 0;  // all streams
     body[p++] = 0;  // all storage
-    body[p++] = 0b00000100; // task condition: bit2=1 = allow on 4G
+    body[p++] = 0b00000111; // task condition: bit2=1 = allow on 4G
 
     console.log(`[Rec] buildFtpUploadRequest ch:${channel} ${startTime}→${endTime}`);
     return buildFrame(0x9206, body, phone);
