@@ -7,6 +7,7 @@ const path = require('path');
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
 const { spawn } = require('child_process');
+const tcpForwarder = require('./tcp-forwarder');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CONFIG = {
@@ -696,6 +697,10 @@ const tcpServer = net.createServer(socket => {
                 // ── Signalling packet (JT/T 808 — 0x7E framing) ─────────────
                 if (buffer[offset] === 0x7E) {
                     const end = buffer.indexOf(0x7E, offset + 1);
+                    if (end !== -1) {
+                        // Forward the complete raw 0x7E…0x7E frame to the remote server
+                        tcpForwarder.sendSignallingPacket(buffer.slice(offset, end + 1));
+                    }
                     if (end === -1) break;
 
                     const inner     = buffer.slice(offset + 1, end);
@@ -819,6 +824,8 @@ const tcpServer = net.createServer(socket => {
                             ].filter(Boolean).join('|') : 'NONE',
                         }
 
+                        // Forward GPS record to remote TCP server
+                        tcpForwarder.sendGpsRecord(gpsRecord);
                         fs.appendFile(`./${fileName}`, Object.values(gpsRecord).join(',') + '\n', err => {
                             if (err) console.error('[GPS LOG] write error:', err.message);
                         });
