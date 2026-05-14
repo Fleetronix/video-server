@@ -697,10 +697,10 @@ const tcpServer = net.createServer(socket => {
                 // ── Signalling packet (JT/T 808 — 0x7E framing) ─────────────
                 if (buffer[offset] === 0x7E) {
                     const end = buffer.indexOf(0x7E, offset + 1);
-                    if (end !== -1) {
-                        // Forward the complete raw 0x7E…0x7E frame to the remote server
-                        tcpForwarder.sendSignallingPacket(buffer.slice(offset, end + 1));
-                    }
+                    // if (end !== -1) {
+                    //     // Forward the complete raw 0x7E…0x7E frame to the remote server
+                    //     tcpForwarder.sendSignallingPacket(buffer.slice(offset, end + 1));
+                    // }
                     if (end === -1) break;
 
                     const inner     = buffer.slice(offset + 1, end);
