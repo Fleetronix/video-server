@@ -354,12 +354,15 @@ function getOrCreateStream(phone, channel) {
     const key = streamKey(phone, channel);
     if (!deviceStreams[key]) {
         console.log(`[Stream] Creating new stream for ${key}`);
+        console.log(`[Stream] Creating new stream for ${key}`);
         deviceStreams[key] = {
-            ffmpeg:      startFFmpeg(phone, channel),
+            ffmpeg:      null,          // started after codec detection
             gotIFrame:   false,
             subpackets:  [],
             patPmtSent:  false,
             tsCounter:   0,
+            codec:       null,
+            codecDetected: false,
         };
         broadcastDeviceList();
     }
@@ -481,15 +484,26 @@ function handleVideoFrame(frameData, phone, channel, dataType) {
     if (dataType === 0) {
         stream.gotIFrame = true;
 
-        // ── Detect codec from I-frame NAL header ──────────────────────────
-        // HEVC starts with 0x00 0x00 0x00 0x01 0x40 or 0x42 (VPS/SPS NAL types)
-        // AVS/H.264 starts with 0x00 0x00 0x00 0x01 0x67 or similar
         if (!stream.codecDetected) {
             const b4 = frameData[4];
             const isHEVC = (b4 === 0x40 || b4 === 0x42 || b4 === 0x44 || b4 === 0x4e);
             stream.codec = isHEVC ? 'hevc' : 'avs';
             stream.codecDetected = true;
-            console.log(`${key} 🎥 Codec detected: ${stream.codec} (NAL byte: 0x${b4.toString(16)})`);
+            console.log(`${key} 🎥 Codec: ${stream.codec} (NAL=0x${b4.toString(16)})`);
+
+            // Start FFmpeg now that we know the codec
+            stream.ffmpeg = startFFmpeg(phone, channel);
+
+            // Give FFmpeg 200ms to start its stdin pipe before we write
+            setTimeout(() => {
+                if (!stream.patPmtSent && stream.ffmpeg && stream.ffmpeg.stdin.writable) {
+                    const streamType = stream.codec === 'hevc' ? 0x24 : 0x42;
+                    stream.ffmpeg.stdin.write(buildPAT());
+                    stream.ffmpeg.stdin.write(buildPMT(streamType));
+                    stream.patPmtSent = true;
+                    console.log(`${key} 📺 PAT+PMT sent streamType=0x${streamType.toString(16)}`);
+                }
+            }, 200);
         }
 
         console.log(`${key} ✅ I_FRAME size:${frameData.length}`);
@@ -498,21 +512,21 @@ function handleVideoFrame(frameData, phone, channel, dataType) {
         console.log(`${key} ${dataType === 1 ? 'P' : 'B'}_FRAME size:${frameData.length}`);
     }
 
-    if (!stream.ffmpeg || !stream.ffmpeg.stdin.writable) return;
+    if (!stream.ffmpeg || !stream.ffmpeg.stdin.writable || !stream.patPmtSent) return;
 
-    // Send PAT+PMT once — use correct stream type for detected codec
-    if (!stream.patPmtSent) {
-        if (!stream.codec && dataType === 0 && frameData.length > 4) {
-            const nalByte = frameData[4];
-            stream.codec = (nalByte === 0x40 || nalByte === 0x42 || nalByte === 0x44) ? 'hevc' : 'avs';
-            console.log(`${key} 🎥 Codec: ${stream.codec} (NAL=0x${nalByte.toString(16)})`);
-        }
-        const streamType = (stream.codec === 'hevc') ? 0x24 : 0x42;
-        stream.ffmpeg.stdin.write(buildPAT());
-        stream.ffmpeg.stdin.write(buildPMT(streamType));
-        stream.patPmtSent = true;
-        console.log(`${key} 📺 Sent PAT+PMT streamType=0x${streamType.toString(16)}`);
-    }
+    // // Send PAT+PMT once — use correct stream type for detected codec
+    // if (!stream.patPmtSent) {
+    //     if (!stream.codec && dataType === 0 && frameData.length > 4) {
+    //         const nalByte = frameData[4];
+    //         stream.codec = (nalByte === 0x40 || nalByte === 0x42 || nalByte === 0x44) ? 'hevc' : 'avs';
+    //         console.log(`${key} 🎥 Codec: ${stream.codec} (NAL=0x${nalByte.toString(16)})`);
+    //     }
+    //     const streamType = (stream.codec === 'hevc') ? 0x24 : 0x42;
+    //     stream.ffmpeg.stdin.write(buildPAT());
+    //     stream.ffmpeg.stdin.write(buildPMT(streamType));
+    //     stream.patPmtSent = true;
+    //     console.log(`${key} 📺 Sent PAT+PMT streamType=0x${streamType.toString(16)}`);
+    // }
 
     const { packets, nextCounter } = wrapFrameInTS(frameData, stream.tsCounter);
     stream.tsCounter = nextCounter;
