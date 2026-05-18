@@ -765,7 +765,7 @@ processVideoPacket(rawData, streamPhone, channel, dataType, subpktMarker);
                     phone = unescaped.slice(4, 10)
                         .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`)
                         .join('')
-                        .replace(/^0+/, '');
+                        //.replace(/^0+/, '');
                     const seq  = unescaped.readUInt16BE(10);
                     const body = unescaped.slice(12);
                     console.log(`[signalling] msgId: 0x${msgId.toString(16).padStart(4,'0')} phone: ${phone}`);
