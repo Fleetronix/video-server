@@ -303,7 +303,7 @@ const deviceStreams = {};
 
 function streamKey(phone, channel) {
     // return `${phone}_ch${channel}`;
-    return `${phone}_ch${channel}`;
+    return `${phone}`;
 }
 
 function startFFmpeg(phone, channel) {
