@@ -302,7 +302,6 @@ http.createServer((req, res) => {
 const deviceStreams = {};
 
 function streamKey(phone, channel) {
-    // return `${phone}_ch${channel}`;
     return `${phone}_ch${channel}`;
 }
 
@@ -737,12 +736,8 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    // TEMPORARY: log header hex so we can find phone offset
-                    // if (!phone) console.log('[StreamHdr]', buffer.slice(offset, offset + 30).toString('hex'));
-
-                    const streamPhone = phone || buffer.slice(offset + 8, offset + 13)
-    .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`).join('').replace(/^0+/, '');
-processVideoPacket(rawData, streamPhone, channel, dataType, subpktMarker);
+                    const streamPhone = phone || socketToPhone.get(socket) || 'unknown';
+                    processVideoPacket(rawData, streamPhone, channel, dataType, subpktMarker);
 
                     offset += 30 + dataBodyLen;
                     continue;
@@ -778,16 +773,15 @@ processVideoPacket(rawData, streamPhone, channel, dataType, subpktMarker);
                         console.log(`[ACK] 0x0001 replyTo:0x${replyMsgId.toString(16).padStart(4,'0')} seq:${replySeq} result:${replyResult} (${resultText})`);
                     }
                     if (msgId === 0x0100) {
-                        tcpSockets[phone] = socket;
-                        socketToPhone.set(socket, phone);   // ← ADD THIS
                         socket.write(buildRegisterResponse(phone, seq, 0, 'AUTH1234'));
 
                     } else if (msgId === 0x0102) {
                         socket.write(buildAck(phone, seq, msgId));
                         socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
+                        const socketToPhone = new WeakMap();
                         tcpSockets[phone] = socket;
-                        socketToPhone.set(socket, phone);
-                        broadcastDeviceList();   // ← ADD THIS so browser creates the panel immediately
+                        socketToPhone.set(socket, phone); 
+                        console.log(`[signalling] Registered socket for ${phone}`);
                         // Step 1: param query handshake (required before 0x9205 on SDK V6.07)
                         setTimeout(() => {
                             if (!socket.destroyed) {
