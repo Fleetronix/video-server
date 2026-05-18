@@ -23,6 +23,7 @@ if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 
 // ── Device state & FTP ───────────────────────────────────────────────────────
 const tcpSockets      = {}; // { [phone]: socket }
+const socketToPhone   = new WeakMap(); // { socket → phone } // { [phone]: socket }
 const deviceRecordings= {}; // { [phone]: [{ch,startTime,endTime,size}] }
 
 // Built-in FTP server so device can upload recordings to us
