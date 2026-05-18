@@ -735,7 +735,8 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    processVideoPacket(rawData, phone || 'unknown', channel, dataType, subpktMarker);
+                    const streamPhone = phone || socketToPhone.get(socket) || 'unknown';
+                    processVideoPacket(rawData, streamPhone, channel, dataType, subpktMarker);
 
                     offset += 30 + dataBodyLen;
                     continue;
@@ -776,7 +777,9 @@ const tcpServer = net.createServer(socket => {
                     } else if (msgId === 0x0102) {
                         socket.write(buildAck(phone, seq, msgId));
                         socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
+                        const socketToPhone = new WeakMap();
                         tcpSockets[phone] = socket;
+                        socketToPhone.set(socket, phone); 
                         console.log(`[signalling] Registered socket for ${phone}`);
                         // Step 1: param query handshake (required before 0x9205 on SDK V6.07)
                         setTimeout(() => {
