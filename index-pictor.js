@@ -19,18 +19,16 @@ const CONFIG = {
 console.log(`Server IP: ${CONFIG.serverIp}`);
 
 // ── Create output folder ──────────────────────────────────────────────────────
-if (!fs.existsSync('./public')) fs.mkdirSync('./public');
+fs.mkdirSync('./public',     { recursive: true });
+fs.mkdirSync('./recordings', { recursive: true });
 
 // ── Device state & FTP ───────────────────────────────────────────────────────
 const tcpSockets      = {}; // { [phone]: socket }
-const socketToPhone   = new WeakMap(); // { socket → phone } // { [phone]: socket }
+const socketToPhone   = new WeakMap(); // { socket → phone }
 const deviceRecordings= {}; // { [phone]: [{ch,startTime,endTime,size}] }
 const deviceImei      = {}; // { [phone]: imeiString }
 
 // Built-in FTP server so device can upload recordings to us
-// npm install ftp-srv  ←  run this once
-// ── Minimal FTP Server (PASV only, no EPSV — required for Babelstar device) ──
-if (!fs.existsSync('./recordings')) fs.mkdirSync('./recordings');
 
 const PUBLIC_IP = '20.244.41.46';
 const FTP_PORT  = 2121;
@@ -310,6 +308,9 @@ function startFFmpeg(phone, channel) {
     const key    = streamKey(phone, channel);
     const prefix = `./public/${key}`;
 
+    // Always ensure output directory exists before spawning FFmpeg
+    fs.mkdirSync('./public', { recursive: true });
+
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
         '-fflags',          '+genpts+discardcorrupt+igndts',
         '-err_detect',      'ignore_err',
@@ -331,10 +332,8 @@ function startFFmpeg(phone, channel) {
     ]);
 
     ffmpeg.stderr.on('data', d => {
-        const msg = d.toString().trim();
-        if (msg.includes('Error') || msg.includes('Invalid') || msg.includes('error')) {
-            console.error(`FFmpeg ${key}:`, msg);
-        }
+        // Log everything — missing output dir shows as "No such file or directory"
+        console.log(`[FFmpeg ${key}]`, d.toString().trim());
     });
 
     ffmpeg.on('close', code => {
@@ -813,7 +812,7 @@ const tcpServer = net.createServer(socket => {
                     }
                     if (msgId === 0x0100) {
                         tcpSockets[phone] = socket;
-                        socketToPhone.set(socket, phone);   // ← ADD THIS
+                        socketToPhone.set(socket, phone);
                         socket.write(buildRegisterResponse(phone, seq, 0, 'AUTH1234'));
 
                         // Extract IMEI from registration body (bytes 4–18 ASCII, or 4–11 BCD)
