@@ -502,7 +502,12 @@ function handleVideoFrame(frameData, phone, channel, dataType) {
 
     // Send PAT+PMT once — use correct stream type for detected codec
     if (!stream.patPmtSent) {
-        const streamType = (stream.codec === 'hevc') ? 0x24 : 0x42; // 0x24=HEVC, 0x42=AVS
+        if (!stream.codec && dataType === 0 && frameData.length > 4) {
+            const nalByte = frameData[4];
+            stream.codec = (nalByte === 0x40 || nalByte === 0x42 || nalByte === 0x44) ? 'hevc' : 'avs';
+            console.log(`${key} 🎥 Codec: ${stream.codec} (NAL=0x${nalByte.toString(16)})`);
+        }
+        const streamType = (stream.codec === 'hevc') ? 0x24 : 0x42;
         stream.ffmpeg.stdin.write(buildPAT());
         stream.ffmpeg.stdin.write(buildPMT(streamType));
         stream.patPmtSent = true;
