@@ -19,16 +19,17 @@ const CONFIG = {
 console.log(`Server IP: ${CONFIG.serverIp}`);
 
 // ── Create output folder ──────────────────────────────────────────────────────
-fs.mkdirSync('./public',     { recursive: true });
-fs.mkdirSync('./recordings', { recursive: true });
+if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 
 // ── Device state & FTP ───────────────────────────────────────────────────────
 const tcpSockets      = {}; // { [phone]: socket }
-const socketToPhone   = new WeakMap(); // { socket → phone }
+const socketToPhone   = new WeakMap(); // { socket → phone } // { [phone]: socket }
 const deviceRecordings= {}; // { [phone]: [{ch,startTime,endTime,size}] }
-const deviceImei      = {}; // { [phone]: imeiString }
 
 // Built-in FTP server so device can upload recordings to us
+// npm install ftp-srv  ←  run this once
+// ── Minimal FTP Server (PASV only, no EPSV — required for Babelstar device) ──
+if (!fs.existsSync('./recordings')) fs.mkdirSync('./recordings');
 
 const PUBLIC_IP = '20.244.41.46';
 const FTP_PORT  = 2121;
@@ -301,15 +302,12 @@ http.createServer((req, res) => {
 const deviceStreams = {};
 
 function streamKey(phone, channel) {
-    return `${phone}`;
+    return `${phone}_ch${channel}`;
 }
 
 function startFFmpeg(phone, channel) {
     const key    = streamKey(phone, channel);
     const prefix = `./public/${key}`;
-
-    // Always ensure output directory exists before spawning FFmpeg
-    fs.mkdirSync('./public', { recursive: true });
 
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
         '-fflags',          '+genpts+discardcorrupt+igndts',
@@ -332,8 +330,10 @@ function startFFmpeg(phone, channel) {
     ]);
 
     ffmpeg.stderr.on('data', d => {
-        // Log everything — missing output dir shows as "No such file or directory"
-        console.log(`[FFmpeg ${key}]`, d.toString().trim());
+        const msg = d.toString().trim();
+        if (msg.includes('Error') || msg.includes('Invalid') || msg.includes('error')) {
+            console.error(`FFmpeg ${key}:`, msg);
+        }
     });
 
     ffmpeg.on('close', code => {
@@ -375,7 +375,7 @@ function broadcastDeviceList() {
     // Build per-phone stream list
     for (const key of Object.keys(deviceStreams)) {
         const [ph, chPart] = key.split('_ch');
-        if (!devices[ph]) devices[ph] = { phone: ph, imei: deviceImei[ph] || null, channels: [] };
+        if (!devices[ph]) devices[ph] = { phone: ph, channels: [] };
         devices[ph].channels.push(parseInt(chPart, 10));
     }
     const payload = JSON.stringify({ type: 'device_list', devices: Object.values(devices) });
@@ -484,26 +484,15 @@ function handleVideoFrame(frameData, phone, channel, dataType) {
     if (dataType === 0) {
         stream.gotIFrame = true;
 
+        // ── Detect codec from I-frame NAL header ──────────────────────────
+        // HEVC starts with 0x00 0x00 0x00 0x01 0x40 or 0x42 (VPS/SPS NAL types)
+        // AVS/H.264 starts with 0x00 0x00 0x00 0x01 0x67 or similar
         if (!stream.codecDetected) {
             const b4 = frameData[4];
             const isHEVC = (b4 === 0x40 || b4 === 0x42 || b4 === 0x44 || b4 === 0x4e);
             stream.codec = isHEVC ? 'hevc' : 'avs';
             stream.codecDetected = true;
-            console.log(`${key} 🎥 Codec: ${stream.codec} (NAL=0x${b4.toString(16)})`);
-
-            // Start FFmpeg now that we know the codec
-            stream.ffmpeg = startFFmpeg(phone, channel);
-
-            // Give FFmpeg 200ms to start its stdin pipe before we write
-            setTimeout(() => {
-                if (!stream.patPmtSent && stream.ffmpeg && stream.ffmpeg.stdin.writable) {
-                    const streamType = stream.codec === 'hevc' ? 0x24 : 0x42;
-                    stream.ffmpeg.stdin.write(buildPAT());
-                    stream.ffmpeg.stdin.write(buildPMT(streamType));
-                    stream.patPmtSent = true;
-                    console.log(`${key} 📺 PAT+PMT sent streamType=0x${streamType.toString(16)}`);
-                }
-            }, 200);
+            console.log(`${key} 🎥 Codec detected: ${stream.codec} (NAL byte: 0x${b4.toString(16)})`);
         }
 
         console.log(`${key} ✅ I_FRAME size:${frameData.length}`);
@@ -512,21 +501,21 @@ function handleVideoFrame(frameData, phone, channel, dataType) {
         console.log(`${key} ${dataType === 1 ? 'P' : 'B'}_FRAME size:${frameData.length}`);
     }
 
-    if (!stream.ffmpeg || !stream.ffmpeg.stdin.writable || !stream.patPmtSent) return;
+    if (!stream.ffmpeg || !stream.ffmpeg.stdin.writable) return;
 
-    // // Send PAT+PMT once — use correct stream type for detected codec
-    // if (!stream.patPmtSent) {
-    //     if (!stream.codec && dataType === 0 && frameData.length > 4) {
-    //         const nalByte = frameData[4];
-    //         stream.codec = (nalByte === 0x40 || nalByte === 0x42 || nalByte === 0x44) ? 'hevc' : 'avs';
-    //         console.log(`${key} 🎥 Codec: ${stream.codec} (NAL=0x${nalByte.toString(16)})`);
-    //     }
-    //     const streamType = (stream.codec === 'hevc') ? 0x24 : 0x42;
-    //     stream.ffmpeg.stdin.write(buildPAT());
-    //     stream.ffmpeg.stdin.write(buildPMT(streamType));
-    //     stream.patPmtSent = true;
-    //     console.log(`${key} 📺 Sent PAT+PMT streamType=0x${streamType.toString(16)}`);
-    // }
+    // Send PAT+PMT once — use correct stream type for detected codec
+    if (!stream.patPmtSent) {
+        if (!stream.codec && dataType === 0 && frameData.length > 4) {
+            const nalByte = frameData[4];
+            stream.codec = (nalByte === 0x40 || nalByte === 0x42 || nalByte === 0x44) ? 'hevc' : 'avs';
+            console.log(`${key} 🎥 Codec: ${stream.codec} (NAL=0x${nalByte.toString(16)})`);
+        }
+        const streamType = (stream.codec === 'hevc') ? 0x24 : 0x42;
+        stream.ffmpeg.stdin.write(buildPAT());
+        stream.ffmpeg.stdin.write(buildPMT(streamType));
+        stream.patPmtSent = true;
+        console.log(`${key} 📺 Sent PAT+PMT streamType=0x${streamType.toString(16)}`);
+    }
 
     const { packets, nextCounter } = wrapFrameInTS(frameData, stream.tsCounter);
     stream.tsCounter = nextCounter;
@@ -772,7 +761,7 @@ const tcpServer = net.createServer(socket => {
                     // TEMPORARY: log header hex so we can find phone offset
                     // if (!phone) console.log('[StreamHdr]', buffer.slice(offset, offset + 30).toString('hex'));
 
-                    const streamPhone = phone || buffer.slice(offset + 7, offset + 13)
+                    const streamPhone = phone || buffer.slice(offset + 8, offset + 13)
                         .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`).join('').replace(/^0+/, '');
                     processVideoPacket(rawData, streamPhone, channel, dataType, subpktMarker);
                     // TEMPORARY — log codec byte
@@ -812,23 +801,8 @@ const tcpServer = net.createServer(socket => {
                     }
                     if (msgId === 0x0100) {
                         tcpSockets[phone] = socket;
-                        socketToPhone.set(socket, phone);
+                        socketToPhone.set(socket, phone);   // ← ADD THIS
                         socket.write(buildRegisterResponse(phone, seq, 0, 'AUTH1234'));
-
-                        // Extract IMEI from registration body (bytes 4–18 ASCII, or 4–11 BCD)
-                        if (body.length >= 19) {
-                            const imeiAscii = body.slice(4, 19).toString('ascii').replace(/[^\d]/g, '');
-                            const imeiBcd   = body.slice(4, 12)
-                                .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`).join('').replace(/^0+/, '').slice(0, 15);
-                            const imei = /^\d{15}$/.test(imeiAscii) ? imeiAscii
-                                       : /^\d{14,15}$/.test(imeiBcd) ? imeiBcd
-                                       : imeiAscii || imeiBcd;
-                            deviceImei[phone] = imei;
-                            console.log(`[Reg] IMEI for ${phone}: ${imei}`);
-                            wss.clients.forEach(c => {
-                                if (c.readyState === 1) c.send(JSON.stringify({ type: 'imei', phone, imei }));
-                            });
-                        }
 
                     } else if (msgId === 0x0102) {
                         socket.write(buildAck(phone, seq, msgId));
