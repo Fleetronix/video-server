@@ -736,8 +736,10 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    const streamPhone = phone || socketToPhone.get(socket) || 'unknown';
-                    processVideoPacket(rawData, streamPhone, channel, dataType, subpktMarker);
+                    // TEMPORARY: log header hex so we can find phone offset
+                    if (!phone) console.log('[StreamHdr]', buffer.slice(offset, offset + 30).toString('hex'));
+
+                    processVideoPacket(rawData, phone || socketToPhone.get(socket) || 'unknown', channel, dataType, subpktMarker);
 
                     offset += 30 + dataBodyLen;
                     continue;
@@ -773,6 +775,8 @@ const tcpServer = net.createServer(socket => {
                         console.log(`[ACK] 0x0001 replyTo:0x${replyMsgId.toString(16).padStart(4,'0')} seq:${replySeq} result:${replyResult} (${resultText})`);
                     }
                     if (msgId === 0x0100) {
+                        tcpSockets[phone] = socket;
+                        socketToPhone.set(socket, phone);   // ← ADD THIS
                         socket.write(buildRegisterResponse(phone, seq, 0, 'AUTH1234'));
 
                     } else if (msgId === 0x0102) {
