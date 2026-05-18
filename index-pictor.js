@@ -197,6 +197,9 @@ console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
 wss.on('connection', (ws, req) => {
     console.log(`[WS] Browser connected from ${req.socket.remoteAddress}`);
 
+    // Send current device list immediately so the browser can render existing streams
+    broadcastDeviceList();
+
     ws.on('message', raw => {
         let msg;
         try { msg = JSON.parse(raw); } catch(e) {
@@ -290,15 +293,29 @@ http.createServer((req, res) => {
 // Fix: wrap raw AVS frames in MPEG-TS packets (stream type 0x42 = AVS) and
 // feed that to FFmpeg as -f mpegts. FFmpeg then uses its AVS demuxer/decoder
 // and transcodes to libx264 for browser-compatible HLS output.
-function startFFmpeg(channel) {
+//
+// Channels are now keyed by `${phone}_ch${channel}` so multiple devices
+// each get their own independent FFmpeg process and HLS stream.
+
+// deviceStreams: { [streamKey]: { ffmpeg, gotIFrame, subpackets, patPmtSent, tsCounter } }
+const deviceStreams = {};
+
+function streamKey(phone, channel) {
+    return `${phone}_ch${channel}`;
+}
+
+function startFFmpeg(phone, channel) {
+    const key    = streamKey(phone, channel);
+    const prefix = `./public/${key}`;
+
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
         '-fflags',          '+genpts+discardcorrupt+igndts',
         '-err_detect',      'ignore_err',
-        '-f',               'mpegts',        // MPEG-TS input — auto-detects AVS via stream type 0x42
-        '-probesize',       '500000',        // enough bytes for AVS codec detection
+        '-f',               'mpegts',
+        '-probesize',       '500000',
         '-analyzeduration', '1000000',
         '-i',               'pipe:0',
-        '-c:v',             'libx264',       // transcode AVS → H.264 for browser/HLS
+        '-c:v',             'libx264',
         '-preset',          'ultrafast',
         '-tune',            'zerolatency',
         '-g',               '50',
@@ -307,30 +324,62 @@ function startFFmpeg(channel) {
         '-hls_time',        '1',
         '-hls_list_size',   '3',
         '-hls_flags',       'delete_segments+append_list',
-        '-hls_segment_filename', `./public/ch${channel}_%03d.ts`,
-        `./public/ch${channel}.m3u8`,
+        '-hls_segment_filename', `${prefix}_%03d.ts`,
+        `${prefix}.m3u8`,
     ]);
 
     ffmpeg.stderr.on('data', d => {
         const msg = d.toString().trim();
         if (msg.includes('Error') || msg.includes('Invalid') || msg.includes('error')) {
-            console.error(`FFmpeg ch${channel}:`, msg);
+            console.error(`FFmpeg ${key}:`, msg);
         }
     });
 
     ffmpeg.on('close', code => {
-        console.log(`FFmpeg ch${channel} closed (code ${code}), restarting in 1s...`);
-        setTimeout(() => { channels[channel].ffmpeg = startFFmpeg(channel); }, 1000);
+        console.log(`FFmpeg ${key} closed (code ${code}), restarting in 1s...`);
+        setTimeout(() => {
+            if (deviceStreams[key]) deviceStreams[key].ffmpeg = startFFmpeg(phone, channel);
+        }, 1000);
     });
 
     return ffmpeg;
 }
 
-const channels = {
-    1: { ffmpeg: null, gotIFrame: false, subpackets: [] },
-};
+/**
+ * Get-or-create the stream state for a given phone+channel combination.
+ * Also triggers a browser refresh of the device list.
+ */
+function getOrCreateStream(phone, channel) {
+    const key = streamKey(phone, channel);
+    if (!deviceStreams[key]) {
+        console.log(`[Stream] Creating new stream for ${key}`);
+        deviceStreams[key] = {
+            ffmpeg:      startFFmpeg(phone, channel),
+            gotIFrame:   false,
+            subpackets:  [],
+            patPmtSent:  false,
+            tsCounter:   0,
+        };
+        broadcastDeviceList();
+    }
+    return deviceStreams[key];
+}
 
-channels[1].ffmpeg = startFFmpeg(1);
+/** Broadcast the current list of connected devices + their streams to all browsers. */
+function broadcastDeviceList() {
+    const devices = {};
+    // Build per-phone stream list
+    for (const key of Object.keys(deviceStreams)) {
+        const [ph, chPart] = key.split('_ch');
+        if (!devices[ph]) devices[ph] = { phone: ph, channels: [] };
+        devices[ph].channels.push(parseInt(chPart, 10));
+    }
+    const payload = JSON.stringify({ type: 'device_list', devices: Object.values(devices) });
+    wss.clients.forEach(c => { if (c.readyState === 1) c.send(payload); });
+}
+
+// Legacy alias kept for the unchanged channels reference below
+const channels = deviceStreams;
 
 // ── MPEG-TS wrapping for AVS frames ──────────────────────────────────────────
 // We build a minimal but valid MPEG-TS stream:
@@ -418,62 +467,60 @@ function wrapFrameInTS(frameData, counter) {
     return { packets, nextCounter: ctr };
 }
 
-let patPmtSent = false;
-let tsCounter  = 0;
+// (patPmtSent and tsCounter are now per-stream inside deviceStreams entries)
 
 // ── Handle one complete video frame ──────────────────────────────────────────
-function handleVideoFrame(frameData, channel, dataType) {
-    const ch = channels[channel];
-    if (!ch) return;
+function handleVideoFrame(frameData, phone, channel, dataType) {
+    const stream = getOrCreateStream(phone, channel);
 
-    const isVideo  = (dataType === 0 || dataType === 1 || dataType === 2);
+    const isVideo = (dataType === 0 || dataType === 1 || dataType === 2);
     if (!isVideo) return;
 
+    const key = streamKey(phone, channel);
     if (dataType === 0) {
-        ch.gotIFrame = true;
-        console.log(`ch${channel} ✅ I_FRAME size:${frameData.length}`);
+        stream.gotIFrame = true;
+        console.log(`${key} ✅ I_FRAME size:${frameData.length}`);
     } else {
-        if (!ch.gotIFrame) return;  // drop P/B until first I-frame
-        console.log(`ch${channel} ${dataType === 1 ? 'P' : 'B'}_FRAME size:${frameData.length}`);
+        if (!stream.gotIFrame) return; // drop P/B until first I-frame
+        console.log(`${key} ${dataType === 1 ? 'P' : 'B'}_FRAME size:${frameData.length}`);
     }
 
-    if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
+    if (!stream.ffmpeg || !stream.ffmpeg.stdin.writable) return;
 
-    // Send PAT+PMT once so FFmpeg learns the stream structure before any PES
-    if (!patPmtSent) {
-        ch.ffmpeg.stdin.write(buildPAT());
-        ch.ffmpeg.stdin.write(buildPMT());
-        patPmtSent = true;
-        console.log(`ch${channel} 📺 Sent PAT+PMT (AVS stream type 0x42)`);
+    // Send PAT+PMT once per stream
+    if (!stream.patPmtSent) {
+        stream.ffmpeg.stdin.write(buildPAT());
+        stream.ffmpeg.stdin.write(buildPMT());
+        stream.patPmtSent = true;
+        console.log(`${key} 📺 Sent PAT+PMT (AVS stream type 0x42)`);
     }
 
-    const { packets, nextCounter } = wrapFrameInTS(frameData, tsCounter);
-    tsCounter = nextCounter;
-    for (const pkt of packets) ch.ffmpeg.stdin.write(pkt);
+    const { packets, nextCounter } = wrapFrameInTS(frameData, stream.tsCounter);
+    stream.tsCounter = nextCounter;
+    for (const pkt of packets) stream.ffmpeg.stdin.write(pkt);
 }
 
 // ── Reassemble subpackets (T/98 protocol section 5.5.3) ──────────────────────
 // subpktMarker: 0=atomic, 1=first, 3=middle, 2=last
-function processVideoPacket(rawData, channel, dataType, subpktMarker) {
-    const ch = channels[channel];
-    if (!ch) return;
+function processVideoPacket(rawData, phone, channel, dataType, subpktMarker) {
+    const stream = getOrCreateStream(phone, channel);
 
     if (subpktMarker === 0) {
-        handleVideoFrame(rawData, channel, dataType);
+        handleVideoFrame(rawData, phone, channel, dataType);
 
     } else if (subpktMarker === 1) {
-        ch.subpackets = [rawData];
+        stream.subpackets = [rawData];
 
     } else if (subpktMarker === 3) {
-        if (ch.subpackets.length > 0) ch.subpackets.push(rawData);
+        if (stream.subpackets.length > 0) stream.subpackets.push(rawData);
 
     } else if (subpktMarker === 2) {
-        if (ch.subpackets.length > 0) {
-            ch.subpackets.push(rawData);
-            const complete = Buffer.concat(ch.subpackets);
-            ch.subpackets  = [];
-            console.log(`ch${channel} complete frame size:${complete.length}`);
-            handleVideoFrame(complete, channel, dataType);
+        if (stream.subpackets.length > 0) {
+            stream.subpackets.push(rawData);
+            const complete   = Buffer.concat(stream.subpackets);
+            stream.subpackets = [];
+            console.log(`${streamKey(phone, channel)} complete frame size:${complete.length}`);
+            handleVideoFrame(complete, phone, channel, dataType);
         }
     }
 }
@@ -688,7 +735,7 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    processVideoPacket(rawData, channel, dataType, subpktMarker);
+                    processVideoPacket(rawData, phone || 'unknown', channel, dataType, subpktMarker);
 
                     offset += 30 + dataBodyLen;
                     continue;
@@ -790,6 +837,7 @@ const tcpServer = net.createServer(socket => {
 
                         console.log(`[GPS] ${phone} lat=${lat} lon=${lon} speed=${speed}km/h dir=${direction}° dt=${dt}`);
 
+                        // Broadcast with phone so browsers route to the right device panel
                         wss.clients.forEach(client => {
                             if (client.readyState === 1) client.send(JSON.stringify(locationData));
                         });
@@ -936,7 +984,19 @@ const tcpServer = net.createServer(socket => {
 
     socket.on('close', () => {
         console.log(`Device disconnected: ${remote} phone:${phone}`);
-        if (phone) delete tcpSockets[phone];
+        if (phone) {
+            delete tcpSockets[phone];
+            // Tear down all FFmpeg processes for this device
+            for (const key of Object.keys(deviceStreams)) {
+                if (key.startsWith(`${phone}_`)) {
+                    const stream = deviceStreams[key];
+                    if (stream.ffmpeg) { try { stream.ffmpeg.kill(); } catch(_){} }
+                    delete deviceStreams[key];
+                    console.log(`[Stream] Removed stream ${key}`);
+                }
+            }
+            broadcastDeviceList();
+        }
     });
     socket.on('error', err => console.error(`Socket error: ${err.message}`));
 });

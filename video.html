@@ -1,325 +1,415 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Vehicle Camera</title>
+    <title>Fleet Monitor</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
-        body { background: #111; color: #fff; font-family: Arial; padding: 20px; margin: 0; }
-        h3   { color: #00d4ff; }
-        video { width: 100%; max-width: 900px; display: block; margin: 10px 0; background: #000; }
-        .live-badge { background: #f00; color: #fff; padding: 2px 8px;
-                      border-radius: 4px; font-size: 11px; margin-left: 8px; }
-        .info-box { background: #222; padding: 10px; border-radius: 6px;
-                    font-size: 13px; border-left: 3px solid #00d4ff; }
-        #map { height: 400px; border-radius: 8px; border: 1px solid #333; }
-        #gpsInfo { background: #1a1a1a; padding: 15px; border-radius: 8px;
-                   display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px;
-                   margin-top: 15px; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background: #0d0d0d; color: #e0e0e0; font-family: Arial, sans-serif; }
+
+        /* ── Top bar ── */
+        #topbar {
+            display: flex; align-items: center; gap: 14px;
+            background: #161616; border-bottom: 1px solid #222;
+            padding: 10px 18px;
+        }
+        #topbar h1 { font-size: 16px; color: #00d4ff; flex: 1; }
+        #deviceTabs { display: flex; gap: 8px; flex-wrap: wrap; }
+        .tab-btn {
+            background: #222; color: #aaa; border: 1px solid #333;
+            padding: 5px 14px; border-radius: 20px; cursor: pointer;
+            font-size: 13px; transition: all .2s;
+        }
+        .tab-btn.active { background: #00d4ff; color: #000; border-color: #00d4ff; font-weight: bold; }
+        .tab-btn .dot {
+            display: inline-block; width: 8px; height: 8px;
+            background: #2ecc71; border-radius: 50%; margin-right: 5px;
+        }
+        #noDevices {
+            padding: 80px; text-align: center; color: #555; font-size: 15px;
+        }
+        #noDevices span { display: block; font-size: 48px; margin-bottom: 14px; }
+
+        /* ── Device panel ── */
+        .device-panel { display: none; padding: 16px 18px; }
+        .device-panel.active { display: block; }
+
+        /* ── Channel grid ── */
+        .channel-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(440px, 1fr));
+            gap: 14px;
+            margin-bottom: 18px;
+        }
+        .channel-card {
+            background: #161616; border: 1px solid #222; border-radius: 8px;
+            overflow: hidden;
+        }
+        .channel-card h3 {
+            padding: 8px 12px; font-size: 13px; color: #00d4ff;
+            background: #111; border-bottom: 1px solid #222;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .live-badge {
+            background: #c0392b; color: #fff; padding: 1px 7px;
+            border-radius: 4px; font-size: 10px; letter-spacing: 1px;
+        }
+        video { width: 100%; display: block; background: #000; aspect-ratio: 16/9; }
+
+        /* ── Map + GPS row ── */
+        .map-row { display: grid; grid-template-columns: 1fr 320px; gap: 14px; margin-bottom: 14px; }
+        .device-map { height: 320px; border-radius: 8px; border: 1px solid #222; }
+
+        .gps-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-content: start; }
+        .info-box {
+            background: #1a1a1a; padding: 9px 12px; border-radius: 6px;
+            font-size: 12px; border-left: 3px solid #00d4ff; color: #ccc;
+        }
+        .info-box strong { display: block; color: #888; font-size: 10px; margin-bottom: 2px; }
+
+        /* ── Recordings ── */
+        .section-title { color: #00d4ff; font-size: 14px; margin: 18px 0 10px; }
+        .rec-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+        .rec-controls input[type=datetime-local] {
+            background: #222; color: #fff; border: 1px solid #444;
+            padding: 6px 10px; border-radius: 4px; font-size: 13px;
+        }
+        .btn { border: none; padding: 7px 15px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 13px; }
+        .btn-blue  { background: #00d4ff; color: #000; }
+        .btn-green { background: #27ae60; color: #fff; }
+
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        thead tr { background: #1a1a1a; }
+        th { padding: 8px 10px; color: #00d4ff; text-align: left; border-bottom: 1px solid #222; }
+        td { padding: 8px 10px; border-bottom: 1px solid #1a1a1a; }
+        .btn-sm { padding: 4px 10px; font-size: 12px; border-radius: 3px; border: none;
+                  cursor: pointer; background: #00d4ff; color: #000; font-weight: bold; }
+        .playback-section { margin-top: 18px; display: none; }
+        .playback-section video { max-width: 900px; background: #000; border-radius: 6px; }
     </style>
 </head>
 <body>
 
-  <!-- Live Video -->
-  <div>
-    <h3>Channel 1 - Front <span class="live-badge">LIVE</span></h3>
-    <video id="ch1" autoplay muted controls></video>
-  </div>
+<div id="topbar">
+    <h1>🚛 Fleet Monitor</h1>
+    <div id="deviceTabs"></div>
+</div>
 
-  <!-- Map -->
-  <h3>Vehicle Location</h3>
-  <div id="map"></div>
+<div id="noDevices">
+    <span>📡</span>
+    Waiting for devices to connect…
+</div>
 
-  <!-- GPS Info -->
-  <div id="gpsInfo">
-    <div class="info-box" id="info-lat">Latitude: --</div>
-    <div class="info-box" id="info-lon">Longitude: --</div>
-    <div class="info-box" id="info-speed">Speed: --</div>
-    <div class="info-box" id="info-dir">Direction: --</div>
-    <div class="info-box" id="info-elev">Elevation: --</div>
-    <div class="info-box" id="info-dt">DateTime: --</div>
-    <div class="info-box" id="info-acc">ACC: --</div>
-    <div class="info-box" id="info-located">Located: --</div>
-    <div class="info-box" id="info-mileage">Mileage: --</div>
-    <div class="info-box" id="info-voltage">Voltage: --</div>
-    <div class="info-box" id="info-satellites">Satellites: --</div>
-    <div class="info-box" id="info-alarms">Alarms: --</div>
-  </div>
-<!-- Recordings -->
-  <div style="margin-top:30px;">
-    <h3>📹 Recordings</h3>
+<div id="devicePanels"></div>
 
-    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:12px;">
-      <label style="color:#aaa; font-size:13px;">From:</label>
-      <input type="datetime-local" id="recFrom"
-             style="background:#222;color:#fff;border:1px solid #444;padding:6px 10px;border-radius:4px;font-size:13px;" />
-      <label style="color:#aaa; font-size:13px;">To:</label>
-      <input type="datetime-local" id="recTo"
-             style="background:#222;color:#fff;border:1px solid #444;padding:6px 10px;border-radius:4px;font-size:13px;" />
-      <button onclick="searchRecordings()"
-              style="background:#00d4ff;color:#000;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-weight:bold;">
-        🔍 Search
-      </button>
-      <button onclick="downloadSelected()"
-              style="background:#27ae60;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-weight:bold;">
-        ⬇ Download Selected
-      </button>
-      <span id="recStatus" style="color:#aaa;font-size:12px;"></span>
-    </div>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ══════════════════════════════════════════════════════
+//  State
+// ══════════════════════════════════════════════════════
+const devices   = {};   // { [phone]: { map, marker, polyline, trail, hlsInstances, channels, recs } }
+let activePhone = null;
 
-    <table style="width:100%;border-collapse:collapse;">
-      <thead>
-        <tr style="background:#222;">
-          <th style="padding:8px;color:#00d4ff;text-align:left;"><input type="checkbox" id="selectAll" onchange="toggleAll(this)"></th>
-          <th style="padding:8px;color:#00d4ff;text-align:left;">CH</th>
-          <th style="padding:8px;color:#00d4ff;text-align:left;">Start</th>
-          <th style="padding:8px;color:#00d4ff;text-align:left;">End</th>
-          <th style="padding:8px;color:#00d4ff;text-align:left;">Size</th>
-          <th style="padding:8px;color:#00d4ff;text-align:left;">Action</th>
-        </tr>
-      </thead>
-      <tbody id="recList">
-        <tr><td colspan="6" style="color:#666;padding:10px;">Select date range and click Search</td></tr>
-      </tbody>
-    </table>
-  </div>
+// ══════════════════════════════════════════════════════
+//  WebSocket
+// ══════════════════════════════════════════════════════
+const ws = new WebSocket(`ws://${location.hostname}:8801`);
+ws.onopen  = () => console.log('[WS] connected');
+ws.onclose = () => console.warn('[WS] disconnected');
+ws.onerror = e  => console.error('[WS] error:', e);
 
-  <!-- Playback -->
-  <div id="playbackSection" style="display:none;margin-top:20px;">
-    <h3>▶ Playback</h3>
-    <video id="playback" controls style="width:100%;max-width:900px;background:#000;"></video>
-  </div>
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script>
-    // ── Live stream ───────────────────────────────────────────────────────
-    function startLive(videoId, src) {
-        const video = document.getElementById(videoId);
-        const hls   = new Hls({ lowLatencyMode: true });
-        hls.loadSource(src);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
-        hls.on(Hls.Events.ERROR, (e, d) => console.error(videoId, d));
+ws.onmessage = e => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch(err) { return; }
+
+    if (msg.type === 'device_list')     handleDeviceList(msg.devices);
+    if (msg.type === 'location')        handleLocation(msg);
+    if (msg.type === 'recordings')      handleRecordings(msg.data);
+    if (msg.type === 'recording_ready') handleRecordingReady(msg.url);
+    if (msg.type === 'status')          setRecStatus(msg.message);
+    if (msg.type === 'error')           setRecStatus('❌ ' + msg.message);
+};
+
+// ══════════════════════════════════════════════════════
+//  Device list
+// ══════════════════════════════════════════════════════
+function handleDeviceList(list) {
+    const phones = list.map(d => String(d.phone));
+
+    // Remove disconnected devices
+    for (const ph of Object.keys(devices)) {
+        if (!phones.includes(ph)) removeDevice(ph);
     }
 
-    startLive('ch1', '/public/ch1.m3u8');
+    // Add / update
+    list.forEach(d => {
+        const ph = String(d.phone);
+        if (!devices[ph]) addDevice(ph, d.channels);
+        else d.channels.forEach(ch => addChannelVideo(ph, ch));
+    });
 
-    // ── Leaflet Map ───────────────────────────────────────────────────────
-    const map = L.map('map').setView([20, 0], 2);
+    document.getElementById('noDevices').style.display = phones.length ? 'none' : 'block';
+    if (phones.length && !devices[activePhone]) setActiveDevice(phones[0]);
+}
 
+function addDevice(phone, channels) {
+    // Tab
+    const tab = document.createElement('button');
+    tab.className = 'tab-btn';
+    tab.id        = `tab-${phone}`;
+    tab.innerHTML = `<span class="dot"></span>${phone}`;
+    tab.onclick   = () => setActiveDevice(phone);
+    document.getElementById('deviceTabs').appendChild(tab);
+
+    // Panel
+    const panel = document.createElement('div');
+    panel.className = 'device-panel';
+    panel.id        = `panel-${phone}`;
+    panel.innerHTML = `
+        <div class="channel-grid" id="channels-${phone}"></div>
+        <div class="map-row">
+            <div id="map-${phone}" class="device-map"></div>
+            <div class="gps-grid">
+                ${[
+                    ['lat','Latitude'],['lon','Longitude'],['speed','Speed'],['dir','Direction'],
+                    ['elev','Elevation'],['dt','DateTime'],['acc','ACC'],['located','Located'],
+                    ['mileage','Mileage'],['voltage','Voltage'],['sats','Satellites'],['alarms','Alarms']
+                ].map(([k,l]) => `
+                    <div class="info-box"><strong>${l}</strong><span id="${phone}-${k}">--</span></div>
+                `).join('')}
+            </div>
+        </div>
+        <h3 class="section-title">📹 Recordings</h3>
+        <div class="rec-controls">
+            <label style="color:#aaa;font-size:13px;">From:</label>
+            <input type="datetime-local" id="${phone}-recFrom">
+            <label style="color:#aaa;font-size:13px;">To:</label>
+            <input type="datetime-local" id="${phone}-recTo">
+            <button class="btn btn-blue" onclick="searchRecordings('${phone}')">🔍 Search</button>
+            <button class="btn btn-green" onclick="downloadSelected('${phone}')">⬇ Download Selected</button>
+            <span id="${phone}-recStatus" style="color:#888;font-size:12px;"></span>
+        </div>
+        <table>
+            <thead><tr>
+                <th><input type="checkbox" onchange="toggleAll('${phone}',this)"></th>
+                <th>CH</th><th>Start</th><th>End</th><th>Size</th><th>Action</th>
+            </tr></thead>
+            <tbody id="${phone}-recList">
+                <tr><td colspan="6" style="color:#555;padding:10px;">Select date range and click Search</td></tr>
+            </tbody>
+        </table>
+        <div class="playback-section" id="${phone}-playbackSection">
+            <h3 class="section-title">▶ Playback</h3>
+            <video id="${phone}-playback" controls></video>
+        </div>
+    `;
+    document.getElementById('devicePanels').appendChild(panel);
+
+    // Leaflet map
+    const map = L.map(`map-${phone}`).setView([20, 0], 2);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '© OpenStreetMap contributors'
     }).addTo(map);
 
-    const truckIcon = L.divIcon({
-        html: `<div style="
-            background: #00d4ff;
-            width: 20px;
-            height: 20px;
-            border-radius: 50%;
-            border: 3px solid #fff;
-            box-shadow: 0 0 8px #00d4ff;
-        "></div>`,
-        iconSize:   [20, 20],
-        iconAnchor: [10, 10],
-        className:  ''
-    });
+    devices[phone] = { phone, channels: [], map, marker: null, polyline: null, trail: [], hlsInstances: {}, recs: [] };
+    channels.forEach(ch => addChannelVideo(phone, ch));
 
-    let marker   = null;
-    let polyline = null;
-    let trail    = [];
+    if (!activePhone) setActiveDevice(phone);
+}
 
-    function updateMap(lat, lon, speed, direction) {
-        const pos = [lat, lon];
-
-        if (!marker) {
-            marker = L.marker(pos, { icon: truckIcon }).addTo(map);
-            map.setView(pos, 15);
-        } else {
-            marker.setLatLng(pos);
-        }
-
-        marker.bindPopup(`
-            <b>Vehicle</b><br>
-            Lat: ${lat.toFixed(6)}<br>
-            Lon: ${lon.toFixed(6)}<br>
-            Speed: ${speed} km/h<br>
-            Direction: ${direction}°
-        `);
-
-        trail.push(pos);
-        if (trail.length > 50) trail.shift();
-
-        if (polyline) map.removeLayer(polyline);
-        polyline = L.polyline(trail, { color: '#00d4ff', weight: 2 }).addTo(map);
-
-        map.panTo(pos);
+function removeDevice(phone) {
+    const dev = devices[phone];
+    if (dev) {
+        Object.values(dev.hlsInstances).forEach(h => { try { h.destroy(); } catch(_){} });
+        try { dev.map.remove(); } catch(_){}
     }
-
-    // ── WebSocket ─────────────────────────────────────────────────────────
-    const ws = new WebSocket(`ws://${location.hostname}:8801`);
-    ws.onopen  = () => console.log('WS connected');
-    ws.onclose = () => console.warn('[WS] Disconnected');
-    ws.onerror = e  => console.error('[WS] Error:', e);
-
-    ws.onmessage = e => {
-        let msg;
-        try { msg = JSON.parse(e.data); }
-        catch(err) { console.error('[WS] Bad JSON:', e.data); return; }
-
-        if (msg.type === 'location') {
-            updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
-            document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}`;
-            document.getElementById('info-lon').textContent        = `Longitude: ${msg.lon.toFixed(6)}`;
-            document.getElementById('info-speed').textContent      = `Speed: ${msg.speed} km/h`;
-            document.getElementById('info-dir').textContent        = `Direction: ${msg.direction}°`;
-            document.getElementById('info-elev').textContent       = `Elevation: ${msg.elevation} m`;
-            document.getElementById('info-dt').textContent         = `DateTime: ${msg.datetime}`;
-            document.getElementById('info-acc').textContent        = `ACC: ${msg.accOn ? 'ON' : 'OFF'}`;
-            document.getElementById('info-located').textContent    = `Located: ${msg.located ? 'Yes' : 'No'}`;
-            document.getElementById('info-mileage').textContent    = `Mileage: ${msg.mileage || '--'}`;
-            document.getElementById('info-voltage').textContent    = `Voltage: ${msg.voltage || '--'}`;
-            document.getElementById('info-satellites').textContent = `Satellites: ${msg.satellites || '--'}`;
-            document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
-        }
-    };
-
-
-
-    // ── Recordings ────────────────────────────────────────────────────────
-    let _recs = [];
-
-    // Handle incoming WS messages for recordings
-    const _origOnMessage = ws.onmessage;
-    ws.onmessage = e => {
-        let msg; try { msg = JSON.parse(e.data); } catch(_){ return; }
-
-        if (msg.type === 'location') {
-            // pass to original handler
-            updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
-            document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}`;
-            document.getElementById('info-lon').textContent        = `Longitude: ${msg.lon.toFixed(6)}`;
-            document.getElementById('info-speed').textContent      = `Speed: ${msg.speed} km/h`;
-            document.getElementById('info-dir').textContent        = `Direction: ${msg.direction}°`;
-            document.getElementById('info-elev').textContent       = `Elevation: ${msg.elevation} m`;
-            document.getElementById('info-dt').textContent         = `DateTime: ${msg.datetime}`;
-            document.getElementById('info-acc').textContent        = `ACC: ${msg.accOn ? 'ON' : 'OFF'}`;
-            document.getElementById('info-located').textContent    = `Located: ${msg.located ? 'Yes' : 'No'}`;
-            document.getElementById('info-mileage').textContent    = `Mileage: ${msg.mileage || '--'}`;
-            document.getElementById('info-voltage').textContent    = `Voltage: ${msg.voltage || '--'}`;
-            document.getElementById('info-satellites').textContent = `Satellites: ${msg.satellites || '--'}`;
-            document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
-        }
-
-        if (msg.type === 'recordings') {
-            console.log('[Rec] Received', msg.data.length, 'recordings');
-            _recs = msg.data;
-            renderRecordings(_recs);
-            document.getElementById('recStatus').textContent = `✅ ${_recs.length} recording(s) found`;
-        }
-
-        if (msg.type === 'recording_ready') {
-            console.log('[Rec] File ready:', msg.url);
-            document.getElementById('recStatus').textContent = '✅ File ready — playing';
-            playFile(msg.url);
-        }
-
-        if (msg.type === 'status') {
-            document.getElementById('recStatus').textContent = msg.message;
-        }
-
-        if (msg.type === 'error') {
-            document.getElementById('recStatus').textContent = '❌ ' + msg.message;
-        }
-    };
-
-    function searchRecordings() {
-        const from = document.getElementById('recFrom').value; // "YYYY-MM-DDTHH:MM"
-        const to   = document.getElementById('recTo').value;
-        console.log('[Rec] searchRecordings from:', from, 'to:', to);
-        if (!from || !to) {
-            document.getElementById('recStatus').textContent = '⚠️ Please select both From and To';
-            return;
-        }
-        if (ws.readyState !== WebSocket.OPEN) {
-            document.getElementById('recStatus').textContent = '❌ Not connected';
-            return;
-        }
-        document.getElementById('recStatus').textContent = '⏳ Querying device...';
-        // Convert "YYYY-MM-DDTHH:MM" → "YYYY-MM-DD HH:MM:00"
-        const fmt = v => v.replace('T', ' ') + ':00';
-        ws.send(JSON.stringify({ type: 'query_recordings', startDate: fmt(from), endDate: fmt(to) }));
+    delete devices[phone];
+    document.getElementById(`tab-${phone}`)?.remove();
+    document.getElementById(`panel-${phone}`)?.remove();
+    if (activePhone === phone) {
+        const remaining = Object.keys(devices);
+        setActiveDevice(remaining[0] || null);
     }
+}
 
-    function renderRecordings(list) {
-        const tbody = document.getElementById('recList');
-        if (!list || list.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" style="color:#666;padding:10px;">No recordings found</td></tr>';
-            return;
-        }
-        let html = '';
-        list.forEach((r, i) => {
-            html += `<tr style="border-bottom:1px solid #333;">
-                <td style="padding:8px;"><input type="checkbox" class="rec-check" data-idx="${i}"></td>
-                <td style="padding:8px;">CH${r.ch}</td>
-                <td style="padding:8px;">${r.startTime}</td>
-                <td style="padding:8px;">${r.endTime}</td>
-                <td style="padding:8px;">${r.size ? (r.size/1024/1024).toFixed(1)+' MB' : '--'}</td>
-                <td style="padding:8px;">
-                  <button onclick="requestDownload(${i})"
-                    style="background:#00d4ff;color:#000;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-weight:bold;">
-                    ⬇ Get
-                  </button>
-                </td>
-            </tr>`;
-        });
-        tbody.innerHTML = html;
-    }
+function addChannelVideo(phone, ch) {
+    const dev = devices[phone];
+    if (!dev || dev.channels.includes(ch)) return;
+    dev.channels.push(ch);
 
-    function toggleAll(cb) {
-        document.querySelectorAll('.rec-check').forEach(c => c.checked = cb.checked);
-    }
+    const card = document.createElement('div');
+    card.className = 'channel-card';
+    card.id        = `chcard-${phone}-${ch}`;
+    card.innerHTML = `
+        <h3>
+            Channel ${ch}
+            <small style="color:#666;font-size:11px;">${phone}</small>
+            <span class="live-badge">LIVE</span>
+        </h3>
+        <video id="video-${phone}-${ch}" autoplay muted controls playsinline></video>
+    `;
+    document.getElementById(`channels-${phone}`).appendChild(card);
 
-    function requestDownload(index) {
-        const rec = _recs[index];
-        if (!rec) return;
-        console.log('[Rec] requestDownload:', rec);
-        document.getElementById('recStatus').textContent = '⏳ Requesting device upload to FTP...';
-        ws.send(JSON.stringify({
-            type:      'download_recording',
-            ch:        rec.ch,
-            startTime: rec.startTime,
-            endTime:   rec.endTime,
-            phone:     rec.phone,
-        }));
-    }
+    const src   = `/public/${phone}_ch${ch}.m3u8`;
+    const video = document.getElementById(`video-${phone}-${ch}`);
+    const hls   = new Hls({ lowLatencyMode: true });
+    hls.loadSource(src);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+    hls.on(Hls.Events.ERROR, (ev, d) => console.error(`HLS ${phone} ch${ch}:`, d));
+    dev.hlsInstances[ch] = hls;
+}
 
-    function downloadSelected() {
-        const checked = [...document.querySelectorAll('.rec-check:checked')];
-        if (checked.length === 0) {
-            document.getElementById('recStatus').textContent = '⚠️ Select at least one recording';
-            return;
-        }
-        checked.forEach(cb => requestDownload(parseInt(cb.dataset.idx)));
-    }
+// ══════════════════════════════════════════════════════
+//  Tabs
+// ══════════════════════════════════════════════════════
+function setActiveDevice(phone) {
+    document.querySelectorAll('.device-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(t => t.classList.remove('active'));
+    activePhone = phone;
+    if (!phone) return;
+    document.getElementById(`panel-${phone}`)?.classList.add('active');
+    document.getElementById(`tab-${phone}`)?.classList.add('active');
+    setTimeout(() => devices[phone]?.map?.invalidateSize(), 100);
+}
 
-    function playFile(url) {
-        const section = document.getElementById('playbackSection');
-        section.style.display = 'block';
-        section.scrollIntoView({ behavior: 'smooth' });
-        const video = document.getElementById('playback');
-        if (window._playHls) { window._playHls.destroy(); window._playHls = null; }
-        if (url.endsWith('.m3u8') && Hls.isSupported()) {
-            const hls = new Hls();
-            window._playHls = hls;
-            hls.loadSource(url);
-            hls.attachMedia(video);
-            hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
-            hls.on(Hls.Events.ERROR, (e,d) => console.error('[HLS]', d));
-        } else {
-            video.src = url;
-            video.play().catch(console.warn);
-        }
+// ══════════════════════════════════════════════════════
+//  GPS
+// ══════════════════════════════════════════════════════
+const truckIcon = L.divIcon({
+    html: `<div style="background:#00d4ff;width:18px;height:18px;border-radius:50%;
+                        border:3px solid #fff;box-shadow:0 0 8px #00d4ff;"></div>`,
+    iconSize: [18,18], iconAnchor: [9,9], className: '',
+});
+
+function handleLocation(msg) {
+    const phone = String(msg.phone);
+    const dev   = devices[phone];
+    if (!dev) return;
+
+    const pos = [msg.lat, msg.lon];
+    if (!dev.marker) {
+        dev.marker = L.marker(pos, { icon: truckIcon }).addTo(dev.map);
+        dev.map.setView(pos, 15);
+    } else {
+        dev.marker.setLatLng(pos);
     }
-  </script>
+    dev.marker.bindPopup(`<b>${phone}</b><br>
+        ${msg.lat.toFixed(6)}, ${msg.lon.toFixed(6)}<br>
+        Speed: ${msg.speed} km/h | Dir: ${msg.direction}°`);
+
+    dev.trail.push(pos);
+    if (dev.trail.length > 50) dev.trail.shift();
+    if (dev.polyline) dev.map.removeLayer(dev.polyline);
+    dev.polyline = L.polyline(dev.trail, { color: '#00d4ff', weight: 2 }).addTo(dev.map);
+    dev.map.panTo(pos);
+
+    const s = (k, v) => { const el = document.getElementById(`${phone}-${k}`); if (el) el.textContent = v; };
+    s('lat',    msg.lat.toFixed(6));
+    s('lon',    msg.lon.toFixed(6));
+    s('speed',  msg.speed + ' km/h');
+    s('dir',    msg.direction + '°');
+    s('elev',   msg.elevation + ' m');
+    s('dt',     msg.datetime);
+    s('acc',    msg.accOn    ? 'ON'  : 'OFF');
+    s('located',msg.located  ? 'Yes' : 'No');
+    s('mileage',msg.mileage  || '--');
+    s('voltage',msg.voltage  || '--');
+    s('sats',   msg.satellites || '--');
+    s('alarms', msg.alarms?.length ? msg.alarms.join(', ') : 'None');
+}
+
+// ══════════════════════════════════════════════════════
+//  Recordings
+// ══════════════════════════════════════════════════════
+function setRecStatus(msg) {
+    if (!activePhone) return;
+    const el = document.getElementById(`${activePhone}-recStatus`);
+    if (el) el.textContent = msg;
+}
+
+function searchRecordings(phone) {
+    const from = document.getElementById(`${phone}-recFrom`).value;
+    const to   = document.getElementById(`${phone}-recTo`).value;
+    const stat = document.getElementById(`${phone}-recStatus`);
+    if (!from || !to) { stat.textContent = '⚠️ Pick both dates'; return; }
+    if (ws.readyState !== WebSocket.OPEN) { stat.textContent = '❌ Not connected'; return; }
+    stat.textContent = '⏳ Querying device...';
+    const fmt = v => v.replace('T', ' ') + ':00';
+    ws.send(JSON.stringify({ type: 'query_recordings', phone, startDate: fmt(from), endDate: fmt(to) }));
+}
+
+function handleRecordings(list) {
+    if (!activePhone) return;
+    const dev = devices[activePhone];
+    if (!dev) return;
+    dev.recs = list || [];
+    renderRecordings(activePhone, dev.recs);
+    document.getElementById(`${activePhone}-recStatus`).textContent = `✅ ${dev.recs.length} recording(s) found`;
+}
+
+function renderRecordings(phone, list) {
+    const tbody = document.getElementById(`${phone}-recList`);
+    if (!list?.length) {
+        tbody.innerHTML = '<tr><td colspan="6" style="color:#555;padding:10px;">No recordings found</td></tr>';
+        return;
+    }
+    tbody.innerHTML = list.map((r, i) => `
+        <tr>
+            <td><input type="checkbox" class="rec-check-${phone}" data-idx="${i}"></td>
+            <td>CH${r.ch}</td>
+            <td>${r.startTime}</td>
+            <td>${r.endTime}</td>
+            <td>${r.size ? (r.size/1024/1024).toFixed(1)+' MB' : '--'}</td>
+            <td><button class="btn-sm" onclick="requestDownload('${phone}',${i})">⬇ Get</button></td>
+        </tr>
+    `).join('');
+}
+
+function toggleAll(phone, cb) {
+    document.querySelectorAll(`.rec-check-${phone}`).forEach(c => c.checked = cb.checked);
+}
+
+function requestDownload(phone, index) {
+    const dev = devices[phone];
+    if (!dev) return;
+    const rec = dev.recs[index];
+    if (!rec) return;
+    document.getElementById(`${phone}-recStatus`).textContent = '⏳ Requesting FTP upload...';
+    ws.send(JSON.stringify({ type: 'download_recording', ch: rec.ch, startTime: rec.startTime, endTime: rec.endTime, phone: rec.phone }));
+}
+
+function downloadSelected(phone) {
+    const checked = [...document.querySelectorAll(`.rec-check-${phone}:checked`)];
+    if (!checked.length) { document.getElementById(`${phone}-recStatus`).textContent = '⚠️ Select at least one'; return; }
+    checked.forEach(cb => requestDownload(phone, parseInt(cb.dataset.idx)));
+}
+
+function handleRecordingReady(url) {
+    if (!activePhone) return;
+    setRecStatus('✅ File ready — playing');
+    playFile(activePhone, url);
+}
+
+function playFile(phone, url) {
+    const section = document.getElementById(`${phone}-playbackSection`);
+    section.style.display = 'block';
+    section.scrollIntoView({ behavior: 'smooth' });
+    const video = document.getElementById(`${phone}-playback`);
+    const key   = `_playHls_${phone}`;
+    if (window[key]) { window[key].destroy(); window[key] = null; }
+    if (url.endsWith('.m3u8') && Hls.isSupported()) {
+        const hls = new Hls();
+        window[key] = hls;
+        hls.loadSource(url); hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+        hls.on(Hls.Events.ERROR, (e,d) => console.error('[HLS playback]', d));
+    } else {
+        video.src = url;
+        video.play().catch(console.warn);
+    }
+}
+</script>
 </body>
 </html>
