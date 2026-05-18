@@ -302,6 +302,7 @@ http.createServer((req, res) => {
 const deviceStreams = {};
 
 function streamKey(phone, channel) {
+    // return `${phone}_ch${channel}`;
     return `${phone}_ch${channel}`;
 }
 
