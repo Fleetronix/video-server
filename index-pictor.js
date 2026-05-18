@@ -737,9 +737,11 @@ const tcpServer = net.createServer(socket => {
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
                     // TEMPORARY: log header hex so we can find phone offset
-                    if (!phone) console.log('[StreamHdr]', buffer.slice(offset, offset + 30).toString('hex'));
+                    // if (!phone) console.log('[StreamHdr]', buffer.slice(offset, offset + 30).toString('hex'));
 
-                    processVideoPacket(rawData, phone || socketToPhone.get(socket) || 'unknown', channel, dataType, subpktMarker);
+                    const streamPhone = phone || buffer.slice(offset + 8, offset + 13)
+    .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`).join('').replace(/^0+/, '');
+processVideoPacket(rawData, streamPhone, channel, dataType, subpktMarker);
 
                     offset += 30 + dataBodyLen;
                     continue;
