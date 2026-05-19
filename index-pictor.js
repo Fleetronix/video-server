@@ -757,9 +757,19 @@ const tcpServer = net.createServer(socket => {
                     const streamPhone = buffer.slice(offset + 8, offset + 14)
                         .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`)
                         .join('')
-                        .replace(/^0+/, '');
+                        .replace(/^0+/, '')  // remove leading zeros
+                        || '0';
 
-                    const dl = activeDownloads[streamPhone];
+                    // Match against activeDownloads using suffix match
+                    // because BCD encoding may drop internal zeros differently
+                    const dlPhone = Object.keys(activeDownloads).find(k =>
+                        k === streamPhone ||
+                        k.endsWith(streamPhone) ||
+                        streamPhone.endsWith(k)
+                    );
+                    const dl = dlPhone ? activeDownloads[dlPhone] : null;
+
+                    // const dl = activeDownloads[streamPhone];
                     if (dl && dl.writeStream && dl.writeStream.writable) {
                         dl.writeStream.write(Buffer.from(rawData));
                         console.log(`[Rec] ⏺ ${streamPhone} wrote ${rawData.length} bytes → ${dl.filename}`);
