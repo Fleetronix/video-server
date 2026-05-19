@@ -657,10 +657,11 @@ function buildQueryRecordings(phone, startDate, endDate) {
 // ── Build 0x9206 — FTP upload request ────────────────────────────────────────
 function buildFtpUploadRequest(phone, channel, startTime, endTime) {
     const serverIp   = CONFIG.serverIp;
-    const ftpPort    = 2121;
+    const ftpPort = 21;
     const ftpUser    = 'anonymous';
     const ftpPass    = 'anonymous';
-    const uploadPath = '/';
+    // const uploadPath = '/';
+    const uploadPath = `/ch${channel}_${startTime.replace(/[: -]/g, '')}.mp4`;
 
     const toBCDBytes = (yy, mo, dd, hh, mm, ss) => Buffer.from([
         ((Math.floor(yy/10)<<4)|(yy%10)),
