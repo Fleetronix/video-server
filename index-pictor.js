@@ -742,28 +742,31 @@ const tcpServer = net.createServer(socket => {
                 // ── Stream data packet (T/98 §5.5.3 — 0x30316364 header) ────
                 if (buffer[offset]   === 0x30 && buffer[offset+1] === 0x31 &&
                     buffer[offset+2] === 0x63 && buffer[offset+3] === 0x64) {
-            
+
                     if (offset + 30 > buffer.length) break;
                     const dataBodyLen = buffer.readUInt16BE(offset + 28);
                     if (offset + 30 + dataBodyLen > buffer.length) break;
-            
+
                     const byte15       = buffer[offset + 15];
-                    const dataType     = (byte15 >> 4) & 0x0F;
-                    const subpktMarker = byte15 & 0x0F;
+                    const dataType     = (byte15 >> 4) & 0x0F; // upper nibble
+                    const subpktMarker = byte15 & 0x0F;         // lower nibble
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
-            
-                    // ── If a download is active for this phone, capture to file ──────
-                    const dl = activeDownloads[phone];
-                    if (dl && dl.writeStream) {
-                        // Write the raw body data to the recording file
-                        dl.writeStream.write(rawData);
-                        console.log(`[Rec] ⏺ Wrote ${rawData.length} bytes to ${dl.filename}`);
+
+                    // Extract phone directly from stream packet bytes 8-13 (BCD)
+                    const streamPhone = buffer.slice(offset + 8, offset + 14)
+                        .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`)
+                        .join('')
+                        .replace(/^0+/, '');
+
+                    const dl = activeDownloads[streamPhone];
+                    if (dl && dl.writeStream && dl.writeStream.writable) {
+                        dl.writeStream.write(Buffer.from(rawData));
+                        console.log(`[Rec] ⏺ ${streamPhone} wrote ${rawData.length} bytes → ${dl.filename}`);
                     } else {
-                        // Normal live stream — send to FFmpeg
                         processVideoPacket(rawData, channel, dataType, subpktMarker);
                     }
-            
+
                     offset += 30 + dataBodyLen;
                     continue;
                 }
