@@ -754,7 +754,7 @@ const tcpServer = net.createServer(socket => {
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
                     const dl = phone ? activeDownloads[phone] : null;
-
+                    console.log(`[DBG2] phone="${phone}" dl=${!!dl} activeDownloads:`, Object.keys(activeDownloads));
                     // const dl = activeDownloads[streamPhone];
                     if (dl && dl.writeStream && dl.writeStream.writable) {
                         dl.writeStream.write(Buffer.from(rawData));
