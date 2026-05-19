@@ -657,7 +657,7 @@ function buildFtpUploadRequest(phone, channel, startTime, endTime) {
     body[p++] = 0b00000100; // task condition: bit2=1 = allow on 4G
 
     console.log(`[Rec] buildFtpUploadRequest ch:${channel} ${startTime}→${endTime}`);
-    let frame = buildFrame(0x9206, body, 5760064474);
+    let frame = buildFrame(0x9206, body, "5760064474");
     console.log(`[Rec] FTP upload request frame size: ${frame.length} bytes`);
     console.log(`[Rec] Frame hex: ${frame.toString('hex')}`);
     return frame;
