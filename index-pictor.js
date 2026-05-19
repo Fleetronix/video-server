@@ -753,25 +753,7 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    // Extract phone directly from stream packet bytes 8-13 (BCD)
-                    const streamPhone = buffer.slice(offset + 8, offset + 14)
-                        .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`)
-                        .join('')
-                        .replace(/^0+/, '')  // remove leading zeros
-                        || '0';
-
-                    // Match against activeDownloads using suffix match
-                    // because BCD encoding may drop internal zeros differently
-
-                        // ADD THIS LINE:
-                    console.log(`[DBG] streamPhone="${streamPhone}" activeDownloads keys:`, Object.keys(activeDownloads));
-
-                    const dlPhone = Object.keys(activeDownloads).find(k =>
-                        k === streamPhone ||
-                        k.endsWith(streamPhone) ||
-                        streamPhone.endsWith(k)
-                    );
-                    const dl = dlPhone ? activeDownloads[dlPhone] : null;
+                    const dl = phone ? activeDownloads[phone] : null;
 
                     // const dl = activeDownloads[streamPhone];
                     if (dl && dl.writeStream && dl.writeStream.writable) {
