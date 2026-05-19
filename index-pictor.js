@@ -41,7 +41,7 @@ if (!fs.existsSync('./recordings')) fs.mkdirSync('./recordings');
 //     if (pasvPort > PASV_MAX) pasvPort = PASV_MIN;
 //     return p;
 // }
-
+const FTP_PORT       = 2121;
 const PASV_DATA_PORT = 2122;
 
 net.createServer(ftpSocket => {
