@@ -762,6 +762,10 @@ const tcpServer = net.createServer(socket => {
 
                     // Match against activeDownloads using suffix match
                     // because BCD encoding may drop internal zeros differently
+
+                        // ADD THIS LINE:
+                    console.log(`[DBG] streamPhone="${streamPhone}" activeDownloads keys:`, Object.keys(activeDownloads));
+
                     const dlPhone = Object.keys(activeDownloads).find(k =>
                         k === streamPhone ||
                         k.endsWith(streamPhone) ||
