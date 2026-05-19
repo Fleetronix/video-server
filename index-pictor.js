@@ -41,6 +41,7 @@ if (!fs.existsSync('./recordings')) fs.mkdirSync('./recordings');
 //     if (pasvPort > PASV_MAX) pasvPort = PASV_MIN;
 //     return p;
 // }
+const PUBLIC_IP      = process.env.PUBLIC_IP || process.env.SERVER_IP;
 const FTP_PORT       = 2121;
 const PASV_DATA_PORT = 2122;
 
@@ -158,10 +159,17 @@ net.createServer(ftpSocket => {
                         dataSocket = null;
                     };
 
-                    const waitForData = setInterval(() => {
-                        console.log(`[FTP] Waiting for data connection... dataSocket=${!!dataSocket}`); 
-                        if (!dataSocket) return;
-                        clearInterval(waitForData);
+                    let waitTries = 0;
+                        const waitForData = setInterval(() => {
+                            if (!dataSocket) {
+                                if (++waitTries > 100) {
+                                    clearInterval(waitForData);
+                                    console.error('[FTP] STOR timeout — no data connection after 10s');
+                                    reply(425, 'No data connection established');
+                                }
+                                return;
+                            }
+                            clearInterval(waitForData);
 
                         dataSocket.pipe(uploadStream);
 
@@ -235,8 +243,10 @@ wss.on('connection', (ws, req) => {
             const { startDate, endDate } = msg;
             let all = Object.values(deviceRecordings).flat();
             console.log(`[WS] query_recordings total in store:${all.length} from:${startDate} to:${endDate}`);
-            if (startDate) all = all.filter(r => r.startTime.split(' ')[0] >= startDate);
-            if (endDate)   all = all.filter(r => r.startTime.split(' ')[0] <= endDate);
+            const startPrefix = startDate ? startDate.split(' ')[0] : null;
+            const endPrefix   = endDate   ? endDate.split(' ')[0]   : null;
+            if (startPrefix) all = all.filter(r => r.startTime.split(' ')[0] >= startPrefix);
+            if (endPrefix)   all = all.filter(r => r.startTime.split(' ')[0] <= endPrefix);
             all.sort((a, b) => b.startTime.localeCompare(a.startTime));
             ws.send(JSON.stringify({ type: 'recordings', data: all }));
             console.log(`[WS] Sent ${all.length} recordings to browser`);
@@ -677,11 +687,10 @@ function buildFtpUploadRequest(phone, channel, startTime, endTime) {
     //                  logicalCh(1) startBCD(6) endBCD(6)
     //                  alarmLogo(8) avType(1) streamType(1) storageType(1) taskCondition(1)
     const k = ipBuf.length, l = userBuf.length, m = passBuf.length, n = pathBuf.length;
-    const body = Buffer.alloc(1+k+2+2+1+l+1+m+1+n+1+6+6+8+1+1+1+1); // +2 for UDP port
+    const body = Buffer.alloc(1+k+2+1+l+1+m+1+n+1+6+6+8+1+1+1+1);   // no UDP port
     let p = 0;
     body[p++] = k;                               ipBuf.copy(body, p);   p += k;
-    body.writeUInt16BE(ftpPort, p);              p += 2;  // TCP port
-    body.writeUInt16BE(0,       p);              p += 2;  // UDP port (0)
+    body.writeUInt16BE(ftpPort, p);              p += 2;  // TCP FTP port only
     body[p++] = l;                               userBuf.copy(body, p); p += l;
     body[p++] = m;                               passBuf.copy(body, p); p += m;
     body[p++] = n;                               pathBuf.copy(body, p); p += n;
