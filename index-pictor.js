@@ -720,6 +720,10 @@ const tcpServer = net.createServer(socket => {
 
     socket.on('data', data => {
         try {
+                // ADD THIS — log everything raw after a download request
+            if (data.length > 50) {
+                console.log(`[RAW TCP] ${data.length} bytes, first 32:`, data.slice(0, 32).toString('hex'));
+            }
             buffer = Buffer.concat([buffer, data]);
             let offset = 0;
 
