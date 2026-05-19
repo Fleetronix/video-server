@@ -52,6 +52,15 @@ let pasvDataSocket = null;   // the one pending data connection slot
  
 const pasvServer = net.createServer(s => {
     console.log(`[FTP] ✅ PASV data connection from ${s.remoteAddress}:${s.remotePort}`);
+    
+    // ADD THIS — see what the device actually sends:
+    s.on('data', d => {
+        console.log(`[FTP] PASV raw data (${d.length} bytes):`, d.slice(0, 64).toString('hex'));
+        console.log(`[FTP] PASV raw ascii:`, d.slice(0, 64).toString('ascii').replace(/[^\x20-\x7E]/g, '.'));
+    });
+    s.on('end',   () => console.log('[FTP] PASV connection ended'));
+    s.on('close', () => console.log('[FTP] PASV connection closed'));
+    
     pasvDataSocket = s;
 });
 pasvServer.listen(PASV_DATA_PORT, '0.0.0.0', () => {
@@ -74,6 +83,7 @@ net.createServer(ftpSocket => {
     reply(220, 'FTP Server Ready');
  
     ftpSocket.on('data', data => {
+         console.log(`[FTP RAW] received ${data.length} bytes from ${clientIp}:`, data.toString('hex'));
         const lines = data.toString().split('\r\n').filter(Boolean);
         console.log(`[FTP] ← raw:`, data.toString().trim());
         lines.forEach(line => {
