@@ -696,6 +696,9 @@ const tcpServer = net.createServer(socket => {
 
                 // ── Signalling packet (JT/T 808 — 0x7E framing) ─────────────
                 if (buffer[offset] === 0x7E) {
+                    console.log("data ----------- ", data);
+                    console.log("data hex ------- ", data.toString('hex'));
+                    console.log("buffer -------- ", buffer);
                     const end = buffer.indexOf(0x7E, offset + 1);
                     // if (end !== -1) {
                     //     // Forward the complete raw 0x7E…0x7E frame to the remote server
