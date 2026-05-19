@@ -61,6 +61,7 @@ net.createServer(ftpSocket => {
 
     ftpSocket.on('data', data => {
         const lines = data.toString().split('\r\n').filter(Boolean);
+        console.log(`[FTP] ← raw:`, data.toString().trim());
         lines.forEach(line => {
             const [cmd, ...args] = line.trim().split(' ');
             const arg = args.join(' ');
@@ -109,7 +110,9 @@ net.createServer(ftpSocket => {
         console.log(`[FTP] ✅ Data connection from ${s.remoteAddress}:${s.remotePort}`);
         dataSocket = s;
     });
-
+    dataServer.on('listening', () => {
+        console.log(`[FTP] PASV server listening on port ${PASV_DATA_PORT}`);
+    });
     dataServer.listen(PASV_DATA_PORT, '0.0.0.0', () => {
         const ip = PUBLIC_IP.split('.');
         const p1 = Math.floor(PASV_DATA_PORT / 256);
@@ -686,10 +689,10 @@ function buildFtpUploadRequest(phone, channel, startTime, endTime) {
     toBCDBytes(sY%100,sM,sD,sH,sm,sS).copy(body, p); p += 6;
     toBCDBytes(eY%100,eM,eD,eH,em,eS).copy(body, p); p += 6;
     body.fill(0x00, p, p+8);                     p += 8;
-    body[p++] = 2;
-    body[p++] = 0;
-    body[p++] = 0;
-    body[p++] = 0b00000100;
+    body[p++] = 0;    // avType: all (0=all, 1=audio, 2=video)
+    body[p++] = 0;    // stream: all
+    body[p++] = 0;    // storage: all
+    body[p++] = 0xFF; // taskCond: allow on ALL networks (4G, WiFi, any)
 
     let frame = buildFrame(0x9206, body, phone);  // ← use phone parameter
     console.log(`[Rec] FTP upload request frame size: ${frame.length} bytes`);
