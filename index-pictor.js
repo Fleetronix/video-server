@@ -30,17 +30,19 @@ const deviceRecordings= {}; // { [phone]: [{ch,startTime,endTime,size}] }
 // ── Minimal FTP Server (PASV only, no EPSV — required for Babelstar device) ──
 if (!fs.existsSync('./recordings')) fs.mkdirSync('./recordings');
 
-const PUBLIC_IP = '20.244.41.46';
-const FTP_PORT  = 2121;
-const PASV_MIN  = 3500;
-const PASV_MAX  = 3600;
-let   pasvPort  = PASV_MIN;
+// const PUBLIC_IP = '20.244.41.46';
+// const FTP_PORT  = 2121;
+// const PASV_MIN  = 3500;
+// const PASV_MAX  = 3600;
+// let   pasvPort  = PASV_MIN;
 
-function nextPasvPort() {
-    const p = pasvPort++;
-    if (pasvPort > PASV_MAX) pasvPort = PASV_MIN;
-    return p;
-}
+// function nextPasvPort() {
+//     const p = pasvPort++;
+//     if (pasvPort > PASV_MAX) pasvPort = PASV_MIN;
+//     return p;
+// }
+
+const PASV_DATA_PORT = 2122;
 
 net.createServer(ftpSocket => {
     const clientIp = ftpSocket.remoteAddress;
@@ -100,23 +102,28 @@ net.createServer(ftpSocket => {
                     break;
 
                 case 'PASV': {
-                    // Close any previous data server
-                    if (dataServer) { try { dataServer.close(); } catch(_){} }
-                    const port = nextPasvPort();
-                    dataServer = net.createServer(s => {
-                        console.log(`[FTP] Data connection from ${s.remoteAddress}:${s.remotePort}`);
-                        dataSocket = s;
-                    });
-                    dataServer.on('error', err => console.error('[FTP] PASV server error:', err.message));
-                    dataServer.listen(port, '0.0.0.0', () => {
-                        // PASV response: 227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)
-                        const ipParts = PUBLIC_IP.split('.');
-                        const p1 = Math.floor(port / 256);
-                        const p2 = port % 256;
-                        reply(227, `Entering Passive Mode (${ipParts.join(',')},${p1},${p2})`);
-                    });
-                    break;
-                }
+    if (dataServer) { try { dataServer.close(); } catch(_){} }
+    dataSocket = null;
+
+    dataServer = net.createServer(s => {
+        console.log(`[FTP] ✅ Data connection from ${s.remoteAddress}:${s.remotePort}`);
+        dataSocket = s;
+    });
+
+    dataServer.listen(PASV_DATA_PORT, '0.0.0.0', () => {
+        const ip = PUBLIC_IP.split('.');
+        const p1 = Math.floor(PASV_DATA_PORT / 256);
+        const p2 = PASV_DATA_PORT % 256;
+        console.log(`[FTP] PASV listening on port ${PASV_DATA_PORT}`);
+        reply(227, `Entering Passive Mode (${ip.join(',')},${p1},${p2})`);
+    });
+
+    dataServer.on('error', err => {
+        console.error('[FTP] PASV server error:', err.message);
+        reply(425, 'Cannot open data connection');
+    });
+    break;
+}
 
                 case 'LIST':
                 case 'NLST':
