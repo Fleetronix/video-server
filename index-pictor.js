@@ -753,12 +753,13 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    const dl = phone ? activeDownloads[phone] : null;
-                    console.log(`[DBG2] phone="${phone}" dl=${!!dl} activeDownloads:`, Object.keys(activeDownloads));
+                    const effectivePhone = phone || socket._phone;
+                    const dl = effectivePhone ? activeDownloads[effectivePhone] : null;
+                    console.log(`[DBG2] phone="${phone || socket._phone}" dl=${!!dl} activeDownloads:`, Object.keys(activeDownloads));
                     // const dl = activeDownloads[streamPhone];
                     if (dl && dl.writeStream && dl.writeStream.writable) {
                         dl.writeStream.write(Buffer.from(rawData));
-                        console.log(`[Rec] ⏺ ${streamPhone} wrote ${rawData.length} bytes → ${dl.filename}`);
+                        console.log(`[Rec] ⏺ ${effectivePhone} wrote ${rawData.length} bytes → ${dl.filename}`);
                     } else {
                         processVideoPacket(rawData, channel, dataType, subpktMarker);
                     }
@@ -806,6 +807,7 @@ const tcpServer = net.createServer(socket => {
                         socket.write(buildAck(phone, seq, msgId));
                         socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
                         tcpSockets[phone] = socket;
+                        socket._phone = phone;  // ADD THIS
                         console.log(`[signalling] Registered socket for ${phone}`);
                         // Step 1: param query handshake (required before 0x9205 on SDK V6.07)
                         setTimeout(() => {
