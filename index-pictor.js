@@ -305,13 +305,43 @@ wss.on('connection', (ws, req) => {
                         console.log(`[Rec] File size check: ${stat.size} bytes (attempt ${sizeCheck})`);
                         if (stat.size > 500000) {
                             clearInterval(checkSize);
-                            console.log(`[Rec] ✅ File ready (${stat.size} bytes), sending recording_ready`);
-                            wss.clients.forEach(c => {
-                                if (c.readyState === 1) c.send(JSON.stringify({
-                                    type: 'recording_ready',
-                                    url:  `/public/rec_${_notifyPhone}.ts`,
-                                }));
+                            console.log(`[Rec] ✅ File ready (${stat.size} bytes), converting to MP4...`);
+                            const tsPath  = `./public/rec_${_notifyPhone}.ts`;
+                            const mp4Path = `./public/rec_${_notifyPhone}.mp4`;
+                            const ff = spawn('/usr/local/bin/ffmpeg', [
+                                '-y',
+                                '-i',        tsPath,
+                                '-c:v',      'copy',
+                                '-c:a',      'copy',
+                                '-movflags', '+faststart',
+                                mp4Path
+                            ]);
+                            ff.stderr.on('data', d => {
+                                const m = d.toString().trim();
+                                if (m.includes('error') || m.includes('Error')) {
+                                    console.error('[RecConvert]', m);
+                                }
                             });
+                            ff.on('close', code => {
+                                console.log(`[Rec] Convert done code=${code} → ${mp4Path}`);
+                                if (code === 0) {
+                                    wss.clients.forEach(c => {
+                                        if (c.readyState === 1) c.send(JSON.stringify({
+                                            type: 'recording_ready',
+                                            url:  `/public/rec_${_notifyPhone}.mp4`,
+                                        }));
+                                    });
+                                } else {
+                                    // Fallback — try sending ts anyway
+                                    wss.clients.forEach(c => {
+                                        if (c.readyState === 1) c.send(JSON.stringify({
+                                            type: 'recording_ready',
+                                            url:  tsPath.replace('./', '/'),
+                                        }));
+                                    });
+                                }
+                            });
+                            ff.on('error', err => console.error('[RecConvert] spawn error:', err.message));
                         }
                     } catch(_) {}
                     if (++sizeCheck > 60) clearInterval(checkSize);
