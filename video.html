@@ -8,48 +8,29 @@
         h3   { color: #00d4ff; }
         video { width: 100%; max-width: 900px; display: block; margin: 10px 0; background: #000; }
         .live-badge { background: #f00; color: #fff; padding: 2px 8px;
-                      border-radius: 4px; font-size: 11px; margin-left: 8px; animation: blink 1.2s infinite; }
-        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.4} }
+                      border-radius: 4px; font-size: 11px; margin-left: 8px; }
         .info-box { background: #222; padding: 10px; border-radius: 6px;
                     font-size: 13px; border-left: 3px solid #00d4ff; }
         #map { height: 400px; border-radius: 8px; border: 1px solid #333; }
         #gpsInfo { background: #1a1a1a; padding: 15px; border-radius: 8px;
-                   display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 15px; }
-        /* Modal */
-        .modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.88);
-                         z-index:1000; align-items:center; justify-content:center; }
-        .modal-overlay.active { display:flex; }
-        .modal-box { background:#111; border:1px solid #00d4ff; border-radius:10px; padding:20px;
-                     width:90%; max-width:960px; position:relative; }
-        .modal-close { position:absolute; top:12px; right:16px; background:none; border:none;
-                       color:#fff; font-size:22px; cursor:pointer; line-height:1; }
-        .modal-title { color:#00d4ff; font-size:13px; letter-spacing:1px; margin-bottom:12px; }
-        #modalVideo { width:100%; background:#000; border-radius:6px; max-height:70vh; }
+                   display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px;
+                   margin-top: 15px; }
     </style>
 </head>
 <body>
 
-<!-- Video Modal -->
-<div class="modal-overlay" id="videoModal">
-    <div class="modal-box">
-        <button class="modal-close" onclick="closeModal()">✕</button>
-        <div class="modal-title" id="modalTitle">▶ Playback</div>
-        <video id="modalVideo" controls></video>
-    </div>
-</div>
-
-<!-- Live Video -->
-<div>
+  <!-- Live Video -->
+  <div>
     <h3>Channel 1 - Front <span class="live-badge">LIVE</span></h3>
     <video id="ch1" autoplay muted controls></video>
-</div>
+  </div>
 
-<!-- Map -->
-<h3>Vehicle Location</h3>
-<div id="map"></div>
+  <!-- Map -->
+  <h3>Vehicle Location</h3>
+  <div id="map"></div>
 
-<!-- GPS Info -->
-<div id="gpsInfo">
+  <!-- GPS Info -->
+  <div id="gpsInfo">
     <div class="info-box" id="info-lat">Latitude: --</div>
     <div class="info-box" id="info-lon">Longitude: --</div>
     <div class="info-box" id="info-speed">Speed: --</div>
@@ -62,246 +43,283 @@
     <div class="info-box" id="info-voltage">Voltage: --</div>
     <div class="info-box" id="info-satellites">Satellites: --</div>
     <div class="info-box" id="info-alarms">Alarms: --</div>
-</div>
-
+  </div>
 <!-- Recordings -->
-<div style="margin-top:30px;">
+  <div style="margin-top:30px;">
     <h3>📹 Recordings</h3>
+
     <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:12px;">
-        <label style="color:#aaa; font-size:13px;">From:</label>
-        <input type="datetime-local" id="recFrom"
-               style="background:#222;color:#fff;border:1px solid #444;padding:6px 10px;border-radius:4px;font-size:13px;" />
-        <label style="color:#aaa; font-size:13px;">To:</label>
-        <input type="datetime-local" id="recTo"
-               style="background:#222;color:#fff;border:1px solid #444;padding:6px 10px;border-radius:4px;font-size:13px;" />
-        <button onclick="searchRecordings()"
-                style="background:#00d4ff;color:#000;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-weight:bold;">
-            🔍 Search
-        </button>
-        <button onclick="downloadSelected()"
-                style="background:#27ae60;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-weight:bold;">
-            ⬇ Download Selected
-        </button>
-        <span id="recStatus" style="color:#aaa;font-size:12px;"></span>
+      <label style="color:#aaa; font-size:13px;">From:</label>
+      <input type="datetime-local" id="recFrom"
+             style="background:#222;color:#fff;border:1px solid #444;padding:6px 10px;border-radius:4px;font-size:13px;" />
+      <label style="color:#aaa; font-size:13px;">To:</label>
+      <input type="datetime-local" id="recTo"
+             style="background:#222;color:#fff;border:1px solid #444;padding:6px 10px;border-radius:4px;font-size:13px;" />
+      <button onclick="searchRecordings()"
+              style="background:#00d4ff;color:#000;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-weight:bold;">
+        🔍 Search
+      </button>
+      <button onclick="downloadSelected()"
+              style="background:#27ae60;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-weight:bold;">
+        ⬇ Download Selected
+      </button>
+      <span id="recStatus" style="color:#aaa;font-size:12px;"></span>
     </div>
+
     <table style="width:100%;border-collapse:collapse;">
-        <thead>
-            <tr style="background:#222;">
-                <th style="padding:8px;color:#00d4ff;text-align:left;"><input type="checkbox" id="selectAll" onchange="toggleAll(this)"></th>
-                <th style="padding:8px;color:#00d4ff;text-align:left;">CH</th>
-                <th style="padding:8px;color:#00d4ff;text-align:left;">Start</th>
-                <th style="padding:8px;color:#00d4ff;text-align:left;">End</th>
-                <th style="padding:8px;color:#00d4ff;text-align:left;">Size</th>
-                <th style="padding:8px;color:#00d4ff;text-align:left;">Action</th>
-            </tr>
-        </thead>
-        <tbody id="recList">
-            <tr><td colspan="6" style="color:#666;padding:10px;">Select date range and click Search</td></tr>
-        </tbody>
+      <thead>
+        <tr style="background:#222;">
+          <th style="padding:8px;color:#00d4ff;text-align:left;"><input type="checkbox" id="selectAll" onchange="toggleAll(this)"></th>
+          <th style="padding:8px;color:#00d4ff;text-align:left;">CH</th>
+          <th style="padding:8px;color:#00d4ff;text-align:left;">Start</th>
+          <th style="padding:8px;color:#00d4ff;text-align:left;">End</th>
+          <th style="padding:8px;color:#00d4ff;text-align:left;">Size</th>
+          <th style="padding:8px;color:#00d4ff;text-align:left;">Action</th>
+        </tr>
+      </thead>
+      <tbody id="recList">
+        <tr><td colspan="6" style="color:#666;padding:10px;">Select date range and click Search</td></tr>
+      </tbody>
     </table>
-</div>
+  </div>
 
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script>
-// ── Live stream ───────────────────────────────────────────────────────────────
-function startLive(videoId, src) {
-    const video = document.getElementById(videoId);
-    const hls   = new Hls({ lowLatencyMode: true });
-    hls.loadSource(src);
-    hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
-    hls.on(Hls.Events.ERROR, (e, d) => console.error(videoId, d));
-}
-startLive('ch1', '/public/ch1.m3u8');
-
-// ── Leaflet Map ───────────────────────────────────────────────────────────────
-const map = L.map('map').setView([20, 0], 2);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '© OpenStreetMap contributors'
-}).addTo(map);
-
-const truckIcon = L.divIcon({
-    html: `<div style="background:#00d4ff;width:20px;height:20px;border-radius:50%;
-                       border:3px solid #fff;box-shadow:0 0 8px #00d4ff;"></div>`,
-    iconSize: [20,20], iconAnchor: [10,10], className: ''
-});
-
-let marker = null, polyline = null, trail = [];
-
-function updateMap(lat, lon, speed, direction) {
-    const pos = [lat, lon];
-    if (!marker) { marker = L.marker(pos, { icon: truckIcon }).addTo(map); map.setView(pos, 15); }
-    else          { marker.setLatLng(pos); }
-    marker.bindPopup(`<b>Vehicle</b><br>Lat: ${lat.toFixed(6)}<br>Lon: ${lon.toFixed(6)}<br>Speed: ${speed} km/h<br>Dir: ${direction}°`);
-    trail.push(pos);
-    if (trail.length > 50) trail.shift();
-    if (polyline) map.removeLayer(polyline);
-    polyline = L.polyline(trail, { color: '#00d4ff', weight: 2 }).addTo(map);
-    map.panTo(pos);
-}
-
-// ── WebSocket ─────────────────────────────────────────────────────────────────
-const ws = new WebSocket(`ws://${location.hostname}:8801`);
-ws.onopen  = () => console.log('WS connected');
-ws.onclose = () => console.warn('[WS] Disconnected');
-ws.onerror = e  => console.error('[WS] Error:', e);
-
-ws.onmessage = e => {
-    let msg;
-    try { msg = JSON.parse(e.data); } catch(err) { return; }
-
-    if (msg.type === 'location') {
-        updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
-        document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}`;
-        document.getElementById('info-lon').textContent        = `Longitude: ${msg.lon.toFixed(6)}`;
-        document.getElementById('info-speed').textContent      = `Speed: ${msg.speed} km/h`;
-        document.getElementById('info-dir').textContent        = `Direction: ${msg.direction}°`;
-        document.getElementById('info-elev').textContent       = `Elevation: ${msg.elevation} m`;
-        document.getElementById('info-dt').textContent         = `DateTime: ${msg.datetime}`;
-        document.getElementById('info-acc').textContent        = `ACC: ${msg.accOn ? 'ON' : 'OFF'}`;
-        document.getElementById('info-located').textContent    = `Located: ${msg.located ? 'Yes' : 'No'}`;
-        document.getElementById('info-mileage').textContent    = `Mileage: ${msg.mileage || '--'}`;
-        document.getElementById('info-voltage').textContent    = `Voltage: ${msg.voltage || '--'}`;
-        document.getElementById('info-satellites').textContent = `Satellites: ${msg.satellites || '--'}`;
-        document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms && msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
+  <!-- Playback -->
+  <div id="playbackSection" style="display:none;margin-top:20px;">
+    <h3>▶ Playback</h3>
+    <video id="playback" controls style="width:100%;max-width:900px;background:#000;"></video>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // ── Live stream ───────────────────────────────────────────────────────
+    function startLive(videoId, src) {
+        const video = document.getElementById(videoId);
+        const hls   = new Hls({ lowLatencyMode: true });
+        hls.loadSource(src);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+        hls.on(Hls.Events.ERROR, (e, d) => console.error(videoId, d));
     }
 
-    if (msg.type === 'recordings') {
-        _recs = msg.data || [];
-        renderRecordings(_recs);
-        document.getElementById('recStatus').textContent = `✅ ${_recs.length} recording(s) found`;
-    }
+    startLive('ch1', '/public/ch1.m3u8');
 
-    if (msg.type === 'recording_ready') {
-        console.log('[WS] recording_ready url:', msg.url);
-        document.getElementById('recStatus').textContent = '✅ Playing';
-        playFile(msg.url, window._pendingRecTitle || 'Recording');
-    }
+    // ── Leaflet Map ───────────────────────────────────────────────────────
+    const map = L.map('map').setView([20, 0], 2);
 
-    if (msg.type === 'status') {
-        document.getElementById('recStatus').textContent = msg.message;
-    }
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
 
-    if (msg.type === 'error') {
-        document.getElementById('recStatus').textContent = '❌ ' + msg.message;
-    }
-};
-
-// ── Recordings ────────────────────────────────────────────────────────────────
-let _recs = [];
-
-function searchRecordings() {
-    const from = document.getElementById('recFrom').value;
-    const to   = document.getElementById('recTo').value;
-    if (!from || !to) { document.getElementById('recStatus').textContent = '⚠️ Please select both From and To'; return; }
-    if (ws.readyState !== WebSocket.OPEN) { document.getElementById('recStatus').textContent = '❌ Not connected'; return; }
-    document.getElementById('recStatus').textContent = '⏳ Querying device...';
-    const fmt = v => v.replace('T', ' ') + ':00';
-    ws.send(JSON.stringify({ type: 'query_recordings', startDate: fmt(from), endDate: fmt(to) }));
-}
-
-function renderRecordings(list) {
-    const tbody = document.getElementById('recList');
-    if (!list || list.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" style="color:#666;padding:10px;">No recordings found</td></tr>';
-        return;
-    }
-    let html = '';
-    list.forEach((r, i) => {
-        html += `<tr style="border-bottom:1px solid #333;">
-            <td style="padding:8px;"><input type="checkbox" class="rec-check" data-idx="${i}"></td>
-            <td style="padding:8px;">CH${r.ch}</td>
-            <td style="padding:8px;">${r.startTime}</td>
-            <td style="padding:8px;">${r.endTime}</td>
-            <td style="padding:8px;">${r.size ? (r.size/1024/1024).toFixed(1)+' MB' : '--'}</td>
-            <td style="padding:8px;">
-                <button onclick="requestDownload(${i})"
-                        style="background:#00d4ff;color:#000;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-weight:bold;">
-                    ▶ Play
-                </button>
-            </td>
-        </tr>`;
+    const truckIcon = L.divIcon({
+        html: `<div style="
+            background: #00d4ff;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            border: 3px solid #fff;
+            box-shadow: 0 0 8px #00d4ff;
+        "></div>`,
+        iconSize:   [20, 20],
+        iconAnchor: [10, 10],
+        className:  ''
     });
-    tbody.innerHTML = html;
-}
 
-function toggleAll(cb) {
-    document.querySelectorAll('.rec-check').forEach(c => c.checked = cb.checked);
-}
+    let marker   = null;
+    let polyline = null;
+    let trail    = [];
 
-function requestDownload(index) {
-    const rec = _recs[index];
-    if (!rec) return;
-    document.getElementById('recStatus').textContent = '⏳ Requesting recording...';
-    window._pendingRecTitle = `CH${rec.ch} — ${rec.startTime}`;
-    ws.send(JSON.stringify({
-        type:      'download_recording',
-        ch:        rec.ch,
-        startTime: rec.startTime,
-        endTime:   rec.endTime,
-        phone:     rec.phone,
-    }));
-}
+    function updateMap(lat, lon, speed, direction) {
+        const pos = [lat, lon];
 
-function downloadSelected() {
-    const checked = [...document.querySelectorAll('.rec-check:checked')];
-    if (checked.length === 0) {
-        document.getElementById('recStatus').textContent = '⚠️ Select at least one recording';
-        return;
+        if (!marker) {
+            marker = L.marker(pos, { icon: truckIcon }).addTo(map);
+            map.setView(pos, 15);
+        } else {
+            marker.setLatLng(pos);
+        }
+
+        marker.bindPopup(`
+            <b>Vehicle</b><br>
+            Lat: ${lat.toFixed(6)}<br>
+            Lon: ${lon.toFixed(6)}<br>
+            Speed: ${speed} km/h<br>
+            Direction: ${direction}°
+        `);
+
+        trail.push(pos);
+        if (trail.length > 50) trail.shift();
+
+        if (polyline) map.removeLayer(polyline);
+        polyline = L.polyline(trail, { color: '#00d4ff', weight: 2 }).addTo(map);
+
+        map.panTo(pos);
     }
-    checked.forEach(cb => requestDownload(parseInt(cb.dataset.idx)));
-}
 
-function playFile(url, title) {
-        console.log('[playFile] URL:', url, 'title:', title);
-        const modal   = document.getElementById('videoModal');
-        const video   = document.getElementById('modalVideo');
-        const titleEl = document.getElementById('modalTitle');
-        titleEl.textContent = '▶ ' + (title || 'Playback');
-        modal.classList.add('active');
+    // ── WebSocket ─────────────────────────────────────────────────────────
+    const ws = new WebSocket(`ws://${location.hostname}:8801`);
+    ws.onopen  = () => console.log('WS connected');
+    ws.onclose = () => console.warn('[WS] Disconnected');
+    ws.onerror = e  => console.error('[WS] Error:', e);
 
-        if (window._recHls) { window._recHls.destroy(); window._recHls = null; }
-        video.pause();
-        video.src = '';
+    ws.onmessage = e => {
+        let msg;
+        try { msg = JSON.parse(e.data); }
+        catch(err) { console.error('[WS] Bad JSON:', e.data); return; }
 
+        if (msg.type === 'location') {
+            updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
+            document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}`;
+            document.getElementById('info-lon').textContent        = `Longitude: ${msg.lon.toFixed(6)}`;
+            document.getElementById('info-speed').textContent      = `Speed: ${msg.speed} km/h`;
+            document.getElementById('info-dir').textContent        = `Direction: ${msg.direction}°`;
+            document.getElementById('info-elev').textContent       = `Elevation: ${msg.elevation} m`;
+            document.getElementById('info-dt').textContent         = `DateTime: ${msg.datetime}`;
+            document.getElementById('info-acc').textContent        = `ACC: ${msg.accOn ? 'ON' : 'OFF'}`;
+            document.getElementById('info-located').textContent    = `Located: ${msg.located ? 'Yes' : 'No'}`;
+            document.getElementById('info-mileage').textContent    = `Mileage: ${msg.mileage || '--'}`;
+            document.getElementById('info-voltage').textContent    = `Voltage: ${msg.voltage || '--'}`;
+            document.getElementById('info-satellites').textContent = `Satellites: ${msg.satellites || '--'}`;
+            document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
+        }
+    };
+
+
+
+    // ── Recordings ────────────────────────────────────────────────────────
+    let _recs = [];
+
+    // Handle incoming WS messages for recordings
+    const _origOnMessage = ws.onmessage;
+    ws.onmessage = e => {
+        let msg; try { msg = JSON.parse(e.data); } catch(_){ return; }
+
+        if (msg.type === 'location') {
+            // pass to original handler
+            updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
+            document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}`;
+            document.getElementById('info-lon').textContent        = `Longitude: ${msg.lon.toFixed(6)}`;
+            document.getElementById('info-speed').textContent      = `Speed: ${msg.speed} km/h`;
+            document.getElementById('info-dir').textContent        = `Direction: ${msg.direction}°`;
+            document.getElementById('info-elev').textContent       = `Elevation: ${msg.elevation} m`;
+            document.getElementById('info-dt').textContent         = `DateTime: ${msg.datetime}`;
+            document.getElementById('info-acc').textContent        = `ACC: ${msg.accOn ? 'ON' : 'OFF'}`;
+            document.getElementById('info-located').textContent    = `Located: ${msg.located ? 'Yes' : 'No'}`;
+            document.getElementById('info-mileage').textContent    = `Mileage: ${msg.mileage || '--'}`;
+            document.getElementById('info-voltage').textContent    = `Voltage: ${msg.voltage || '--'}`;
+            document.getElementById('info-satellites').textContent = `Satellites: ${msg.satellites || '--'}`;
+            document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
+        }
+
+        if (msg.type === 'recordings') {
+            console.log('[Rec] Received', msg.data.length, 'recordings');
+            _recs = msg.data;
+            renderRecordings(_recs);
+            document.getElementById('recStatus').textContent = `✅ ${_recs.length} recording(s) found`;
+        }
+
+        if (msg.type === 'recording_ready') {
+            console.log('[Rec] File ready:', msg.url);
+            document.getElementById('recStatus').textContent = '✅ File ready — playing';
+            playFile(msg.url);
+        }
+
+        if (msg.type === 'status') {
+            document.getElementById('recStatus').textContent = msg.message;
+        }
+
+        if (msg.type === 'error') {
+            document.getElementById('recStatus').textContent = '❌ ' + msg.message;
+        }
+    };
+
+    function searchRecordings() {
+        const from = document.getElementById('recFrom').value; // "YYYY-MM-DDTHH:MM"
+        const to   = document.getElementById('recTo').value;
+        console.log('[Rec] searchRecordings from:', from, 'to:', to);
+        if (!from || !to) {
+            document.getElementById('recStatus').textContent = '⚠️ Please select both From and To';
+            return;
+        }
+        if (ws.readyState !== WebSocket.OPEN) {
+            document.getElementById('recStatus').textContent = '❌ Not connected';
+            return;
+        }
+        document.getElementById('recStatus').textContent = '⏳ Querying device...';
+        // Convert "YYYY-MM-DDTHH:MM" → "YYYY-MM-DD HH:MM:00"
+        const fmt = v => v.replace('T', ' ') + ':00';
+        ws.send(JSON.stringify({ type: 'query_recordings', startDate: fmt(from), endDate: fmt(to) }));
+    }
+
+    function renderRecordings(list) {
+        const tbody = document.getElementById('recList');
+        if (!list || list.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" style="color:#666;padding:10px;">No recordings found</td></tr>';
+            return;
+        }
+        let html = '';
+        list.forEach((r, i) => {
+            html += `<tr style="border-bottom:1px solid #333;">
+                <td style="padding:8px;"><input type="checkbox" class="rec-check" data-idx="${i}"></td>
+                <td style="padding:8px;">CH${r.ch}</td>
+                <td style="padding:8px;">${r.startTime}</td>
+                <td style="padding:8px;">${r.endTime}</td>
+                <td style="padding:8px;">${r.size ? (r.size/1024/1024).toFixed(1)+' MB' : '--'}</td>
+                <td style="padding:8px;">
+                  <button onclick="requestDownload(${i})"
+                    style="background:#00d4ff;color:#000;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-weight:bold;">
+                    ⬇ Get
+                  </button>
+                </td>
+            </tr>`;
+        });
+        tbody.innerHTML = html;
+    }
+
+    function toggleAll(cb) {
+        document.querySelectorAll('.rec-check').forEach(c => c.checked = cb.checked);
+    }
+
+    function requestDownload(index) {
+        const rec = _recs[index];
+        if (!rec) return;
+        console.log('[Rec] requestDownload:', rec);
+        document.getElementById('recStatus').textContent = '⏳ Requesting device upload to FTP...';
+        ws.send(JSON.stringify({
+            type:      'download_recording',
+            ch:        rec.ch,
+            startTime: rec.startTime,
+            endTime:   rec.endTime,
+            phone:     rec.phone,
+        }));
+    }
+
+    function downloadSelected() {
+        const checked = [...document.querySelectorAll('.rec-check:checked')];
+        if (checked.length === 0) {
+            document.getElementById('recStatus').textContent = '⚠️ Select at least one recording';
+            return;
+        }
+        checked.forEach(cb => requestDownload(parseInt(cb.dataset.idx)));
+    }
+
+    function playFile(url) {
+        const section = document.getElementById('playbackSection');
+        section.style.display = 'block';
+        section.scrollIntoView({ behavior: 'smooth' });
+        const video = document.getElementById('playback');
+        if (window._playHls) { window._playHls.destroy(); window._playHls = null; }
         if (url.endsWith('.m3u8') && Hls.isSupported()) {
-            const hls = new Hls({ lowLatencyMode: false, startPosition: 0 });
-            window._recHls = hls;
+            const hls = new Hls();
+            window._playHls = hls;
             hls.loadSource(url);
             hls.attachMedia(video);
-            hls.on(Hls.Events.MANIFEST_PARSED, () => { video.currentTime = 0; video.play(); });
-            hls.on(Hls.Events.ERROR, (e, d) => {
-                console.error('[RecHLS]', d.type, d.details);
-                if (d.fatal) document.getElementById('recStatus').textContent = '❌ ' + d.details;
-            });
+            hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+            hls.on(Hls.Events.ERROR, (e,d) => console.error('[HLS]', d));
         } else {
-            // Server already confirmed file is ready before sending this URL
-            // Play directly — no polling needed
-            console.log('[playFile] Playing .ts directly');
             video.src = url;
-            video.currentTime = 0;
-            video.play()
-                .then(() => {
-                    document.getElementById('recStatus').textContent = '✅ Playing';
-                })
-                .catch(err => {
-                    console.error('[playFile] play error:', err);
-                    document.getElementById('recStatus').textContent = '❌ Play error: ' + err.message;
-                });
+            video.play().catch(console.warn);
         }
     }
-function closeModal() {
-    const modal = document.getElementById('videoModal');
-    const video = document.getElementById('modalVideo');
-    modal.classList.remove('active');
-    video.pause();
-    video.src = '';
-    if (window._recHls) { window._recHls.destroy(); window._recHls = null; }
-    if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'stop_playback' }));
-    }
-}
-</script>
+  </script>
 </body>
 </html>
