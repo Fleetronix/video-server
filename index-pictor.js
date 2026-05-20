@@ -434,6 +434,7 @@ const tcpServer = net.createServer(socket => {
                     const seq  = unescaped.readUInt16BE(10);
                     const body = unescaped.slice(12);
                     console.log(`[signalling] msgId: 0x${msgId.toString(16).padStart(4,'0')} phone: ${phone}`);
+                    console.log(`[RAW] body hex: ${body.toString('hex')}`);  // ← ADD THIS LINE
 
                     // ── 0x0001: General response from device ─────────────────
                     if (msgId === 0x0001) {
