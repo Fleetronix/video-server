@@ -25,7 +25,7 @@ if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 const tcpSockets      = {}; // { [phone]: socket }
 const deviceRecordings= {}; // { [phone]: [{ch,startTime,endTime,size}] }
 const activeDownloads = {}; // { [phone]: { writeStream, filename, channel } }
-
+let recSocket = null; // the specific socket sending recording data
 // Built-in FTP server so device can upload recordings to us
 // npm install ftp-srv  ←  run this once
 // ── Minimal FTP Server (PASV only, no EPSV — required for Babelstar device) ──
@@ -279,11 +279,12 @@ wss.on('connection', (ws, req) => {
             const _resetTimer = () => {
                 if (_recTimer) clearTimeout(_recTimer);
                 _recTimer = setTimeout(() => {
-                    console.log(`[Rec] ⏹ Recording stream ended for ${targetPhone}`);
-                    if (activeDownloads[targetPhone]) activeDownloads[targetPhone].active = false;
-                    delete activeDownloads[targetPhone];
-                    // Keep recChannels alive so browser can finish playing
-                }, 10000);
+                        console.log(`[Rec] ⏹ Recording stream ended for ${targetPhone}`);
+                        if (activeDownloads[targetPhone]) activeDownloads[targetPhone].active = false;
+                        delete activeDownloads[targetPhone];
+                        recSocket = null; // release the rec socket
+                        console.log(`[Rec] Rec socket released`);
+                    }, 10000);
             };
             activeDownloads[targetPhone].resetTimer = _resetTimer;
             _resetTimer();
@@ -323,6 +324,7 @@ wss.on('connection', (ws, req) => {
                 }
                 delete activeDownloads[p];
             });
+            recSocket = null;
         }
     });
 
@@ -916,11 +918,22 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    const effectivePhone = phone || Object.keys(activeDownloads)[0];
-                    const isRec = effectivePhone &&
-                                  activeDownloads[effectivePhone] &&
-                                  activeDownloads[effectivePhone].active === true &&
-                                  recChannels[effectivePhone];
+                    // Only treat as recording if THIS socket is the designated rec socket
+                    // OR this socket has no phone yet and activeDownloads is set
+                    // (meaning it's the new connection the device opened for 0x9201)
+                    if (!phone && recSocket === null && Object.keys(activeDownloads).length > 0) {
+                        // This unidentified socket is the recording socket
+                        recSocket = socket;
+                        console.log(`[Rec] Recording socket identified: ${remote}`);
+                    }
+
+                    const isRec = (socket === recSocket) &&
+                                  Object.keys(activeDownloads).length > 0 &&
+                                  Object.values(activeDownloads)[0]?.active === true;
+
+                    const effectivePhone = isRec
+                        ? Object.keys(activeDownloads)[0]
+                        : phone;
 
                     // Log timestamp of first few rec packets to verify it's historical
                     if (isRec && dataType === 0) {
