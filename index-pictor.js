@@ -1008,50 +1008,48 @@ const tcpServer = net.createServer(socket => {
             while (offset < buffer.length - 4) {
 
                 // ── Stream data packet (T/98 §5.5.3 — 0x30316364 header) ────
-                // ── Stream data packet (T/98 §5.5.3 — 0x30316364 header) ────
                 if (buffer[offset]   === 0x30 && buffer[offset+1] === 0x31 &&
                     buffer[offset+2] === 0x63 && buffer[offset+3] === 0x64) {
- 
+
                     if (offset + 30 > buffer.length) break;
                     const dataBodyLen = buffer.readUInt16BE(offset + 28);
                     if (offset + 30 + dataBodyLen > buffer.length) break;
- 
+
                     const byte15       = buffer[offset + 15];
                     const dataType     = (byte15 >> 4) & 0x0F;
                     const subpktMarker = byte15 & 0x0F;
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
- 
-                    // Get phone from packet bytes 8-13 (BCD) — works on any socket
-                    const pktPhone = (() => {
-                        const bcdBytes = buffer.slice(offset + 8, offset + 14);
-                        const digits = bcdBytes.map(b => `${(b>>4)&0xF}${b&0xF}`).join('');
-                        return digits.replace(/^0+/, '') || '0';
-                    })();
- 
-                    if (recActive) {
-                        // Recording mode — route ALL packets to rec pipeline
-                        const recPhone = Object.keys(activeDownloads)[0];
-                        if (recPhone) {
-                            // Reset inactivity timer
-                            if (activeDownloads[recPhone]?.resetTimer) {
-                                activeDownloads[recPhone].resetTimer();
-                            }
-                            // Log first I-frame timestamp to verify historical data
+
+                    // Identify packet as recording vs live by comparing timestamp
+                    // to current time — recording packets have historical timestamps
+                    let isRec = false;
+                    if (recActive && Object.keys(activeDownloads).length > 0) {
+                        try {
+                            const tsMs   = buffer.readBigUInt64BE(offset + 16);
+                            const tsDate = Number(tsMs);
+                            const nowMs  = Date.now();
+                            // If timestamp is more than 60 seconds in the past → recording
+                            const diffMs = nowMs - tsDate;
+                            isRec = diffMs > 60000;
                             if (dataType === 0) {
-                                try {
-                                    const tsMs = buffer.readBigUInt64BE(offset + 16);
-                                    const tsDate = new Date(Number(tsMs));
-                                    console.log(`[REC PKT] socket=${remote} phone=${pktPhone} I-frame ts=${tsDate.toISOString()}`);
-                                } catch(_) {}
+                                console.log(`[PKT] socket=${remote} ts=${new Date(tsDate).toISOString()} diff=${Math.round(diffMs/1000)}s isRec=${isRec}`);
                             }
-                            processRecPacket(rawData, recPhone, dataType, subpktMarker);
+                        } catch(_) {
+                            isRec = false;
                         }
+                    }
+
+                    if (isRec) {
+                        const recPhone = Object.keys(activeDownloads)[0];
+                        if (activeDownloads[recPhone]?.resetTimer) {
+                            activeDownloads[recPhone].resetTimer();
+                        }
+                        processRecPacket(rawData, recPhone, dataType, subpktMarker);
                     } else {
-                        // Live mode
                         processVideoPacket(rawData, channel, dataType, subpktMarker);
                     }
- 
+
                     offset += 30 + dataBodyLen;
                     continue;
                 }
