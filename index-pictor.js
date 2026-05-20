@@ -24,8 +24,9 @@ if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 // ── Device state & FTP ───────────────────────────────────────────────────────
 const tcpSockets      = {}; // { [phone]: socket }
 const deviceRecordings= {}; // { [phone]: [{ch,startTime,endTime,size}] }
-const activeDownloads = {}; // { [phone]: { writeStream, filename, channel } }
-let recSocket = null; // the specific socket sending recording data
+const activeDownloads = {}; // { [phone]: { channel, active } }
+let recActive    = false;  // true while recording stream is expected
+let recEndTimer  = null;   // timer to stop rec capture
 // Built-in FTP server so device can upload recordings to us
 // npm install ftp-srv  ←  run this once
 // ── Minimal FTP Server (PASV only, no EPSV — required for Babelstar device) ──
@@ -239,92 +240,100 @@ wss.on('connection', (ws, req) => {
             }
         }
 
-        // ── download_recording: tell device to upload a file via FTP ──────
         // ── download_recording: stream recording via 0x9201 ───────────────
         if (msg.type === 'download_recording') {
             const { ch, startTime, endTime, phone: reqPhone } = msg;
             const targetPhone = reqPhone || Object.keys(tcpSockets)[0];
-            console.log(`[Rec] download ch:${ch} ${startTime}→${endTime} phone:${targetPhone}`);
-
+            console.log(`[Rec] ▶ download ch:${ch} ${startTime}→${endTime} phone:${targetPhone}`);
+            console.log(`[Rec] tcpSockets:`, Object.keys(tcpSockets));
+            console.log(`[Rec] recActive before:`, recActive);
+ 
             if (!targetPhone || !tcpSockets[targetPhone] || tcpSockets[targetPhone].destroyed) {
                 ws.send(JSON.stringify({ type: 'error', message: 'Device not connected' }));
                 return;
             }
-
-            // Stop any previous rec FFmpeg and clean old segments
-            if (recChannels[targetPhone]) {
-                try { recChannels[targetPhone].ffmpeg.stdin.end(); } catch(_) {}
-                delete recChannels[targetPhone];
+ 
+            // Stop any previous rec and clean old files
+            recActive = false;
+            if (recEndTimer) { clearTimeout(recEndTimer); recEndTimer = null; }
+            const recPhone = Object.keys(activeDownloads)[0];
+            if (recPhone && recChannels[recPhone]) {
+                try { recChannels[recPhone].ffmpeg.stdin.end(); } catch(_) {}
+                delete recChannels[recPhone];
             }
+            Object.keys(activeDownloads).forEach(p => delete activeDownloads[p]);
+ 
             try {
                 fs.readdirSync('./public')
                   .filter(f => f.startsWith(`rec_${targetPhone}`))
                   .forEach(f => { try { fs.unlinkSync(`./public/${f}`); } catch(_) {} });
-                console.log(`[Rec] Cleaned old rec segments for ${targetPhone}`);
+                console.log(`[Rec] Cleaned old rec files for ${targetPhone}`);
             } catch(_) {}
-
-            // Start fresh rec FFmpeg
+ 
+            // Start fresh rec writer
             const recFfmpeg = startRecFFmpeg(targetPhone, ch);
             recChannels[targetPhone] = {
                 ffmpeg: recFfmpeg, gotIFrame: false,
-                subpackets: [], tsCounter: 0, patPmtSent: false, onReady: null,
+                subpackets: [], tsCounter: 0, patPmtSent: false,
             };
-
-            // Mark download active — stays until stop_playback
-            // Mark download active
             activeDownloads[targetPhone] = { channel: ch, active: true };
-
-            // Auto-stop after 10s of no packets (recording finished)
-            let _recTimer = null;
+ 
+            // Inactivity timer — stop rec if no packets for 10s
             const _resetTimer = () => {
-                if (_recTimer) clearTimeout(_recTimer);
-                _recTimer = setTimeout(() => {
-                        console.log(`[Rec] ⏹ Recording stream ended for ${targetPhone}`);
-                        if (activeDownloads[targetPhone]) activeDownloads[targetPhone].active = false;
-                        delete activeDownloads[targetPhone];
-                        recSocket = null; // release the rec socket
-                        console.log(`[Rec] Rec socket released`);
-                    }, 10000);
+                if (recEndTimer) clearTimeout(recEndTimer);
+                recEndTimer = setTimeout(() => {
+                    console.log(`[Rec] ⏹ No packets for 10s — stopping rec for ${targetPhone}`);
+                    recActive = false;
+                    if (recChannels[targetPhone]) {
+                        try { recChannels[targetPhone].ffmpeg.stdin.end(); } catch(_) {}
+                    }
+                    activeDownloads[targetPhone] = { channel: ch, active: false };
+                    console.log(`[Rec] rec stopped, live stream resuming`);
+                }, 10000);
             };
             activeDownloads[targetPhone].resetTimer = _resetTimer;
-            _resetTimer();
-
-            // Notify browser after first I-frame + 3s for FFmpeg segment
+ 
+            // Set notify callback BEFORE activating rec
             const _notifyPhone = targetPhone;
             recChannels[targetPhone].onReady = () => {
                 setTimeout(() => {
-                    console.log(`[Rec] ✅ recording_ready → /public/rec_${_notifyPhone}.m3u8`);
+                    console.log(`[Rec] ✅ Sending recording_ready to browser: /public/rec_${_notifyPhone}.ts`);
                     wss.clients.forEach(c => {
                         if (c.readyState === 1) c.send(JSON.stringify({
                             type: 'recording_ready',
-                            url:  `/public/rec_${_notifyPhone}.m3u8`,
+                            url:  `/public/rec_${_notifyPhone}.ts`,
                         }));
                     });
-                }, 3000);
+                }, 2000);
             };
-
-            // Send 0x9201 playback request
+ 
+            // ACTIVATE rec mode THEN send command
+            recActive = true;
+            _resetTimer();
+            console.log(`[Rec] recActive = true, sending 0x9201`);
+ 
             const frame = buildVideoPlaybackRequest(targetPhone, ch, startTime, endTime);
             tcpSockets[targetPhone].write(frame);
             ws.send(JSON.stringify({ type: 'status', message: '⏳ Buffering recording...' }));
         }
-
+ 
         // ── stop_playback: browser closed modal ───────────────────────────
         if (msg.type === 'stop_playback') {
+            console.log(`[Rec] stop_playback received`);
+            recActive = false;
+            if (recEndTimer) { clearTimeout(recEndTimer); recEndTimer = null; }
             const ph = Object.keys(tcpSockets)[0];
             if (ph && tcpSockets[ph] && !tcpSockets[ph].destroyed) {
                 tcpSockets[ph].write(buildPlaybackStop(ph, 1));
                 console.log(`[Rec] Sent 0x9202 stop to ${ph}`);
             }
             Object.keys(activeDownloads).forEach(p => {
-                if (activeDownloads[p]) activeDownloads[p].active = false;
                 if (recChannels[p]) {
                     try { recChannels[p].ffmpeg.stdin.end(); } catch(_) {}
                     delete recChannels[p];
                 }
                 delete activeDownloads[p];
             });
-            recSocket = null;
         }
     });
 
@@ -418,52 +427,60 @@ const channels = {
 const recChannels = {}; // { [phone]: { ffmpeg, gotIFrame, subpackets, tsCounter, patPmtSent } }
 
 function startRecFFmpeg(phone, channel) {
-    const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
-        '-fflags',          '+genpts+discardcorrupt+igndts',
-        '-err_detect',      'ignore_err',
-        '-f',               'mpegts',
-        '-probesize',       '2000000',
-        '-analyzeduration', '3000000',
-        '-i',               'pipe:0',
-        '-c:v',             'libx264',
-        '-preset',          'ultrafast',
-        '-tune',            'zerolatency',
-        '-g',               '30',
-        '-keyint_min',      '15',
-        '-f',               'hls',
-        '-hls_time',        '2',
-        '-hls_list_size',   '0',
-        '-hls_flags',       'append_list',
-        '-hls_segment_filename', `./public/rec_${phone}_%03d.ts`,
-        `./public/rec_${phone}.m3u8`,
-    ]);
-    ffmpeg.stderr.on('data', d => {
-        const m = d.toString().trim();
-        if (m.includes('Error') || m.includes('error')) console.error(`[RecFFmpeg] ${m}`);
-    });
-    ffmpeg.on('close', code => console.log(`[RecFFmpeg] closed code=${code}`));
-    return ffmpeg;
+    const outPath = `./public/rec_${phone}.ts`;
+    const writeStream = fs.createWriteStream(outPath);
+    console.log(`[Rec] ⏺ Raw TS writer started: ${outPath}`);
+    writeStream.on('error', err => console.error(`[Rec] Write error:`, err.message));
+    // NOTE: PAT/PMT written by handleRecFrame on first frame (patPmtSent flag)
+    return {
+        stdin: {
+            writable: true,
+            write: (data) => { writeStream.write(data); return true; },
+            end: () => {
+                writeStream.end(() => console.log(`[Rec] ✅ TS file complete: ${outPath}`));
+            }
+        },
+        stderr: { on: () => {} },
+        on: () => {}
+    };
 }
 
 function handleRecFrame(frameData, phone, dataType) {
     const rc = recChannels[phone];
-    if (!rc) return;
+    if (!rc) {
+        console.warn(`[Rec] handleRecFrame: no recChannel for phone=${phone}`);
+        return;
+    }
     const isVideo = (dataType === 0 || dataType === 1 || dataType === 2);
     if (!isVideo) return;
+ 
     if (dataType === 0) {
+        // Log first I-frame bytes to identify codec
+        if (!rc.gotIFrame) {
+            console.log(`[Rec] First I-frame: ${frameData.slice(0,8).toString('hex')} len=${frameData.length}`);
+        }
         if (!rc.gotIFrame && rc.onReady) {
-            rc.onReady(); // fire once on first I-frame
+            rc.onReady();
             rc.onReady = null;
         }
         rc.gotIFrame = true;
+    } else if (!rc.gotIFrame) {
+        return; // drop P/B until first I-frame
     }
-    else if (!rc.gotIFrame) return;
-    if (!rc.ffmpeg || !rc.ffmpeg.stdin.writable) return;
+ 
+    if (!rc.ffmpeg || !rc.ffmpeg.stdin.writable) {
+        console.warn(`[Rec] handleRecFrame: ffmpeg not writable for phone=${phone}`);
+        return;
+    }
+ 
+    // Write PAT+PMT once — use same AVS type as live stream
     if (!rc.patPmtSent) {
         rc.ffmpeg.stdin.write(buildPAT());
-        rc.ffmpeg.stdin.write(buildPMT_HEVC());
+        rc.ffmpeg.stdin.write(buildPMT()); // AVS 0x42 — same as live
         rc.patPmtSent = true;
+        console.log(`[Rec] Wrote PAT+PMT to TS file`);
     }
+ 
     const { packets, nextCounter } = wrapFrameInTS(frameData, rc.tsCounter);
     rc.tsCounter = nextCounter;
     for (const pkt of packets) rc.ffmpeg.stdin.write(pkt);
@@ -928,52 +945,50 @@ const tcpServer = net.createServer(socket => {
             while (offset < buffer.length - 4) {
 
                 // ── Stream data packet (T/98 §5.5.3 — 0x30316364 header) ────
+                // ── Stream data packet (T/98 §5.5.3 — 0x30316364 header) ────
                 if (buffer[offset]   === 0x30 && buffer[offset+1] === 0x31 &&
                     buffer[offset+2] === 0x63 && buffer[offset+3] === 0x64) {
-
+ 
                     if (offset + 30 > buffer.length) break;
                     const dataBodyLen = buffer.readUInt16BE(offset + 28);
                     if (offset + 30 + dataBodyLen > buffer.length) break;
-
+ 
                     const byte15       = buffer[offset + 15];
-                    const dataType     = (byte15 >> 4) & 0x0F; // upper nibble
-                    const subpktMarker = byte15 & 0x0F;         // lower nibble
+                    const dataType     = (byte15 >> 4) & 0x0F;
+                    const subpktMarker = byte15 & 0x0F;
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
-
-                    // Only treat as recording if THIS socket is the designated rec socket
-                    // OR this socket has no phone yet and activeDownloads is set
-                    // (meaning it's the new connection the device opened for 0x9201)
-                    if (!phone && recSocket === null && Object.keys(activeDownloads).length > 0) {
-                        // This unidentified socket is the recording socket
-                        recSocket = socket;
-                        console.log(`[Rec] Recording socket identified: ${remote}`);
-                    }
-
-                    const isRec = (socket === recSocket) &&
-                                  Object.keys(activeDownloads).length > 0 &&
-                                  Object.values(activeDownloads)[0]?.active === true;
-
-                    const effectivePhone = isRec
-                        ? Object.keys(activeDownloads)[0]
-                        : phone;
-
-                    // Log timestamp of first few rec packets to verify it's historical
-                    if (isRec && dataType === 0) {
-                        const tsMs = buffer.readBigUInt64BE(offset + 16);
-                        const tsDate = new Date(Number(tsMs));
-                        console.log(`[REC PKT] I-frame timestamp: ${tsMs}ms = ${tsDate.toISOString()}`);
-                    }
-
-                    if (isRec) {
-                        if (activeDownloads[effectivePhone]?.resetTimer) {
-                            activeDownloads[effectivePhone].resetTimer();
+ 
+                    // Get phone from packet bytes 8-13 (BCD) — works on any socket
+                    const pktPhone = (() => {
+                        const bcdBytes = buffer.slice(offset + 8, offset + 14);
+                        const digits = bcdBytes.map(b => `${(b>>4)&0xF}${b&0xF}`).join('');
+                        return digits.replace(/^0+/, '') || '0';
+                    })();
+ 
+                    if (recActive) {
+                        // Recording mode — route ALL packets to rec pipeline
+                        const recPhone = Object.keys(activeDownloads)[0];
+                        if (recPhone) {
+                            // Reset inactivity timer
+                            if (activeDownloads[recPhone]?.resetTimer) {
+                                activeDownloads[recPhone].resetTimer();
+                            }
+                            // Log first I-frame timestamp to verify historical data
+                            if (dataType === 0) {
+                                try {
+                                    const tsMs = buffer.readBigUInt64BE(offset + 16);
+                                    const tsDate = new Date(Number(tsMs));
+                                    console.log(`[REC PKT] socket=${remote} phone=${pktPhone} I-frame ts=${tsDate.toISOString()}`);
+                                } catch(_) {}
+                            }
+                            processRecPacket(rawData, recPhone, dataType, subpktMarker);
                         }
-                        processRecPacket(rawData, effectivePhone, dataType, subpktMarker);
                     } else {
+                        // Live mode
                         processVideoPacket(rawData, channel, dataType, subpktMarker);
                     }
-
+ 
                     offset += 30 + dataBodyLen;
                     continue;
                 }

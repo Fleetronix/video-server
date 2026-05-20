@@ -319,37 +319,54 @@
     }
 
     function playFile(url, title) {
-        console.log('[playFile] URL:', url);
-        const modal = document.getElementById('videoModal');
-        const video = document.getElementById('modalVideo');
+        console.log('[playFile] URL:', url, 'title:', title);
+        const modal   = document.getElementById('videoModal');
+        const video   = document.getElementById('modalVideo');
         const titleEl = document.getElementById('modalTitle');
         titleEl.textContent = '▶ ' + (title || 'Playback');
         modal.classList.add('active');
-
+ 
         if (window._recHls) { window._recHls.destroy(); window._recHls = null; }
-
-        // Wait for manifest to exist then load from beginning
-        document.getElementById('recStatus').textContent = '⏳ Loading segments...';
-        let attempts = 0;
-        const tryLoad = () => {
-            fetch(url + '?t=' + Date.now())
-                .then(r => r.text())
-                .then(m3u8 => {
-                    const segments = (m3u8.match(/\.ts/g) || []).length;
-                    console.log('[playFile] segments in playlist:', segments);
-                    if (segments < 3 && attempts++ < 20) {
-                        setTimeout(tryLoad, 1000);
-                        return;
-                    }
-                    document.getElementById('recStatus').textContent = '✅ Playing';
-                    _loadHls(url, video);
-                })
-                .catch(() => {
-                    if (attempts++ < 20) setTimeout(tryLoad, 1000);
-                });
-        };
-        tryLoad();
-        return;
+        video.src = '';
+ 
+        if (url.endsWith('.m3u8') && Hls.isSupported()) {
+            const hls = new Hls({ lowLatencyMode: false, startPosition: 0 });
+            window._recHls = hls;
+            hls.loadSource(url);
+            hls.attachMedia(video);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => { video.currentTime = 0; video.play(); });
+            hls.on(Hls.Events.ERROR, (e, d) => {
+                console.error('[RecHLS]', d.type, d.details);
+                if (d.fatal) document.getElementById('recStatus').textContent = '❌ ' + d.details;
+            });
+        } else {
+            // Direct .ts file — poll until it exists and has data
+            document.getElementById('recStatus').textContent = '⏳ Loading...';
+            let attempts = 0;
+            const tryPlay = () => {
+                fetch(url + '?t=' + Date.now(), { method: 'HEAD' })
+                    .then(r => {
+                        const size = r.headers.get('content-length');
+                        console.log('[playFile] HEAD', url, 'status:', r.status, 'size:', size);
+                        if (r.ok && size > 100000) {
+                            video.src = url + '?t=' + Date.now();
+                            video.currentTime = 0;
+                            video.play().catch(e => console.warn('[playFile] play error:', e));
+                            document.getElementById('recStatus').textContent = '✅ Playing';
+                        } else if (attempts++ < 30) {
+                            document.getElementById('recStatus').textContent = `⏳ Buffering... (${attempts}s)`;
+                            setTimeout(tryPlay, 1000);
+                        } else {
+                            document.getElementById('recStatus').textContent = '❌ Timeout — file not ready';
+                        }
+                    })
+                    .catch(e => {
+                        console.warn('[playFile] fetch error:', e);
+                        if (attempts++ < 30) setTimeout(tryPlay, 1000);
+                    });
+            };
+            tryPlay();
+        }
     }
 
     function _loadHls(url, video) {
