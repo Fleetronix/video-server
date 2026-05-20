@@ -240,6 +240,7 @@ wss.on('connection', (ws, req) => {
         }
 
         // ── download_recording: tell device to upload a file via FTP ──────
+        // ── download_recording: stream recording via 0x9201 ───────────────
         if (msg.type === 'download_recording') {
             const { ch, startTime, endTime, phone: reqPhone } = msg;
             const targetPhone = reqPhone || Object.keys(tcpSockets)[0];
@@ -249,35 +250,30 @@ wss.on('connection', (ws, req) => {
                 ws.send(JSON.stringify({ type: 'error', message: 'Device not connected' }));
                 return;
             }
-            const frame = buildVideoPlaybackRequest(targetPhone, ch, startTime, endTime);
-            // console.log(`[WS] Sending 0x9206 frame:`, frame.toString('hex'));
-        
-            // Start recording FFmpeg instance
+
             // Stop any previous rec FFmpeg and clean old segments
             if (recChannels[targetPhone]) {
                 try { recChannels[targetPhone].ffmpeg.stdin.end(); } catch(_) {}
                 delete recChannels[targetPhone];
             }
-            // Delete stale rec HLS files
             try {
-                const files = fs.readdirSync('./public');
-                files.filter(f => f.startsWith(`rec_${targetPhone}`))
-                     .forEach(f => { try { fs.unlinkSync(`./public/${f}`); } catch(_) {} });
+                fs.readdirSync('./public')
+                  .filter(f => f.startsWith(`rec_${targetPhone}`))
+                  .forEach(f => { try { fs.unlinkSync(`./public/${f}`); } catch(_) {} });
                 console.log(`[Rec] Cleaned old rec segments for ${targetPhone}`);
             } catch(_) {}
+
+            // Start fresh rec FFmpeg
             const recFfmpeg = startRecFFmpeg(targetPhone, ch);
             recChannels[targetPhone] = {
                 ffmpeg: recFfmpeg, gotIFrame: false,
-                subpackets: [], tsCounter: 0, patPmtSent: false
+                subpackets: [], tsCounter: 0, patPmtSent: false, onReady: null,
             };
+
+            // Mark download active — stays until stop_playback
             activeDownloads[targetPhone] = { channel: ch, active: true };
 
-            // Auto-deactivate after 5s of no new packets
-            activeDownloads[targetPhone].resetTimer = null;
-            resetRecTimer();
-            tcpSockets[targetPhone].write(frame);
-
-            // Notify browser after first I-frame + 3s for FFmpeg to produce segment
+            // Notify browser after first I-frame + 3s for FFmpeg segment
             const _notifyPhone = targetPhone;
             recChannels[targetPhone].onReady = () => {
                 setTimeout(() => {
@@ -290,23 +286,28 @@ wss.on('connection', (ws, req) => {
                     });
                 }, 3000);
             };
+
+            // Send 0x9201 playback request
+            const frame = buildVideoPlaybackRequest(targetPhone, ch, startTime, endTime);
+            tcpSockets[targetPhone].write(frame);
             ws.send(JSON.stringify({ type: 'status', message: '⏳ Buffering recording...' }));
-            // ── stop_playback: browser closed the modal ───────────────────────
-                if (msg.type === 'stop_playback') {
-                    const ph = Object.keys(tcpSockets)[0];
-                    if (ph && tcpSockets[ph] && !tcpSockets[ph].destroyed) {
-                        tcpSockets[ph].write(buildPlaybackStop(ph, 1));
-                        console.log(`[Rec] Sent 0x9202 stop to ${ph}`);
-                    }
-                    Object.keys(activeDownloads).forEach(p => {
-                        if (activeDownloads[p]) activeDownloads[p].active = false;
-                        if (recChannels[p]) {
-                            try { recChannels[p].ffmpeg.stdin.end(); } catch(_) {}
-                            delete recChannels[p];
-                        }
-                        delete activeDownloads[p];
-                    });
+        }
+
+        // ── stop_playback: browser closed modal ───────────────────────────
+        if (msg.type === 'stop_playback') {
+            const ph = Object.keys(tcpSockets)[0];
+            if (ph && tcpSockets[ph] && !tcpSockets[ph].destroyed) {
+                tcpSockets[ph].write(buildPlaybackStop(ph, 1));
+                console.log(`[Rec] Sent 0x9202 stop to ${ph}`);
+            }
+            Object.keys(activeDownloads).forEach(p => {
+                if (activeDownloads[p]) activeDownloads[p].active = false;
+                if (recChannels[p]) {
+                    try { recChannels[p].ffmpeg.stdin.end(); } catch(_) {}
+                    delete recChannels[p];
                 }
+                delete activeDownloads[p];
+            });
         }
     });
 
