@@ -253,62 +253,44 @@ function downloadSelected() {
     checked.forEach(cb => requestDownload(parseInt(cb.dataset.idx)));
 }
 
-// ── Playback ──────────────────────────────────────────────────────────────────
 function playFile(url, title) {
-    console.log('[playFile] URL:', url, 'title:', title);
-    const modal   = document.getElementById('videoModal');
-    const video   = document.getElementById('modalVideo');
-    const titleEl = document.getElementById('modalTitle');
-    titleEl.textContent = '▶ ' + (title || 'Playback');
-    modal.classList.add('active');
+        console.log('[playFile] URL:', url, 'title:', title);
+        const modal   = document.getElementById('videoModal');
+        const video   = document.getElementById('modalVideo');
+        const titleEl = document.getElementById('modalTitle');
+        titleEl.textContent = '▶ ' + (title || 'Playback');
+        modal.classList.add('active');
 
-    if (window._recHls) { window._recHls.destroy(); window._recHls = null; }
-    video.pause();
-    video.src = '';
+        if (window._recHls) { window._recHls.destroy(); window._recHls = null; }
+        video.pause();
+        video.src = '';
 
-    if (url.endsWith('.m3u8') && Hls.isSupported()) {
-        // HLS playback
-        const hls = new Hls({ lowLatencyMode: false, startPosition: 0 });
-        window._recHls = hls;
-        hls.loadSource(url);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => { video.currentTime = 0; video.play(); });
-        hls.on(Hls.Events.ERROR, (e, d) => {
-            console.error('[RecHLS]', d.type, d.details);
-            if (d.fatal) document.getElementById('recStatus').textContent = '❌ ' + d.details;
-        });
-    } else {
-        // Direct file (.ts) — poll until file is large enough, then play
-        document.getElementById('recStatus').textContent = '⏳ Buffering...';
-        let attempts = 0;
-        const tryPlay = () => {
-            fetch(url, { method: 'HEAD', cache: 'no-store' })
-                .then(r => {
-                    const size = parseInt(r.headers.get('content-length') || '0');
-                    console.log('[playFile] HEAD status:', r.status, 'size:', size, 'attempt:', attempts);
-                    if (r.ok && size > 500000) {
-                        // File is big enough — play it
-                        video.src = url;
-                        video.currentTime = 0;
-                        video.play().catch(err => console.warn('[playFile] play error:', err));
-                        document.getElementById('recStatus').textContent = '✅ Playing';
-                    } else if (attempts++ < 60) {
-                        document.getElementById('recStatus').textContent =
-                            `⏳ Buffering... (${(size/1024).toFixed(0)} KB)`;
-                        setTimeout(tryPlay, 1000);
-                    } else {
-                        document.getElementById('recStatus').textContent = '❌ Timeout — file not ready';
-                    }
+        if (url.endsWith('.m3u8') && Hls.isSupported()) {
+            const hls = new Hls({ lowLatencyMode: false, startPosition: 0 });
+            window._recHls = hls;
+            hls.loadSource(url);
+            hls.attachMedia(video);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => { video.currentTime = 0; video.play(); });
+            hls.on(Hls.Events.ERROR, (e, d) => {
+                console.error('[RecHLS]', d.type, d.details);
+                if (d.fatal) document.getElementById('recStatus').textContent = '❌ ' + d.details;
+            });
+        } else {
+            // Server already confirmed file is ready before sending this URL
+            // Play directly — no polling needed
+            console.log('[playFile] Playing .ts directly');
+            video.src = url;
+            video.currentTime = 0;
+            video.play()
+                .then(() => {
+                    document.getElementById('recStatus').textContent = '✅ Playing';
                 })
                 .catch(err => {
-                    console.warn('[playFile] fetch error:', err);
-                    if (attempts++ < 60) setTimeout(tryPlay, 1000);
+                    console.error('[playFile] play error:', err);
+                    document.getElementById('recStatus').textContent = '❌ Play error: ' + err.message;
                 });
-        };
-        tryPlay();
+        }
     }
-}
-
 function closeModal() {
     const modal = document.getElementById('videoModal');
     const video = document.getElementById('modalVideo');
