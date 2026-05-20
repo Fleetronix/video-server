@@ -280,47 +280,28 @@ wss.on('connection', (ws, req) => {
             const frame = buildFtpUploadRequest(targetPhone, ch, startTime, endTime);
             console.log(`[WS] Sending 0x9206 frame:`, frame.toString('hex'));
         
-            // Set up file capture BEFORE sending the command
-            const fname    = `ch${ch}_${startTime.replace(/[: -]/g, '')}.mp4`;
-            const fpath    = `./recordings/${fname}`;
-            const wStream  = fs.createWriteStream(fpath);
-            
-            
+            // Start recording FFmpeg instance
+            if (recChannels[targetPhone]) {
+                try { recChannels[targetPhone].ffmpeg.stdin.end(); } catch(_) {}
+            }
+            const recFfmpeg = startRecFFmpeg(targetPhone, ch);
+            recChannels[targetPhone] = {
+                ffmpeg: recFfmpeg, gotIFrame: false,
+                subpackets: [], tsCounter: 0, patPmtSent: false
+            };
+            activeDownloads[targetPhone] = { channel: ch };
+            console.log(`[Rec] ⏺ Streaming recording via FFmpeg for ${targetPhone}`);
 
-            let dlTimer = null;
-const dlEntry = { writeStream: wStream, filename: fname, channel: ch };
-activeDownloads[targetPhone] = dlEntry;
-
-// Auto-close if no data received for 5 seconds — device doesn't always send 0x1206
-dlEntry.resetTimer = () => {
-    if (dlTimer) clearTimeout(dlTimer);
-    dlTimer = setTimeout(() => {
-        console.log(`[Rec] ⏹ No data for 5s — closing ${fname}`);
-        wStream.end(() => {
-            console.log(`[Rec] ✅ File saved: ${fname}`);
-            wss.clients.forEach(c => {
-                if (c.readyState === 1) c.send(JSON.stringify({
-                    type:     'recording_ready',
-                    url:      `/recordings/${fname}`,
-                    filename: fname,
-                }));
-            });
-            delete activeDownloads[targetPhone];
-        });
-    }, 5000);
-};
-dlEntry.resetTimer(); // start the timer immediately
-
-
-
-            console.log(`[Rec] ⏺ Capturing recording to ${fpath}`);
-        
-            wStream.on('error', err => {
-                console.error('[Rec] Write error:', err.message);
-            });
-        
             tcpSockets[targetPhone].write(frame);
-            ws.send(JSON.stringify({ type: 'status', message: '⏳ Device sending recording... please wait' }));
+
+            // Notify browser immediately with the HLS URL
+            setTimeout(() => {
+                ws.send(JSON.stringify({
+                    type: 'recording_ready',
+                    url:  `/public/rec_${targetPhone}.m3u8`,
+                }));
+            }, 3000); // wait 3s for FFmpeg to produce first segment
+            ws.send(JSON.stringify({ type: 'status', message: '⏳ Buffering recording...' }));
         }
     });
 
@@ -409,6 +390,74 @@ function startFFmpeg(channel) {
 const channels = {
     1: { ffmpeg: null, gotIFrame: false, subpackets: [] },
 };
+
+// ── Recording playback FFmpeg instances ───────────────────────────────────────
+const recChannels = {}; // { [phone]: { ffmpeg, gotIFrame, subpackets, tsCounter, patPmtSent } }
+
+function startRecFFmpeg(phone, channel) {
+    const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
+        '-fflags',          '+genpts+discardcorrupt+igndts',
+        '-err_detect',      'ignore_err',
+        '-f',               'mpegts',
+        '-probesize',       '500000',
+        '-analyzeduration', '1000000',
+        '-i',               'pipe:0',
+        '-c:v',             'libx264',
+        '-preset',          'ultrafast',
+        '-tune',            'zerolatency',
+        '-g',               '50',
+        '-keyint_min',      '25',
+        '-f',               'hls',
+        '-hls_time',        '1',
+        '-hls_list_size',   '10',
+        '-hls_flags',       'delete_segments+append_list',
+        '-hls_segment_filename', `./public/rec_${phone}_%03d.ts`,
+        `./public/rec_${phone}.m3u8`,
+    ]);
+    ffmpeg.stderr.on('data', d => {
+        const m = d.toString().trim();
+        if (m.includes('Error') || m.includes('error')) console.error(`[RecFFmpeg] ${m}`);
+    });
+    ffmpeg.on('close', code => console.log(`[RecFFmpeg] closed code=${code}`));
+    return ffmpeg;
+}
+
+function handleRecFrame(frameData, phone, dataType) {
+    const rc = recChannels[phone];
+    if (!rc) return;
+    const isVideo = (dataType === 0 || dataType === 1 || dataType === 2);
+    if (!isVideo) return;
+    if (dataType === 0) { rc.gotIFrame = true; }
+    else if (!rc.gotIFrame) return;
+    if (!rc.ffmpeg || !rc.ffmpeg.stdin.writable) return;
+    if (!rc.patPmtSent) {
+        rc.ffmpeg.stdin.write(buildPAT());
+        rc.ffmpeg.stdin.write(buildPMT());
+        rc.patPmtSent = true;
+    }
+    const { packets, nextCounter } = wrapFrameInTS(frameData, rc.tsCounter);
+    rc.tsCounter = nextCounter;
+    for (const pkt of packets) rc.ffmpeg.stdin.write(pkt);
+}
+
+function processRecPacket(rawData, phone, dataType, subpktMarker) {
+    const rc = recChannels[phone];
+    if (!rc) return;
+    if (subpktMarker === 0) {
+        handleRecFrame(rawData, phone, dataType);
+    } else if (subpktMarker === 1) {
+        rc.subpackets = [rawData];
+    } else if (subpktMarker === 3) {
+        if (rc.subpackets.length > 0) rc.subpackets.push(rawData);
+    } else if (subpktMarker === 2) {
+        if (rc.subpackets.length > 0) {
+            rc.subpackets.push(rawData);
+            const complete = Buffer.concat(rc.subpackets);
+            rc.subpackets = [];
+            handleRecFrame(complete, phone, dataType);
+        }
+    }
+}
 
 channels[1].ffmpeg = startFFmpeg(1);
 
@@ -781,14 +830,11 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    const effectivePhone = phone ||
-                        Object.keys(activeDownloads)[0];
+                    const effectivePhone = phone || Object.keys(activeDownloads)[0];
                     const dl = effectivePhone ? activeDownloads[effectivePhone] : null;
-                    // const dl = activeDownloads[streamPhone];
-                    if (dl && dl.writeStream && dl.writeStream.writable) {
-                        dl.writeStream.write(Buffer.from(rawData));
-                        if (dl.resetTimer) dl.resetTimer(); // reset the 5s inactivity timer
-                        console.log(`[Rec] ⏺ ${effectivePhone} wrote ${rawData.length} bytes → ${dl.filename}`);
+
+                    if (dl && recChannels[effectivePhone]) {
+                        processRecPacket(rawData, effectivePhone, dataType, subpktMarker);
                     } else {
                         processVideoPacket(rawData, channel, dataType, subpktMarker);
                     }

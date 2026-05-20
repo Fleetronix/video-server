@@ -15,10 +15,26 @@
         #gpsInfo { background: #1a1a1a; padding: 15px; border-radius: 8px;
                    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px;
                    margin-top: 15px; }
+
+
+        /* Modal */
+        .modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:1000; align-items:center; justify-content:center; }
+        .modal-overlay.active { display:flex; }
+        .modal-box { background:#111; border:1px solid #00d4ff; border-radius:10px; padding:20px; width:90%; max-width:960px; position:relative; }
+        .modal-close { position:absolute; top:12px; right:16px; background:none; border:none; color:#fff; font-size:22px; cursor:pointer; }
+        .modal-title { color:#00d4ff; font-size:13px; letter-spacing:1px; margin-bottom:12px; }
+        #modalVideo { width:100%; background:#000; border-radius:6px; max-height:70vh; }
     </style>
 </head>
 <body>
-
+<!-- Video Modal -->
+  <div class="modal-overlay" id="videoModal">
+    <div class="modal-box">
+      <button class="modal-close" onclick="closeModal()">✕</button>
+      <div class="modal-title" id="modalTitle">▶ Playback</div>
+      <video id="modalVideo" controls autoplay></video>
+    </div>
+  </div>
   <!-- Live Video -->
   <div>
     <h3>Channel 1 - Front <span class="live-badge">LIVE</span></h3>
@@ -218,9 +234,8 @@
         }
 
         if (msg.type === 'recording_ready') {
-            console.log('[Rec] File ready:', msg.url);
-            document.getElementById('recStatus').textContent = '✅ File ready — playing';
-            playFile(msg.url);
+            document.getElementById('recStatus').textContent = '✅ Playing';
+            playFile(msg.url, window._pendingRecTitle || 'Recording');
         }
 
         if (msg.type === 'status') {
@@ -282,8 +297,7 @@
     function requestDownload(index) {
         const rec = _recs[index];
         if (!rec) return;
-        console.log('[Rec] requestDownload:', rec);
-        document.getElementById('recStatus').textContent = '⏳ Requesting device upload to FTP...';
+        document.getElementById('recStatus').textContent = '⏳ Buffering recording...';
         ws.send(JSON.stringify({
             type:      'download_recording',
             ch:        rec.ch,
@@ -291,6 +305,8 @@
             endTime:   rec.endTime,
             phone:     rec.phone,
         }));
+        // Store title for when recording_ready arrives
+        window._pendingRecTitle = `CH${rec.ch} — ${rec.startTime}`;
     }
 
     function downloadSelected() {
@@ -302,23 +318,33 @@
         checked.forEach(cb => requestDownload(parseInt(cb.dataset.idx)));
     }
 
-    function playFile(url) {
-        const section = document.getElementById('playbackSection');
-        section.style.display = 'block';
-        section.scrollIntoView({ behavior: 'smooth' });
-        const video = document.getElementById('playback');
-        if (window._playHls) { window._playHls.destroy(); window._playHls = null; }
+    function playFile(url, title) {
+        const modal = document.getElementById('videoModal');
+        const video = document.getElementById('modalVideo');
+        const titleEl = document.getElementById('modalTitle');
+        titleEl.textContent = '▶ ' + (title || 'Playback');
+        modal.classList.add('active');
+
+        if (window._recHls) { window._recHls.destroy(); window._recHls = null; }
         if (url.endsWith('.m3u8') && Hls.isSupported()) {
-            const hls = new Hls();
-            window._playHls = hls;
+            const hls = new Hls({ lowLatencyMode: true });
+            window._recHls = hls;
             hls.loadSource(url);
             hls.attachMedia(video);
             hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
-            hls.on(Hls.Events.ERROR, (e,d) => console.error('[HLS]', d));
+            hls.on(Hls.Events.ERROR, (e, d) => console.error('[RecHLS]', d));
         } else {
             video.src = url;
             video.play().catch(console.warn);
         }
+    }
+
+    function closeModal() {
+        document.getElementById('videoModal').classList.remove('active');
+        const video = document.getElementById('modalVideo');
+        video.pause();
+        video.src = '';
+        if (window._recHls) { window._recHls.destroy(); window._recHls = null; }
     }
   </script>
 </body>
