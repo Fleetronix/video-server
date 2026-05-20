@@ -392,6 +392,10 @@ const tcpServer = net.createServer(socket => {
     socket.on('data', data => {
         try {
             buffer = Buffer.concat([buffer, data]);
+            // Temporary: log raw data from unregistered sockets
+            if (!phone) {
+                console.log(`[UNREGISTERED] ${remote} raw hex: ${data.toString('hex').slice(0, 200)}`);
+            }
             let offset = 0;
 
             while (offset < buffer.length - 4) {
