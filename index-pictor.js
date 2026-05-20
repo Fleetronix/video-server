@@ -441,6 +441,8 @@ const tcpServer = net.createServer(socket => {
                         const replyResult = body[4];
                         const resultText  = ['Success','Failed','Wrong Msg','Not Supported','Alarm Confirmed','Update Required'][replyResult] || `Unknown(${replyResult})`;
                         console.log(`[ACK] replyTo:0x${replyMsgId.toString(16).padStart(4,'0')} result:${replyResult} (${resultText})`);
+                        // Also forward to submodules — they filter by replyMsgId internally
+                        ftpDownload.handleSignalling(msgId, body, seq, phone, socket);
 
                     // ── 0x0100: Device register ──────────────────────────────
                     } else if (msgId === 0x0100) {
@@ -537,7 +539,11 @@ const tcpServer = net.createServer(socket => {
                             if (err) console.error('[GPS LOG] write error:', err.message);
                         });
 
-                    // ── FTP download messages (0x0001 ack for 0x9206, 0x1206) ──
+                    // ── 0x1206: File upload completion from camera ────────────
+                    } else if (msgId === 0x1206) {
+                        ftpDownload.handleSignalling(msgId, body, seq, phone, socket);
+
+                    // ── Other submodule messages ──────────────────────────────
                     } else if (ftpDownload.handleSignalling(msgId, body, seq, phone, socket)) {
                         // handled by ftp-download module — no further action needed
 
