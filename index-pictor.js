@@ -38,7 +38,7 @@ console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
 // ── Init FTP download module ────────────────────────────────────────────────
 ftpDownload.init({
     serverIp:      CONFIG.serverIp,
-    ftpPort:       2121,
+    ftpPort:       21,
     pasvDataPort:  2122,
     recordingsDir: './recordings',
     wss,
@@ -393,25 +393,6 @@ const tcpServer = net.createServer(socket => {
         try {
             buffer = Buffer.concat([buffer, data]);
             // Temporary: log raw data from unregistered sockets
-            if (!phone) {
-                console.log(`[UNREGISTERED] ${remote} raw hex: ${data.toString('hex').slice(0, 200)}`);
-                const sevenE = data.indexOf(0x7E);
-                if (sevenE !== -1) {
-                    const end = data.indexOf(0x7E, sevenE + 1);
-                    if (end !== -1) {
-                        const inner     = data.slice(sevenE + 1, end);
-                        const unescaped = unescapeBuffer(inner);
-                        if (unescaped.length >= 10) {
-                            phone = unescaped.slice(4, 10)
-                                .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`)
-                                .join('')
-                                .replace(/^0+/, '');
-                            tcpSockets[phone] = socket;
-                            console.log(`[UNREGISTERED→REGISTERED] phone:${phone} from ${remote}`);
-                        }
-                    }
-                }
-            }
             let offset = 0;
 
             while (offset < buffer.length - 4) {
@@ -451,8 +432,6 @@ const tcpServer = net.createServer(socket => {
                         .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`)
                         .join('')
                         .replace(/^0+/, '');
-                    tcpSockets[phone] = socket;
-                    console.log(`[STREAM] Auto-registered phone:${phone} from ${remote}`);
                     const seq  = unescaped.readUInt16BE(10);
                     const body = unescaped.slice(12);
                     console.log(`[signalling] msgId: 0x${msgId.toString(16).padStart(4,'0')} phone: ${phone}`);

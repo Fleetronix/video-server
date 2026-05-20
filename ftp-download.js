@@ -36,7 +36,7 @@ const path = require('path');
 
 // ── Module state ──────────────────────────────────────────────────────────────
 let _serverIp       = '';
-let _ftpPort        = 2121;
+let _ftpPort        = 21;
 let _pasvDataPort   = 2122;
 let _recordingsDir  = './recordings';
 let _wss            = null;      // WebSocketServer instance
