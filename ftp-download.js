@@ -143,7 +143,7 @@ function _build9206(phone, channel, startTime, endTime) {
     // streamType: 0 = main or sub, 1 = main, 2 = sub — use 1 (main)
     body[p++] = 1;
     // storageType: 0 = any, 1 = main, 2 = disaster — use 0
-    body[p++] = 0;
+    body[p++] = 99;   // storageType: 99 — matches camera memType
     // taskCondition bits: bit0=WiFi bit1=LAN bit2=3G/4G — 0xFF = allow all
     body[p++] = 0xFF;
 
@@ -159,7 +159,7 @@ function _build9206(phone, channel, startTime, endTime) {
       alarmLogo  : 0x0000000000000000
       avType     : 0 (audio+video)
       streamType : 1 (main stream)
-      storageType: 0 (any)
+      storageType: 99 (camera custom)
       taskCond   : 0xFF (all networks)
       body hex   : ${body.toString('hex')}`);
 
