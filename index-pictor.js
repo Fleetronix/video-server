@@ -395,6 +395,22 @@ const tcpServer = net.createServer(socket => {
             // Temporary: log raw data from unregistered sockets
             if (!phone) {
                 console.log(`[UNREGISTERED] ${remote} raw hex: ${data.toString('hex').slice(0, 200)}`);
+                const sevenE = data.indexOf(0x7E);
+                if (sevenE !== -1) {
+                    const end = data.indexOf(0x7E, sevenE + 1);
+                    if (end !== -1) {
+                        const inner     = data.slice(sevenE + 1, end);
+                        const unescaped = unescapeBuffer(inner);
+                        if (unescaped.length >= 10) {
+                            phone = unescaped.slice(4, 10)
+                                .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`)
+                                .join('')
+                                .replace(/^0+/, '');
+                            tcpSockets[phone] = socket;
+                            console.log(`[UNREGISTERED→REGISTERED] phone:${phone} from ${remote}`);
+                        }
+                    }
+                }
             }
             let offset = 0;
 
