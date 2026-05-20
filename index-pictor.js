@@ -249,7 +249,7 @@ wss.on('connection', (ws, req) => {
                 ws.send(JSON.stringify({ type: 'error', message: 'Device not connected' }));
                 return;
             }
-            const frame = buildFtpUploadRequest(targetPhone, ch, startTime, endTime);
+            const frame = buildVideoPlaybackRequest(targetPhone, ch, startTime, endTime);
             // console.log(`[WS] Sending 0x9206 frame:`, frame.toString('hex'));
         
             // Start recording FFmpeg instance
@@ -304,6 +304,22 @@ wss.on('connection', (ws, req) => {
                 }, 3000);
             };
             ws.send(JSON.stringify({ type: 'status', message: '⏳ Buffering recording...' }));
+            // ── stop_playback: browser closed the modal ───────────────────────
+                if (msg.type === 'stop_playback') {
+                    const ph = Object.keys(tcpSockets)[0];
+                    if (ph && tcpSockets[ph] && !tcpSockets[ph].destroyed) {
+                        tcpSockets[ph].write(buildPlaybackStop(ph, 1));
+                        console.log(`[Rec] Sent 0x9202 stop to ${ph}`);
+                    }
+                    Object.keys(activeDownloads).forEach(p => {
+                        if (activeDownloads[p]) activeDownloads[p].active = false;
+                        if (recChannels[p]) {
+                            try { recChannels[p].ffmpeg.stdin.end(); } catch(_) {}
+                            delete recChannels[p];
+                        }
+                        delete activeDownloads[p];
+                    });
+                }
         }
     });
 
@@ -804,6 +820,69 @@ function buildFtpUploadRequest(phone, channel, startTime, endTime) {
     // console.log(`[Rec] FTP upload request frame size: ${frame.length} bytes`);
     // console.log(`[Rec] Frame hex: ${frame.toString('hex')}`);
     return frame;
+}
+
+// ── Build 0x9201 — remote video playback request ─────────────────────────────
+// ── Build 0x9201 — remote video playback request ─────────────────────────────
+function buildVideoPlaybackRequest(phone, channel, startTime, endTime) {
+    const serverIp   = CONFIG.serverIp;
+    const serverPort = CONFIG.tcpPort;
+
+    const toBCDBytes = (yy, mo, dd, hh, mm, ss) => Buffer.from([
+        ((Math.floor(yy/10)<<4)|(yy%10)),
+        ((Math.floor(mo/10)<<4)|(mo%10)),
+        ((Math.floor(dd/10)<<4)|(dd%10)),
+        ((Math.floor(hh/10)<<4)|(hh%10)),
+        ((Math.floor(mm/10)<<4)|(mm%10)),
+        ((Math.floor(ss/10)<<4)|(ss%10)),
+    ]);
+
+    const [sDate, sTime='00:00:00'] = startTime.split(' ');
+    const [eDate, eTime='23:59:59'] = endTime.split(' ');
+    const [sY,sM,sD] = sDate.split('-').map(Number);
+    const [sH,sm,sS] = sTime.split(':').map(Number);
+    const [eY,eM,eD] = eDate.split('-').map(Number);
+    const [eH,em,eS] = eTime.split(':').map(Number);
+
+    const ipBuf = Buffer.from(serverIp, 'ascii');
+    const n = ipBuf.length;
+
+    // Table 24: ipLen(1) ip(n) tcpPort(2) udpPort(2) ch(1)
+    //           avType(1) streamType(1) memType(1) playMode(1) speed(1)
+    //           startBCD(6) endBCD(6)
+    const body = Buffer.alloc(1 + n + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 6 + 6);
+    let p = 0;
+    body[p++] = n;
+    ipBuf.copy(body, p); p += n;
+    body.writeUInt16BE(serverPort, p); p += 2;
+    body.writeUInt16BE(0,          p); p += 2; // UDP = 0
+    body[p++] = channel;
+    body[p++] = 2; // avType: video only
+    body[p++] = 1; // main stream
+    body[p++] = 0; // main or disaster storage
+    body[p++] = 0; // normal playback
+    body[p++] = 0; // speed = invalid for normal
+    toBCDBytes(sY%100,sM,sD,sH,sm,sS).copy(body, p); p += 6;
+    toBCDBytes(eY%100,eM,eD,eH,em,eS).copy(body, p); p += 6;
+
+    console.log(`[Rec] 0x9201 playback ch:${channel} ${startTime}→${endTime}`);
+    return buildFrame(0x9201, body, phone);
+}
+// ── Build 0x9202 — playback control (stop) ───────────────────────────────────
+function buildPlaybackStop(phone, channel) {
+    const body = Buffer.alloc(9);
+    body[0] = channel;
+    body[1] = 2; // 2 = end playback
+    // rest is zeros
+    return buildFrame(0x9202, body, phone);
+}
+function buildPlaybackControl(phone, channel, control) {
+    const body = Buffer.alloc(9);
+    body[0] = channel;
+    body[1] = control; // 0=start, 1=pause, 2=end
+    body[2] = 0;       // speed multiplier
+    body.fill(0, 3, 9); // drag position (unused)
+    return buildFrame(0x9202, body, phone);
 }
 
 // ── TCP server ────────────────────────────────────────────────────────────────

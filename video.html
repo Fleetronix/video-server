@@ -376,6 +376,9 @@
         video.pause();
         video.src = '';
         if (window._recHls) { window._recHls.destroy(); window._recHls = null; }
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'stop_playback' }));
+        }
     }
   </script>
 </body>
