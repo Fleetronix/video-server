@@ -273,20 +273,7 @@ wss.on('connection', (ws, req) => {
             activeDownloads[targetPhone] = { channel: ch, active: true };
 
             // Auto-deactivate after 5s of no new packets
-            let recInactiveTimer = null;
-            const resetRecTimer = () => {
-                if (recInactiveTimer) clearTimeout(recInactiveTimer);
-                recInactiveTimer = setTimeout(() => {
-                    console.log(`[Rec] ⏹ Inactivity — stopping rec capture for ${targetPhone}`);
-                    if (activeDownloads[targetPhone]) activeDownloads[targetPhone].active = false;
-                    if (recChannels[targetPhone]) {
-                        try { recChannels[targetPhone].ffmpeg.stdin.end(); } catch(_) {}
-                        delete recChannels[targetPhone];
-                    }
-                    delete activeDownloads[targetPhone];
-                }, 5000);
-            };
-            activeDownloads[targetPhone].resetTimer = resetRecTimer;
+            activeDownloads[targetPhone].resetTimer = null;
             resetRecTimer();
             tcpSockets[targetPhone].write(frame);
 
@@ -913,16 +900,13 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    const effectivePhone = phone || Object.keys(activeDownloads)[0];
+                    const effectivePhone = phone ||
+                        (Object.keys(activeDownloads).length > 0 ? Object.keys(activeDownloads)[0] : null);
                     const dlEntry = effectivePhone ? activeDownloads[effectivePhone] : null;
                     const isRec = !!(dlEntry && dlEntry.active === true && recChannels[effectivePhone]);
                     console.log(`[REC CHK] eff=${effectivePhone} active=${dlEntry?.active} hasRec=${!!recChannels[effectivePhone]} isRec=${isRec}`);
 
                     if (isRec) {
-                        // Reset inactivity timer on every packet
-                        if (activeDownloads[effectivePhone].resetTimer) {
-                            activeDownloads[effectivePhone].resetTimer();
-                        }
                         processRecPacket(rawData, effectivePhone, dataType, subpktMarker);
                     } else {
                         processVideoPacket(rawData, channel, dataType, subpktMarker);
