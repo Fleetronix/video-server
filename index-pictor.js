@@ -901,11 +901,18 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    const effectivePhone = phone ||
-                        (Object.keys(activeDownloads).length > 0 ? Object.keys(activeDownloads)[0] : null);
-                    const dlEntry = effectivePhone ? activeDownloads[effectivePhone] : null;
-                    const isRec = !!(dlEntry && dlEntry.active === true && recChannels[effectivePhone]);
-                    console.log(`[REC CHK] eff=${effectivePhone} active=${dlEntry?.active} hasRec=${!!recChannels[effectivePhone]} isRec=${isRec}`);
+                    const effectivePhone = phone || Object.keys(activeDownloads)[0];
+                    const isRec = effectivePhone &&
+                                  activeDownloads[effectivePhone] &&
+                                  activeDownloads[effectivePhone].active === true &&
+                                  recChannels[effectivePhone];
+
+                    // Log timestamp of first few rec packets to verify it's historical
+                    if (isRec && dataType === 0) {
+                        const tsMs = buffer.readBigUInt64BE(offset + 16);
+                        const tsDate = new Date(Number(tsMs));
+                        console.log(`[REC PKT] I-frame timestamp: ${tsMs}ms = ${tsDate.toISOString()}`);
+                    }
 
                     if (isRec) {
                         processRecPacket(rawData, effectivePhone, dataType, subpktMarker);
