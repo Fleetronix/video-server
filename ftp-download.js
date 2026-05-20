@@ -87,7 +87,7 @@ function _build9205(phone, channel, startTime, endTime) {
     _bcdBytes(s.y%100,s.mo,s.d,s.h,s.mi,s.s).copy(body, 1);       // start BCD
     _bcdBytes(e.y%100,e.mo,e.d,e.h,e.mi,e.s).copy(body, 7);       // end BCD
     body.fill(0x00, 13, 21);                                        // alarm logo — no filter
-    body[21] = 2;                                                    // avType: video only
+    body[21] = 0;                                                    // avType: 0=audio+video (matches camera)
     body[22] = 0;                                                    // stream: all
 
     _log(`0x9205 query — ch:${channel} ${startTime} → ${endTime}`);
@@ -138,7 +138,7 @@ function _build9206(phone, channel, startTime, endTime) {
     _bcdBytes(e.y % 100, e.mo, e.d, e.h, e.mi, e.s).copy(body, p); p += 6;
     // Alarm logo — 8 bytes all 0 (no alarm filter)
     body.fill(0x00, p, p + 8);              p += 8;
-    // avType: 0 = audio+video (camera decides), 2 = video only — use 2
+    // avType: 0 = audio+video — matches what camera actually stores
     body[p++] = 0;
     // streamType: 0 = main or sub, 1 = main, 2 = sub — use 1 (main)
     body[p++] = 1;
@@ -157,7 +157,7 @@ function _build9206(phone, channel, startTime, endTime) {
       Start BCD  : ${startTime}
       End BCD    : ${endTime}
       alarmLogo  : 0x0000000000000000
-      avType     : 2 (video only)
+      avType     : 0 (audio+video)
       streamType : 1 (main stream)
       storageType: 0 (any)
       taskCond   : 0xFF (all networks)
