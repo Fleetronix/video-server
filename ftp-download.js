@@ -76,6 +76,24 @@ function _log(...args)  { console.log ('[FTP-DL]', ...args); }
 function _warn(...args) { console.warn('[FTP-DL]', ...args); }
 function _err(...args)  { console.error('[FTP-DL]', ...args); }
 
+// ── 0x9205 frame builder — query recording list ────────────────────────────
+// T/98 §5.6.1 Table 21: send this BEFORE 0x9206 so camera verifies file exists
+function _build9205(phone, channel, startTime, endTime) {
+    const s = _parseDateTime(startTime, '00:00:00');
+    const e = _parseDateTime(endTime,   '23:59:59');
+
+    const body = Buffer.alloc(23);
+    body[0] = channel;                                               // logical channel (0=all)
+    _bcdBytes(s.y%100,s.mo,s.d,s.h,s.mi,s.s).copy(body, 1);       // start BCD
+    _bcdBytes(e.y%100,e.mo,e.d,e.h,e.mi,e.s).copy(body, 7);       // end BCD
+    body.fill(0x00, 13, 21);                                        // alarm logo — no filter
+    body[21] = 2;                                                    // avType: video only
+    body[22] = 0;                                                    // stream: all
+
+    _log(`0x9205 query — ch:${channel} ${startTime} → ${endTime}`);
+    return _buildFrame(0x9205, body, phone);
+}
+
 // ── 0x9206 frame builder ─────────────────────────────────────────────────────
 // T/98 §5.6.5 Table 26:
 //   ipLen(1)  ip(k)  port(2)  userLen(1)  user(l)
@@ -87,7 +105,7 @@ function _build9206(phone, channel, startTime, endTime) {
     const ftpPass    = 'anonymous';
     // Filename on the FTP server — unique per request
     const tag        = startTime.replace(/[: -]/g, '');
-    const uploadPath = `/ch${channel}_${tag}.mp4`;
+    const uploadPath = `/`;  // root path — camera picks its own filename
 
     const s = _parseDateTime(startTime, '00:00:00');
     const e = _parseDateTime(endTime,   '23:59:59');
@@ -159,21 +177,9 @@ function _build9207(phone, sessionId, control) {
 }
 
 // ── FTP server ────────────────────────────────────────────────────────────────
-function _startFtpServer() {
-    // Permanent PASV data server — stays open across all transfers
-    // (re-creating it per PASV causes EADDRINUSE on the second upload)
-    _pasvServer = net.createServer(s => {
-        _log(`PASV data connection from ${s.remoteAddress}:${s.remotePort}`);
-        _pasvDataSocket = s;
-    });
-    _pasvServer.listen(_pasvDataPort, '0.0.0.0', () => {
-        _log(`✓ PASV data server on :${_pasvDataPort}`);
-    });
-    _pasvServer.on('error', err => _err('PASV server error:', err.message));
-
-    // FTP control server
-    _ftpServer = net.createServer(ftpSock => {
-        _log(`FTP control connection from ${ftpSock.remoteAddress}`);
+function _makeFtpHandler() {
+    return ftpSock => {
+        _log(`FTP control connection from ${ftpSock.remoteAddress}:${ftpSock.remotePort} → local:${ftpSock.localPort}`);
 
         let dataSocket   = null;
         let uploadStream = null;
@@ -327,12 +333,40 @@ function _startFtpServer() {
             if (uploadStream) { try { uploadStream.end(); } catch (_) {} }
         });
         ftpSock.on('error', err => _err('FTP control socket error:', err.message));
-    });
+    };
+}
 
+function _startFtpServer() {
+    // ── Permanent PASV data server ──────────────────────────────────────────
+    // Stays open forever — re-creating per PASV causes EADDRINUSE on 2nd upload
+    _pasvServer = net.createServer(s => {
+        _log(`PASV data connection from ${s.remoteAddress}:${s.remotePort}`);
+        _pasvDataSocket = s;
+    });
+    _pasvServer.listen(_pasvDataPort, '0.0.0.0', () => {
+        _log(`✓ PASV data server on :${_pasvDataPort}`);
+    });
+    _pasvServer.on('error', err => _err('PASV server error:', err.message));
+
+    // ── FTP control on configured port (default 2121) ───────────────────────
+    _ftpServer = net.createServer(_makeFtpHandler());
     _ftpServer.listen(_ftpPort, '0.0.0.0', () => {
         _log(`✓ FTP control server on :${_ftpPort}`);
     });
-    _ftpServer.on('error', err => _err('FTP server error:', err.message));
+    _ftpServer.on('error', err => _err(`FTP server :${_ftpPort} error:`, err.message));
+
+    // ── Port 21 fallback — many cameras ignore the port in 0x9206 ──────────
+    // Run: sudo setcap cap_net_bind_service=+ep $(which node)
+    // OR:  sudo iptables -t nat -A PREROUTING -p tcp --dport 21 -j REDIRECT --to-port 2121
+    const ftp21 = net.createServer(_makeFtpHandler());
+    ftp21.listen(21, '0.0.0.0', () => {
+        _log(`✓ FTP control server on :21 (port-21 fallback)`);
+    });
+    ftp21.on('error', err => {
+        // Port 21 needs root/cap — log the fix and continue without it
+        _warn(`Port 21 unavailable (${err.message}). Camera may use port 21 instead of ${_ftpPort}.`);
+        _warn(`Fix: sudo iptables -t nat -A PREROUTING -p tcp --dport 21 -j REDIRECT --to-port ${_ftpPort}`);
+    });
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -400,22 +434,29 @@ function handleWsMessage(msg, ws) {
             return;
         }
 
-        // Build and send 0x9206
-        const { frame, uploadPath } = _build9206(phone, ch, startTime, endTime);
+        // Step 1 — send 0x9205 (query list) so camera verifies file exists on SD card
+        const queryFrame = _build9205(phone, ch, startTime, endTime);
+        _tcpSockets[phone].write(queryFrame);
+        _log(`Sent 0x9205 pre-query to ${phone}`);
 
-        _log(`Sending 0x9206 to ${phone} (frame ${frame.length} bytes)`);
-        _log(`Frame hex: ${frame.toString('hex')}`);
+        // Step 2 — after 3 s, send 0x9206 (FTP upload request)
+        setTimeout(() => {
+            if (!_tcpSockets[phone] || _tcpSockets[phone].destroyed) {
+                _err(`Socket gone before 0x9206 could be sent`);
+                return;
+            }
+            const { frame, uploadPath } = _build9206(phone, ch, startTime, endTime);
+            _log(`Sending 0x9206 to ${phone} (frame ${frame.length} bytes)`);
+            _log(`Frame hex: ${frame.toString('hex')}`);
+            _tcpSockets[phone].write(frame);
 
-        _tcpSockets[phone].write(frame);
-
-        // Record the session so 0x1206 can correlate
-        _sessions[phone] = {
-            ch, startTime, endTime,
-            ftpPath: uploadPath,
-            sentAt: Date.now(),
-        };
-
-        _log(`Session saved for ${phone}:`, _sessions[phone]);
+            _sessions[phone] = {
+                ch, startTime, endTime,
+                ftpPath: uploadPath,
+                sentAt: Date.now(),
+            };
+            _log(`Session saved for ${phone}:`, _sessions[phone]);
+        }, 3000);
 
         // Tell browser we're waiting
         ws.send(JSON.stringify({
