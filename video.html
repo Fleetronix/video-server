@@ -282,13 +282,13 @@ function playFile(url, title) {
         document.getElementById('recStatus').textContent = '⏳ Buffering...';
         let attempts = 0;
         const tryPlay = () => {
-            fetch(url + '?_=' + Date.now(), { method: 'HEAD' })
+            fetch(url, { method: 'HEAD', cache: 'no-store' })
                 .then(r => {
                     const size = parseInt(r.headers.get('content-length') || '0');
                     console.log('[playFile] HEAD status:', r.status, 'size:', size, 'attempt:', attempts);
                     if (r.ok && size > 500000) {
                         // File is big enough — play it
-                        video.src = url + '?_=' + Date.now();
+                        video.src = url;
                         video.currentTime = 0;
                         video.play().catch(err => console.warn('[playFile] play error:', err));
                         document.getElementById('recStatus').textContent = '✅ Playing';

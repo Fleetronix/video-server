@@ -342,15 +342,17 @@ wss.on('connection', (ws, req) => {
 });
 // ── HTTP server ───────────────────────────────────────────────────────────────
 http.createServer((req, res) => {
+    // Strip query string
+    const urlPath = req.url.split('?')[0];
     let filePath;
-    if (req.url === '/') {
+    if (urlPath === '/') {
         filePath = './video.html';
-    } else if (req.url.startsWith('/public/')) {
-        filePath = `.${req.url}`;
-    } else if (req.url.startsWith('/recordings/')) {
-    filePath = `.${req.url}`;
+    } else if (urlPath.startsWith('/public/')) {
+        filePath = `.${urlPath}`;
+    } else if (urlPath.startsWith('/recordings/')) {
+        filePath = `.${urlPath}`;
     } else {
-        filePath = `.${req.url}`;
+        filePath = `.${urlPath}`;
     }
 
     const ext = path.extname(filePath).toLowerCase();
