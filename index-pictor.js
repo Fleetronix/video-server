@@ -395,6 +395,16 @@ const tcpServer = net.createServer(socket => {
             // Temporary: log raw data from unregistered sockets
             if (!phone) {
                 console.log(`[UNREGISTERED] ${remote} raw hex: ${data.toString('hex').slice(0, 200)}`);
+                // Auto-register stream connections — phone is at bytes 4–9 (BCD) in 0x30316364 packets
+                if (data[0] === 0x30 && data[1] === 0x31 && data[2] === 0x63 && data[3] === 0x64 &&
+                    data.length >= 10) {
+                    phone = data.slice(4, 10)
+                        .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`)
+                        .join('')
+                        .replace(/^0+/, '');
+                    tcpSockets[phone] = socket;
+                    console.log(`[STREAM] Auto-registered phone:${phone} from ${remote}`);
+                }
             }
             let offset = 0;
 
