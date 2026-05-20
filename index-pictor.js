@@ -276,9 +276,9 @@ wss.on('connection', (ws, req) => {
                 ffmpeg: recFfmpeg, gotIFrame: false,
                 subpackets: [], tsCounter: 0, patPmtSent: false,
             };
-            console.log(`[Rec] recChannels keys after set:`, Object.keys(recChannels));
-            console.log(`[Rec] activeDownloads keys after set:`, Object.keys(activeDownloads));
             activeDownloads[targetPhone] = { channel: ch, active: true };
+            console.log(`[Rec] recChannels keys:`, Object.keys(recChannels));
+            console.log(`[Rec] activeDownloads keys:`, Object.keys(activeDownloads));
  
             // Inactivity timer — stop rec if no packets for 10s
             const _resetTimer = () => {
