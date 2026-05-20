@@ -216,6 +216,11 @@ function requestFtpDownload() {
     const to    = document.getElementById('recTo').value;
 
     if (!from || !to) { setStatus('⚠️ Select both From and To'); return; }
+
+    // ADD THIS — validate range
+    const diffMs = new Date(to.replace('T',' ')) - new Date(from.replace('T',' '));
+    if (diffMs <= 0) { setStatus('⚠️ End time must be after start time'); return; }
+    if (diffMs > 60 * 60 * 1000) { setStatus('⚠️ Max range is 1 hour — camera has 2-minute files, pick a short window'); return; }
     if (ws.readyState !== WebSocket.OPEN) { setStatus('❌ Not connected'); return; }
 
     const fmt = v => v.replace('T', ' ') + ':00';
