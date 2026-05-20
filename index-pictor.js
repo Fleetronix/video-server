@@ -310,12 +310,17 @@ wss.on('connection', (ws, req) => {
                             const mp4Path = `./public/rec_${_notifyPhone}.mp4`;
                             const ff = spawn('/usr/local/bin/ffmpeg', [
                                 '-y',
-                                '-i',        tsPath,
-                                '-c:v',      'copy',
-                                '-c:a',      'copy',
-                                '-movflags', '+faststart',
+                                '-fflags',          '+genpts+discardcorrupt+igndts',
+                                '-err_detect',      'ignore_err',
+                                '-i',               tsPath,
+                                '-c:v',             'libx264',
+                                '-preset',          'ultrafast',
+                                '-crf',             '28',
+                                '-movflags',        '+faststart',
+                                '-an',
                                 mp4Path
                             ]);
+                            ff.stderr.on('data', d => console.log('[RecConvert]', d.toString().trim()));
                             ff.stderr.on('data', d => {
                                 const m = d.toString().trim();
                                 if (m.includes('error') || m.includes('Error')) {
