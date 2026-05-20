@@ -271,7 +271,22 @@ wss.on('connection', (ws, req) => {
             };
 
             // Mark download active — stays until stop_playback
+            // Mark download active
             activeDownloads[targetPhone] = { channel: ch, active: true };
+
+            // Auto-stop after 10s of no packets (recording finished)
+            let _recTimer = null;
+            const _resetTimer = () => {
+                if (_recTimer) clearTimeout(_recTimer);
+                _recTimer = setTimeout(() => {
+                    console.log(`[Rec] ⏹ Recording stream ended for ${targetPhone}`);
+                    if (activeDownloads[targetPhone]) activeDownloads[targetPhone].active = false;
+                    delete activeDownloads[targetPhone];
+                    // Keep recChannels alive so browser can finish playing
+                }, 10000);
+            };
+            activeDownloads[targetPhone].resetTimer = _resetTimer;
+            _resetTimer();
 
             // Notify browser after first I-frame + 3s for FFmpeg segment
             const _notifyPhone = targetPhone;
@@ -915,6 +930,9 @@ const tcpServer = net.createServer(socket => {
                     }
 
                     if (isRec) {
+                        if (activeDownloads[effectivePhone]?.resetTimer) {
+                            activeDownloads[effectivePhone].resetTimer();
+                        }
                         processRecPacket(rawData, effectivePhone, dataType, subpktMarker);
                     } else {
                         processVideoPacket(rawData, channel, dataType, subpktMarker);
@@ -1072,6 +1090,13 @@ const tcpServer = net.createServer(socket => {
                     } else if (msgId === 0x1205) {
                         // Device SD card recording list
                         socket.write(buildAck(phone, seq, msgId));
+                        // If this 0x1205 came after a 0x9201 playback request,
+                        // it means the device finished sending the recording
+                        if (activeDownloads[phone]) {
+                            console.log(`[Rec] 0x1205 received — recording stream complete for ${phone}`);
+                            activeDownloads[phone].active = false;
+                            delete activeDownloads[phone];
+                        }
                         console.log(`[Rec] 0x1205 from ${phone} bodyLen:${body.length}`);
                         try {
                             if (body.length < 6) { console.warn('[Rec] Body too short'); offset = end+1; continue; }
