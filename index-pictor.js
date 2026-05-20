@@ -422,16 +422,16 @@ function startRecFFmpeg(phone, channel) {
         '-fflags',          '+genpts+discardcorrupt+igndts',
         '-err_detect',      'ignore_err',
         '-f',               'mpegts',
-        '-probesize',       '500000',
-        '-analyzeduration', '1000000',
+        '-probesize',       '2000000',
+        '-analyzeduration', '3000000',
         '-i',               'pipe:0',
         '-c:v',             'libx264',
         '-preset',          'ultrafast',
         '-tune',            'zerolatency',
-        '-g',               '50',
-        '-keyint_min',      '25',
+        '-g',               '30',
+        '-keyint_min',      '15',
         '-f',               'hls',
-        '-hls_time',        '1',
+        '-hls_time',        '2',
         '-hls_list_size',   '0',
         '-hls_flags',       'append_list',
         '-hls_segment_filename', `./public/rec_${phone}_%03d.ts`,
@@ -461,7 +461,7 @@ function handleRecFrame(frameData, phone, dataType) {
     if (!rc.ffmpeg || !rc.ffmpeg.stdin.writable) return;
     if (!rc.patPmtSent) {
         rc.ffmpeg.stdin.write(buildPAT());
-        rc.ffmpeg.stdin.write(buildPMT());
+        rc.ffmpeg.stdin.write(buildPMT_HEVC());
         rc.patPmtSent = true;
     }
     const { packets, nextCounter } = wrapFrameInTS(frameData, rc.tsCounter);
@@ -539,6 +539,29 @@ function buildPMT() {
     s[13] = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
     s[14] = VIDEO_PID & 0xFF;  // elementary PID
     s[15] = 0xF0; s[16] = 0x00;// no ES_info
+    return pkt;
+}
+
+function buildPMT_HEVC() {
+    const pkt = Buffer.alloc(TS_PACKET_SIZE, 0xFF);
+    pkt[0] = 0x47;
+    pkt[1] = 0x40 | ((PMT_PID >> 8) & 0x1F);
+    pkt[2] = PMT_PID & 0xFF;
+    pkt[3] = 0x10;
+    pkt[4] = 0x00;
+    const s = pkt.slice(5);
+    s[0]  = 0x02;
+    s[1]  = 0xB0; s[2] = 0x12;
+    s[3]  = 0x00; s[4] = 0x01;
+    s[5]  = 0xC1;
+    s[6]  = 0x00; s[7] = 0x00;
+    s[8]  = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
+    s[9]  = VIDEO_PID & 0xFF;
+    s[10] = 0xF0; s[11] = 0x00;
+    s[12] = 0x24;              // ← HEVC stream type (was 0x42 AVS)
+    s[13] = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
+    s[14] = VIDEO_PID & 0xFF;
+    s[15] = 0xF0; s[16] = 0x00;
     return pkt;
 }
 
