@@ -296,17 +296,27 @@ wss.on('connection', (ws, req) => {
             // Set notify callback BEFORE activating rec
             const _notifyPhone = targetPhone;
             recChannels[targetPhone].onReady = () => {
-                setTimeout(() => {
-                    console.log(`[Rec] ✅ Sending recording_ready to browser: /public/rec_${_notifyPhone}.ts`);
-                    wss.clients.forEach(c => {
-                        if (c.readyState === 1) c.send(JSON.stringify({
-                            type: 'recording_ready',
-                            url:  `/public/rec_${_notifyPhone}.ts`,
-                        }));
-                    });
-                }, 2000);
+                // Don't notify yet — wait for file to have data (poll server-side)
+                console.log(`[Rec] First I-frame received, waiting for file to grow...`);
+                let sizeCheck = 0;
+                const checkSize = setInterval(() => {
+                    try {
+                        const stat = fs.statSync(`./public/rec_${_notifyPhone}.ts`);
+                        console.log(`[Rec] File size check: ${stat.size} bytes (attempt ${sizeCheck})`);
+                        if (stat.size > 500000) {
+                            clearInterval(checkSize);
+                            console.log(`[Rec] ✅ File ready (${stat.size} bytes), sending recording_ready`);
+                            wss.clients.forEach(c => {
+                                if (c.readyState === 1) c.send(JSON.stringify({
+                                    type: 'recording_ready',
+                                    url:  `/public/rec_${_notifyPhone}.ts`,
+                                }));
+                            });
+                        }
+                    } catch(_) {}
+                    if (++sizeCheck > 60) clearInterval(checkSize);
+                }, 1000);
             };
- 
             // ACTIVATE rec mode THEN send command
             recActive = true;
             _resetTimer();
@@ -365,10 +375,26 @@ http.createServer((req, res) => {
         '.avi':  'video/x-msvideo',
     };
 
+    // For HEAD requests just return file size via stat
+    if (req.method === 'HEAD') {
+        fs.stat(filePath, (err, stat) => {
+            if (err) { res.writeHead(404); res.end(); return; }
+            res.writeHead(200, {
+                'Content-Type':   contentTypes[ext] || 'application/octet-stream',
+                'Content-Length': stat.size,
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control':  'no-cache',
+            });
+            res.end();
+        });
+        return;
+    }
+
     fs.readFile(filePath, (err, data) => {
         if (err) { res.writeHead(404); res.end('Not found'); return; }
         res.writeHead(200, {
             'Content-Type': contentTypes[ext] || 'text/plain',
+            'Content-Length': data.length,
             'Access-Control-Allow-Origin': '*',
             'Cache-Control': 'no-cache',
         });
