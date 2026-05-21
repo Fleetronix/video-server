@@ -91,8 +91,11 @@
 
 <!-- Recordings -->
 <div class="rec-section">
-    <h3>📥 FTP Download Recording</h3>
+    <h3>📥 Recording Download</h3>
     <div class="rec-controls">
+        <label>Phone:</label>
+        <input type="text" id="recPhone" placeholder="e.g. 1576064472"
+               style="width:130px;background:#222;color:#fff;border:1px solid #444;padding:6px;border-radius:4px;font-size:13px;" />
         <label>Ch:</label>
         <input type="number" id="recCh" value="1" min="1" max="8"
                style="width:50px;background:#222;color:#fff;border:1px solid #444;padding:6px;border-radius:4px;font-size:13px;" />
@@ -100,22 +103,26 @@
         <input type="datetime-local" id="recFrom" />
         <label>To:</label>
         <input type="datetime-local" id="recTo" />
-        <button class="btn btn-primary" onclick="requestFtpDownload()">⬇ Request Download</button>
-        <button class="btn btn-danger"  onclick="cancelDownload()" id="btnCancel" style="display:none">🛑 Cancel</button>
+        <button class="btn btn-primary" onclick="queryRecordings()">🔍 Query List</button>
+        <button class="btn btn-danger"  onclick="stopDownload()" id="btnCancel" style="display:none">🛑 Stop</button>
         <span id="recStatus"></span>
     </div>
 
-    <!-- Downloaded files list -->
+    <!-- Recording list from camera -->
+    <div id="recListSection" style="display:none; margin-bottom:16px;">
+        <h4 style="color:#aaa;margin:8px 0;">Available Recordings on SD Card</h4>
+        <table>
+            <thead><tr><th>#</th><th>Start Time</th><th>End Time</th><th>Size</th><th>Action</th></tr></thead>
+            <tbody id="recQueryList"></tbody>
+        </table>
+    </div>
+
+    <!-- Downloaded clips -->
+    <h4 style="color:#aaa;margin:8px 0;">Downloaded Clips</h4>
     <table>
-        <thead>
-            <tr>
-                <th>#</th>
-                <th>Filename</th>
-                <th>Action</th>
-            </tr>
-        </thead>
-        <tbody id="recList">
-            <tr><td colspan="3" style="color:#555">No downloads yet</td></tr>
+        <thead><tr><th>#</th><th>Clip</th><th>Action</th></tr></thead>
+        <tbody id="recDownloadList">
+            <tr><td colspan="3" style="color:#555">No clips downloaded yet</td></tr>
         </tbody>
     </table>
 </div>
@@ -176,6 +183,7 @@ ws.onmessage = e => {
 
     // ── GPS location ─────────────────────────────────────────────────────────
     if (msg.type === 'location') {
+        if (msg.phone) { _lastPhone = msg.phone; document.getElementById('recPhone').value = msg.phone; }
         updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
         document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}`;
         document.getElementById('info-lon').textContent        = `Longitude: ${msg.lon.toFixed(6)}`;
@@ -191,11 +199,23 @@ ws.onmessage = e => {
         document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms && msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
     }
 
-    // ── FTP download complete — file ready to play ────────────────────────────
-    if (msg.type === 'ftp_ready') {
-        setStatus(`✅ File ready: ${msg.filename}`);
+    // ── Recording list from camera ────────────────────────────────────────────
+    if (msg.type === 'recordings_list') {
+        setStatus(`✅ Found ${msg.total} recordings`);
+        showRecordingList(msg.phone, msg.recordings);
+    }
+
+    // ── Clip downloaded and ready ─────────────────────────────────────────────
+    if (msg.type === 'clip_ready') {
+        setStatus(`✅ Clip ready!`);
         document.getElementById('btnCancel').style.display = 'none';
-        addFileToList(msg.filename, msg.url);
+        addClipToList(msg.url, msg.startTime, msg.endTime);
+    }
+
+    // ── Clip error ────────────────────────────────────────────────────────────
+    if (msg.type === 'clip_error') {
+        setStatus('❌ ' + msg.message);
+        document.getElementById('btnCancel').style.display = 'none';
     }
 
     // ── Status / error ────────────────────────────────────────────────────────
@@ -203,69 +223,92 @@ ws.onmessage = e => {
     if (msg.type === 'error')  setStatus('❌ ' + msg.message);
 };
 
-// ── Status helper ─────────────────────────────────────────────────────────────
+// ── Status helper ────────────────────────────────────────────────────────────
 function setStatus(txt) {
     document.getElementById('recStatus').textContent = txt;
     console.log('[status]', txt);
 }
 
-// ── FTP Download request ──────────────────────────────────────────────────────
-function requestFtpDownload() {
+// ── Auto-fill phone from last GPS message ─────────────────────────────────────
+let _lastPhone = null;
+
+// ── Query recording list from SD card ────────────────────────────────────────
+function queryRecordings() {
+    const phone = document.getElementById('recPhone').value.trim() || _lastPhone;
     const ch    = parseInt(document.getElementById('recCh').value) || 1;
     const from  = document.getElementById('recFrom').value;
     const to    = document.getElementById('recTo').value;
-
+    if (!phone) { setStatus('⚠️ Enter phone number'); return; }
     if (!from || !to) { setStatus('⚠️ Select both From and To'); return; }
-
-    // ADD THIS — validate range
-    const diffMs = new Date(to.replace('T',' ')) - new Date(from.replace('T',' '));
-    if (diffMs <= 0) { setStatus('⚠️ End time must be after start time'); return; }
-    if (diffMs > 60 * 60 * 1000) { setStatus('⚠️ Max range is 1 hour — camera has 2-minute files, pick a short window'); return; }
     if (ws.readyState !== WebSocket.OPEN) { setStatus('❌ Not connected'); return; }
-
     const fmt = v => v.replace('T', ' ') + ':00';
-    const startTime = fmt(from);
-    const endTime   = fmt(to);
+    setStatus('⏳ Querying camera SD card...');
+    ws.send(JSON.stringify({ type: 'get_recordings', phone, ch, startTime: fmt(from), endTime: fmt(to) }));
+}
 
-    console.log(`[FTP] Requesting ch:${ch} ${startTime} → ${endTime}`);
-    setStatus(`⏳ Sending request to camera...`);
+// ── Download a specific clip ──────────────────────────────────────────────────
+function downloadClip(phone, ch, startTime, endTime) {
+    if (ws.readyState !== WebSocket.OPEN) { setStatus('❌ Not connected'); return; }
+    setStatus('⏳ Downloading clip from SD card... (streams in real-time)');
     document.getElementById('btnCancel').style.display = '';
-
-    ws.send(JSON.stringify({
-        type:      'ftp_download',
-        ch,
-        startTime,
-        endTime,
-    }));
+    ws.send(JSON.stringify({ type: 'download_clip', phone, ch, startTime, endTime }));
 }
 
-// ── Cancel download ───────────────────────────────────────────────────────────
-function cancelDownload() {
+// ── Stop download ─────────────────────────────────────────────────────────────
+function stopDownload() {
+    const phone = document.getElementById('recPhone').value.trim() || _lastPhone;
     if (ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: 'ftp_cancel' }));
+    ws.send(JSON.stringify({ type: 'stop_clip', phone }));
     document.getElementById('btnCancel').style.display = 'none';
-    setStatus('🛑 Cancelling...');
+    setStatus('🛑 Stopped');
 }
 
-// ── Downloaded files list ─────────────────────────────────────────────────────
-let _files = [];
-function addFileToList(filename, url) {
-    _files.push({ filename, url });
-    const tbody = document.getElementById('recList');
+// ── Show recording list from camera ──────────────────────────────────────────
+function showRecordingList(phone, recordings) {
+    const section = document.getElementById('recListSection');
+    const tbody   = document.getElementById('recQueryList');
+    section.style.display = 'block';
     tbody.innerHTML = '';
-    _files.forEach((f, i) => {
+    if (!recordings.length) {
+        tbody.innerHTML = '<tr><td colspan="5" style="color:#555">No recordings found in this time range</td></tr>';
+        return;
+    }
+    const ch = parseInt(document.getElementById('recCh').value) || 1;
+    recordings.forEach((r, i) => {
+        const sizeMB = (r.fileSize / 1024 / 1024).toFixed(1);
         const tr = document.createElement('tr');
         tr.innerHTML = `
-            <td>${i + 1}</td>
-            <td>${f.filename}</td>
+            <td>${i+1}</td>
+            <td>${r.startTime}</td>
+            <td>${r.endTime}</td>
+            <td>${sizeMB} MB</td>
             <td>
-                <button class="btn-play" onclick="playFile('${f.url}','${f.filename}')">▶ Play</button>
-                <a href="${f.url}" download="${f.filename}"
-                   style="margin-left:8px;background:#27ae60;color:#fff;border:none;
-                          padding:5px 12px;border-radius:4px;cursor:pointer;
-                          font-weight:bold;font-size:12px;text-decoration:none;">
-                   ⬇ Save
-                </a>
+                <button class="btn-play" onclick="downloadClip('${phone}',${r.ch||ch},'${r.startTime}','${r.endTime}')">
+                    ⬇ Download
+                </button>
+            </td>`;
+        tbody.appendChild(tr);
+    });
+}
+
+// ── Add downloaded clip to list ───────────────────────────────────────────────
+let _clips = [];
+function addClipToList(url, startTime, endTime) {
+    const name = url.split('/').pop();
+    _clips.push({ url, name, startTime, endTime });
+    const tbody = document.getElementById('recDownloadList');
+    tbody.innerHTML = '';
+    _clips.forEach((c, i) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td>${i+1}</td>
+            <td style="font-size:12px">${c.startTime} → ${c.endTime}</td>
+            <td>
+                <button class="btn-play" onclick="playFile('${c.url}','${c.name}')">▶ Play</button>
+                <a href="${c.url}" download="${c.name}"
+                   style="margin-left:8px;background:#27ae60;color:#fff;
+                          padding:5px 12px;border-radius:4px;font-weight:bold;
+                          font-size:12px;text-decoration:none;">⬇ Save</a>
             </td>`;
         tbody.appendChild(tr);
     });

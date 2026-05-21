@@ -15,6 +15,7 @@ const { WebSocketServer } = require('ws');
 const { spawn }           = require('child_process');
 const tcpForwarder        = require('./tcp-forwarder');
 const ftpDownload         = require('./ftp-download');
+const playbackDownload    = require('./playback-download');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CONFIG = {
@@ -36,6 +37,17 @@ const wss = new WebSocketServer({ port: CONFIG.wsPort });
 console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
 
 // ── Init FTP download module ────────────────────────────────────────────────
+// ── Init playback download module ─────────────────────────────────────────
+playbackDownload.init({
+    serverIp:   CONFIG.serverIp,
+    tcpPort:    CONFIG.tcpPort,
+    clipsDir:   './clips',
+    wss,
+    tcpSockets,
+    buildFrame,
+    buildAck,
+});
+
 ftpDownload.init({
     serverIp:      CONFIG.serverIp,
     ftpPort:       21,
@@ -55,7 +67,9 @@ wss.on('connection', (ws, req) => {
             console.warn('[WS] Non-JSON message:', raw.toString());
             return;
         }
-        ftpDownload.handleWsMessage(msg, ws);
+        if (!playbackDownload.handleWsMessage(msg, ws)) {
+            ftpDownload.handleWsMessage(msg, ws);
+        }
     });
     ws.on('close', () => console.log('[WS] Browser disconnected'));
     ws.on('error', err => console.error('[WS] Error:', err.message));
@@ -70,6 +84,8 @@ http.createServer((req, res) => {
     } else if (urlPath.startsWith('/public/')) {
         filePath = `.${urlPath}`;
     } else if (urlPath.startsWith('/recordings/')) {
+        filePath = `.${urlPath}`;
+    } else if (urlPath.startsWith('/clips/')) {
         filePath = `.${urlPath}`;
     } else {
         filePath = `.${urlPath}`;
@@ -411,8 +427,10 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    // All stream packets go to live video
-                    processVideoPacket(rawData, channel, dataType, subpktMarker);
+                    // Route to playback-download if active, else live video
+                    if (!playbackDownload.handleVideoFrame(phone, rawData, dataType, subpktMarker)) {
+                        processVideoPacket(rawData, channel, dataType, subpktMarker);
+                    }
 
                     offset += 30 + dataBodyLen;
                     continue;
@@ -443,8 +461,10 @@ const tcpServer = net.createServer(socket => {
                         const replyResult = body[4];
                         const resultText  = ['Success','Failed','Wrong Msg','Not Supported','Alarm Confirmed','Update Required'][replyResult] || `Unknown(${replyResult})`;
                         console.log(`[ACK] replyTo:0x${replyMsgId.toString(16).padStart(4,'0')} result:${replyResult} (${resultText})`);
-                        // Also forward to submodules — they filter by replyMsgId internally
-                        ftpDownload.handleSignalling(msgId, body, seq, phone, socket);
+                        // Forward to submodules — they filter by replyMsgId internally
+                        if (!playbackDownload.handleSignalling(msgId, body, seq, phone, socket)) {
+                            ftpDownload.handleSignalling(msgId, body, seq, phone, socket);
+                        }
 
                     // ── 0x0100: Device register ──────────────────────────────
                     } else if (msgId === 0x0100) {
@@ -540,6 +560,14 @@ const tcpServer = net.createServer(socket => {
                         fs.appendFile(`./${fileName}`, Object.values(gpsRecord).join(',') + '\n', err => {
                             if (err) console.error('[GPS LOG] write error:', err.message);
                         });
+
+                    // ── 0x1201: Playback complete from camera ─────────────────
+                    } else if (msgId === 0x1201) {
+                        playbackDownload.handleSignalling(msgId, body, seq, phone, socket);
+
+                    // ── 0x1205: Recording list response ──────────────────────────
+                    } else if (msgId === 0x1205) {
+                        playbackDownload.handleSignalling(msgId, body, seq, phone, socket);
 
                     // ── 0x1206: File upload completion from camera ────────────
                     } else if (msgId === 0x1206) {
