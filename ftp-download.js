@@ -111,6 +111,7 @@ function _build9205(phone, channel, startTime, endTime) {
 //   logicalCh(1)  startBCD(6)  endBCD(6)
 //   alarmLogo(8)  avType(1)  streamType(1)  storageType(1)  taskCondition(1)
 function _build9206(phone, channel, startTime, endTime) {
+    const framePhone = _framePhone(phone);
     const ftpUser    = 'anonymous';
     const ftpPass    = 'anonymous';
     // Filename on the FTP server — unique per request
