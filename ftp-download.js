@@ -331,6 +331,10 @@ function _makeFtpHandler() {
                         reply(200, 'OK');
                         break;
 
+                    case 'AUTH':
+                        reply(431, 'No TLS support');
+                        break;
+
                     case 'FEAT':
                         ftpSock.write('211-Features:\r\n211 End\r\n');
                         break;
