@@ -54,6 +54,10 @@ let _ftpServer      = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// Camera protocol phone is 1576064472 (10 digits)
+// but frame header needs SN 15760064472 (11 digits)
+const framePhone = String(phone).length === 10 ? '1' + phone : phone;
+
 function _bcdBytes(yy, mo, dd, hh, mm, ss) {
     const enc = n => ((Math.floor(n / 10) << 4) | (n % 10));
     return Buffer.from([enc(yy), enc(mo), enc(dd), enc(hh), enc(mm), enc(ss)]);
@@ -91,7 +95,8 @@ function _build9205(phone, channel, startTime, endTime) {
     body[22] = 0;                                                    // stream: all
 
     _log(`0x9205 query — ch:${channel} ${startTime} → ${endTime}`);
-    return _buildFrame(0x9205, body, phone);
+    // return _buildFrame(0x9205, body, phone);
+    return _buildFrame(0x9205, body, framePhone);
 }
 
 // ── 0x9206 frame builder ─────────────────────────────────────────────────────
@@ -164,7 +169,8 @@ function _build9206(phone, channel, startTime, endTime) {
       taskCond   : 0x0F
       body hex   : ${body.toString('hex')}`);
 
-    return { frame: _buildFrame(0x9206, body, phone), uploadPath };
+    // return { frame: _buildFrame(0x9206, body, phone), uploadPath };
+    return { frame: _buildFrame(0x9206, body, framePhone), uploadPath };
 }
 
 // ── 0x9207 control frame ─────────────────────────────────────────────────────
@@ -175,6 +181,7 @@ function _build9207(phone, sessionId, control) {
     body.writeUInt16BE(sessionId & 0xFFFF, 0);
     body[2] = control;
     return _buildFrame(0x9207, body, phone);
+    return _buildFrame(0x9207, body, framePhone);
 }
 
 // ── FTP server ────────────────────────────────────────────────────────────────
@@ -519,7 +526,8 @@ function handleSignalling(msgId, body, seq, phone, socket) {
     //   result: 0=success  1=failed
     if (msgId === 0x1206) {
         // Always ACK the device
-        socket.write(_buildAck(phone, seq, 0x1206));
+        // socket.write(_buildAck(phone, seq, 0x1206));
+        socket.write(_buildAck(framePhone, seq, 0x1206));
 
         const rawHex      = body.toString('hex');
         const replySerial = body.readUInt16BE(0);
