@@ -180,7 +180,7 @@ function _build9207(phone, sessionId, control) {
     const body = Buffer.alloc(3);
     body.writeUInt16BE(sessionId & 0xFFFF, 0);
     body[2] = control;
-    return _buildFrame(0x9207, body, phone);
+    // return _buildFrame(0x9207, body, phone);
     return _buildFrame(0x9207, body, framePhone);
 }
 
@@ -527,6 +527,7 @@ function handleSignalling(msgId, body, seq, phone, socket) {
     if (msgId === 0x1206) {
         // Always ACK the device
         // socket.write(_buildAck(phone, seq, 0x1206));
+        const framePhone = String(phone).length === 10 ? '1' + phone : phone;  // ← add this
         socket.write(_buildAck(framePhone, seq, 0x1206));
 
         const rawHex      = body.toString('hex');
