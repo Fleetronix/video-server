@@ -36,8 +36,8 @@ const path = require('path');
 
 // ── Module state ──────────────────────────────────────────────────────────────
 let _serverIp       = '';
-let _ftpPort        = 2121;
-let _pasvDataPort   = 2122;
+let _ftpPort = 14992;
+let _pasvDataPort = 14993;
 let _recordingsDir  = './recordings';
 let _wss            = null;      // WebSocketServer instance
 let _tcpSockets     = null;      // shared { [phone]: socket } map
@@ -105,8 +105,9 @@ function _build9206(phone, channel, startTime, endTime) {
     const ftpPass    = 'anonymous';
     // Filename on the FTP server — unique per request
     const tag        = startTime.replace(/[: -]/g, '');
-    const uploadPath = `/`;  // root path — camera picks its own filename
-
+    //const uploadPath = `/`;  // root path — camera picks its own filename
+    const tag = `${phone}-${Date.now()}-1`;
+    const uploadPath = `/FtpDownload/${tag}`;
     const s = _parseDateTime(startTime, '00:00:00');
     const e = _parseDateTime(endTime,   '23:59:59');
 

@@ -38,8 +38,8 @@ console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
 // ── Init FTP download module ────────────────────────────────────────────────
 ftpDownload.init({
     serverIp:      CONFIG.serverIp,
-    ftpPort:       2121,
-    pasvDataPort:  2122,
+    ftpPort:       14992,
+    pasvDataPort:  14993,
     recordingsDir: './recordings',
     wss,
     tcpSockets,
