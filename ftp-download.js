@@ -141,11 +141,11 @@ function _build9206(phone, channel, startTime, endTime) {
     // avType: 0 = audio+video — matches what camera actually stores
     body[p++] = 0;
     // streamType: 0 = main or sub, 1 = main, 2 = sub — use 1 (main)
-    body[p++] = 1;
+    body[p++] = 0;
     // storageType: 0 = any, 1 = main, 2 = disaster — use 0
-    body[p++] = 99;   // storageType: 99 — matches camera memType
+    body[p++] = 0;   // storageType: 99 — matches camera memType
     // taskCondition bits: bit0=WiFi bit1=LAN bit2=3G/4G — 0xFF = allow all
-    body[p++] = 0xFF;
+    body[p++] = 0x0F;
 
     _log(`0x9206 body breakdown:
       FTP IP     : ${_serverIp} (len ${k})
@@ -158,9 +158,9 @@ function _build9206(phone, channel, startTime, endTime) {
       End BCD    : ${endTime}
       alarmLogo  : 0x0000000000000000
       avType     : 0 (audio+video)
-      streamType : 1 (main stream)
-      storageType: 99 (camera custom)
-      taskCond   : 0xFF (all networks)
+      streamType : 0 (main stream)
+      storageType: 0 (all storage)
+      taskCond   : 0x0F
       body hex   : ${body.toString('hex')}`);
 
     return { frame: _buildFrame(0x9206, body, phone), uploadPath };
