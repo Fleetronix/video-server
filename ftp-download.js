@@ -53,7 +53,14 @@ let _pasvServer     = null;
 let _ftpServer      = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
+// Phone → SN mapping (protocol phone differs from SN by one digit)
+const PHONE_TO_SN = {
+    '1576064472': '15760064472',
+    '1576064474': '15760064474',
+};
+function _framePhone(phone) {
+    return PHONE_TO_SN[phone] || phone;
+}
 
 function _bcdBytes(yy, mo, dd, hh, mm, ss) {
     const enc = n => ((Math.floor(n / 10) << 4) | (n % 10));
@@ -80,7 +87,7 @@ function _err(...args)  { console.error('[FTP-DL]', ...args); }
 // ── 0x9205 frame builder — query recording list ────────────────────────────
 // T/98 §5.6.1 Table 21: send this BEFORE 0x9206 so camera verifies file exists
 function _build9205(phone, channel, startTime, endTime) {
-    const framePhone = String(phone).length === 10 ? '1' + phone : phone;  
+    const framePhone = _framePhone(phone);
     const s = _parseDateTime(startTime, '00:00:00');
     const e = _parseDateTime(endTime,   '23:59:59');
 
@@ -525,7 +532,7 @@ function handleSignalling(msgId, body, seq, phone, socket) {
     if (msgId === 0x1206) {
         // Always ACK the device
         // socket.write(_buildAck(phone, seq, 0x1206));
-        const framePhone = String(phone).length === 10 ? '1' + phone : phone;  // ← add this
+        const framePhone = _framePhone(phone);
         socket.write(_buildAck(framePhone, seq, 0x1206));
 
         const rawHex      = body.toString('hex');
