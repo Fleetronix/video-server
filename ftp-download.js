@@ -104,7 +104,7 @@ function _build9206(phone, channel, startTime, endTime) {
     const ftpUser    = 'anonymous';
     const ftpPass    = 'anonymous';
     // Filename on the FTP server — unique per request
-    const tag        = startTime.replace(/[: -]/g, '');
+    //const tag        = startTime.replace(/[: -]/g, '');
     //const uploadPath = `/`;  // root path — camera picks its own filename
     const tag = `${phone}-${Date.now()}-1`;
     const uploadPath = `/FtpDownload/${tag}`;
