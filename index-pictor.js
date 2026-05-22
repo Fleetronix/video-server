@@ -314,6 +314,8 @@ function buildFrame(msgId, body, phone) {
     header.writeUInt16BE(body.length, 2);
 
     const phoneStr = String(phone).padStart(12, '0');
+    const phoneStr = String(phone).padStart(12, '0');
+    console.log('[buildFrame] phone input:', phone, 'padded:', phoneStr);
     Buffer.from(
         phoneStr.match(/.{2}/g).map(v => {
             const n = parseInt(v, 10);
@@ -434,8 +436,8 @@ const tcpServer = net.createServer(socket => {
                         .replace(/^0+/, '');
                     const seq  = unescaped.readUInt16BE(10);
                     const body = unescaped.slice(12);
-                    console.log(`[signalling] msgId: 0x${msgId.toString(16).padStart(4,'0')} phone: ${phone}`);
-                    console.log(`[RAW] body hex: ${body.toString('hex')}`);  // ← ADD THIS LINE
+                    // console.log(`[signalling] msgId: 0x${msgId.toString(16).padStart(4,'0')} phone: ${phone}`);
+                    // console.log(`[RAW] body hex: ${body.toString('hex')}`);  // ← ADD THIS LINE
 
                     // ── 0x0001: General response from device ─────────────────
                     if (msgId === 0x0001) {
@@ -500,7 +502,7 @@ const tcpServer = net.createServer(socket => {
                             elevation, datetime: dt, accOn, located, alarms, ...extra,
                         };
 
-                        console.log(`[GPS] ${phone} lat=${lat} lon=${lon} speed=${speed}km/h dir=${direction}° dt=${dt}`);
+                        // console.log(`[GPS] ${phone} lat=${lat} lon=${lon} speed=${speed}km/h dir=${direction}° dt=${dt}`);
 
                         wss.clients.forEach(client => {
                             if (client.readyState === 1) client.send(JSON.stringify(locationData));
