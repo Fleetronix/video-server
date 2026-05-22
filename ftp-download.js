@@ -54,9 +54,6 @@ let _ftpServer      = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// Camera protocol phone is 1576064472 (10 digits)
-// but frame header needs SN 15760064472 (11 digits)
-const framePhone = String(phone).length === 10 ? '1' + phone : phone;
 
 function _bcdBytes(yy, mo, dd, hh, mm, ss) {
     const enc = n => ((Math.floor(n / 10) << 4) | (n % 10));
