@@ -116,8 +116,8 @@ function startFFmpeg(phone, channel) {
     const dir = `./public/${phone}`;
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-    const playlist = `${dir}/video${channel}.m3u8`;
-    const segments = `${dir}/video${channel}_%03d.ts`;
+    const playlist = `${dir}/${phone}.m3u8`;
+    const segments = `${dir}/${phone}_%03d.ts`;
 
     console.log(`[FFmpeg] Starting for ${phone} ch${channel} → ${playlist}`);
 

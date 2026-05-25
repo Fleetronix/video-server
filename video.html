@@ -165,7 +165,7 @@ function ensureVideoPlayer(phone) {
         const video = document.getElementById(`vid-${phone}`);
         if (!video) return;
 
-        const src = `/public/${phone}/video1.m3u8`;
+        const src = `/public/${phone}/${phone}.m3u8`;
 
         if (Hls.isSupported()) {
             const hls = new Hls({
