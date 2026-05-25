@@ -3,8 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // index-pictor.js  —  LIVE STREAM + GPS  (multi-device)
 // Each device gets its own folder:  public/<phone>/
-// HLS playlist:                     public/<phone>/<phone>_ch1.m3u8
-// Segments:                         public/<phone>/<phone>_ch1_000.ts …
+// HLS playlist:                     public/<phone>/video1.m3u8
 // ─────────────────────────────────────────────────────────────────────────────
 
 const net  = require('net');
@@ -29,11 +28,10 @@ console.log(`Server IP: ${CONFIG.serverIp}`);
 if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 
 // ── Device state ──────────────────────────────────────────────────────────────
-const tcpSockets = {};  // { [phone]: socket }
-const phoneByIp  = {};  // { [ip]: phone }
-
+const tcpSockets = {};   // { [phone]: socket }
+const phoneByIp  = {};   // { [ip]: phone }
 // devices[phone][channel] = { ffmpeg, gotIFrame, subpackets, patPmtSent, tsCounter }
-const devices = {};
+const devices    = {};
 
 function getOrCreateDeviceChannel(phone, channel) {
     if (!devices[phone]) devices[phone] = {};
@@ -49,8 +47,6 @@ function getOrCreateDeviceChannel(phone, channel) {
     return devices[phone][channel];
 }
 
-// ── Extract phone number from a T/98 stream packet header (bytes 4–9, BCD) ───
-
 // ── WebSocket server ──────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ port: CONFIG.wsPort });
 console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
@@ -58,7 +54,7 @@ console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
 wss.on('connection', (ws, req) => {
     console.log(`[WS] Browser connected from ${req.socket.remoteAddress}`);
 
-    // Send all currently connected devices immediately to the new browser
+    // Send all currently active devices to the newly connected browser
     const connectedPhones = Object.keys(tcpSockets);
     console.log(`[WS] Sending ${connectedPhones.length} active device(s) to new browser`);
     connectedPhones.forEach(p => {
@@ -116,8 +112,6 @@ http.createServer((req, res) => {
 }).listen(CONFIG.httpPort, () => console.log(`✓ HTTP on :${CONFIG.httpPort}`));
 
 // ── FFmpeg — HLS live stream ──────────────────────────────────────────────────
-// Each device/channel gets its own FFmpeg process.
-// Output lives in:  ./public/<phone>/<phone>_ch<N>.m3u8
 function startFFmpeg(phone, channel) {
     const dir = `./public/${phone}`;
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -127,48 +121,62 @@ function startFFmpeg(phone, channel) {
 
     console.log(`[FFmpeg] Starting for ${phone} ch${channel} → ${playlist}`);
 
-    const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
-        '-fflags',          '+genpts+discardcorrupt+igndts',
-        '-err_detect',      'ignore_err',
-        '-f',               'mpegts',
-        '-probesize',       '500000',
-        '-analyzeduration', '1000000',
-        '-i',               'pipe:0',
-        '-c:v',             'libx264',
-        '-preset',          'ultrafast',
-        '-tune',            'zerolatency',
-        '-g',               '50',
-        '-keyint_min',      '25',
-        '-f',               'hls',
-        '-hls_time',        '1',
-        '-hls_list_size',   '3',
-        '-hls_flags',       'delete_segments+append_list',
+    // Use libx264 to transcode AVS→H264 so browsers can play it.
+    // -c:v copy does NOT work because AVS (0x42) is not natively supported in HLS.
+    const ffmpeg = spawn('ffmpeg', [
+        '-fflags',               '+genpts+discardcorrupt+igndts',
+        '-err_detect',           'ignore_err',
+        '-f',                    'mpegts',
+        '-probesize',            '5000000',
+        '-analyzeduration',      '5000000',
+        '-i',                    'pipe:0',
+        '-c:v',                  'libx264',
+        '-preset',               'ultrafast',
+        '-tune',                 'zerolatency',
+        '-g',                    '50',
+        '-keyint_min',           '25',
+        '-sc_threshold',         '0',
+        '-an',                                  // no audio
+        '-f',                    'hls',
+        '-hls_time',             '2',
+        '-hls_list_size',        '3',
+        '-hls_flags',            'delete_segments+append_list',
+        '-hls_segment_type',     'mpegts',
         '-hls_segment_filename', segments,
         playlist,
     ]);
 
+    // Log ALL FFmpeg stderr so we can see exactly what it says
     ffmpeg.stderr.on('data', d => {
-        console.log(`[FFmpeg ${phone} ch${channel}] ${d.toString().trim()}`);
+        const msg = d.toString().trim();
+        if (msg) console.log(`[FFmpeg ${phone} ch${channel}] ${msg}`);
     });
 
     ffmpeg.on('close', code => {
-        console.log(`[FFmpeg ${phone} ch${channel}] closed (code ${code}), restarting in 1s...`);
+        console.log(`[FFmpeg ${phone} ch${channel}] exited (code ${code}), restarting in 2s...`);
+        const ch = getOrCreateDeviceChannel(phone, channel);
+        ch.ffmpeg     = null;
+        ch.patPmtSent = false;
+        ch.tsCounter  = 0;
+        ch.gotIFrame  = false;
         setTimeout(() => {
-            const ch = getOrCreateDeviceChannel(phone, channel);
-            ch.patPmtSent = false;
-            ch.tsCounter  = 0;
-            ch.gotIFrame  = false;
-            ch.ffmpeg     = startFFmpeg(phone, channel);
-        }, 1000);
+            // Only restart if device is still connected
+            if (tcpSockets[phone]) {
+                ch.ffmpeg = startFFmpeg(phone, channel);
+            }
+        }, 2000);
+    });
+
+    ffmpeg.on('error', err => {
+        console.error(`[FFmpeg ${phone} ch${channel}] spawn error: ${err.message}`);
     });
 
     return ffmpeg;
 }
 
-// ── Ensure FFmpeg is running for a device/channel ─────────────────────────────
 function ensureFFmpeg(phone, channel) {
     const ch = getOrCreateDeviceChannel(phone, channel);
-    if (!ch.ffmpeg || ch.ffmpeg.exitCode !== null) {
+    if (!ch.ffmpeg) {
         ch.ffmpeg = startFFmpeg(phone, channel);
     }
     return ch;
@@ -228,10 +236,8 @@ function wrapFrameInTS(frameData, counter) {
         0x00,
     ]);
     const pes = Buffer.concat([pesHdr, frameData]);
-
     const packets = [];
     let pos = 0, first = true, ctr = counter;
-
     while (pos < pes.length) {
         const pkt = Buffer.alloc(TS_PACKET_SIZE, 0xFF);
         pkt[0] = 0x47;
@@ -239,7 +245,6 @@ function wrapFrameInTS(frameData, counter) {
         pkt[2] = VIDEO_PID & 0xFF;
         pkt[3] = 0x10 | (ctr & 0x0F);
         ctr    = (ctr + 1) & 0x0F;
-
         const room  = TS_PACKET_SIZE - 4;
         const chunk = pes.slice(pos, pos + room);
         chunk.copy(pkt, 4);
@@ -247,26 +252,12 @@ function wrapFrameInTS(frameData, counter) {
         first = false;
         packets.push(pkt);
     }
-
     return { packets, nextCounter: ctr };
 }
 
 // ── Handle one complete video frame ──────────────────────────────────────────
 function handleVideoFrame(frameData, channel, dataType, phone) {
     const ch = getOrCreateDeviceChannel(phone, channel);
-
-    // If FFmpeg isn't ready yet, wait up to 3 seconds and retry
-    if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) {
-        if (!ch._retryCount) ch._retryCount = 0;
-        if (ch._retryCount < 30) {
-            ch._retryCount++;
-            setTimeout(() => handleVideoFrame(frameData, channel, dataType, phone), 100);
-        } else {
-            console.warn(`[${phone}] ch${channel} FFmpeg not ready after 3s, dropping frame`);
-        }
-        return;
-    }
-    ch._retryCount = 0;
 
     const isVideo = (dataType === 0 || dataType === 1 || dataType === 2);
     if (!isVideo) return;
@@ -276,9 +267,9 @@ function handleVideoFrame(frameData, channel, dataType, phone) {
         console.log(`[${phone}] ch${channel} ✅ I_FRAME size:${frameData.length}`);
     } else {
         if (!ch.gotIFrame) return;
-        console.log(`[${phone}] ch${channel} ${dataType === 1 ? 'P' : 'B'}_FRAME size:${frameData.length}`);
     }
 
+    // FFmpeg not ready yet — silently drop, it will recover on next I-frame
     if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
 
     if (!ch.patPmtSent) {
@@ -290,14 +281,14 @@ function handleVideoFrame(frameData, channel, dataType, phone) {
 
     const { packets, nextCounter } = wrapFrameInTS(frameData, ch.tsCounter);
     ch.tsCounter = nextCounter;
-    for (const pkt of packets) ch.ffmpeg.stdin.write(pkt);
+    for (const pkt of packets) {
+        try { ch.ffmpeg.stdin.write(pkt); } catch(e) { /* stdin closed */ }
+    }
 }
 
 // ── Reassemble subpackets (T/98 §5.5.3) ─────────────────────────────────────
-// subpktMarker: 0=atomic, 1=first, 3=middle, 2=last
 function processVideoPacket(rawData, channel, dataType, subpktMarker, phone) {
     const ch = getOrCreateDeviceChannel(phone, channel);
-
     if (subpktMarker === 0) {
         handleVideoFrame(rawData, channel, dataType, phone);
     } else if (subpktMarker === 1) {
@@ -309,7 +300,6 @@ function processVideoPacket(rawData, channel, dataType, subpktMarker, phone) {
             ch.subpackets.push(rawData);
             const complete = Buffer.concat(ch.subpackets);
             ch.subpackets  = [];
-            console.log(`[${phone}] ch${channel} complete frame size:${complete.length}`);
             handleVideoFrame(complete, channel, dataType, phone);
         }
     }
@@ -340,7 +330,6 @@ function buildFrame(msgId, body, phone) {
     const header = Buffer.alloc(12);
     header.writeUInt16BE(msgId,       0);
     header.writeUInt16BE(body.length, 2);
-
     const phoneStr = String(phone).padStart(12, '0');
     Buffer.from(
         phoneStr.match(/.{2}/g).map(v => {
@@ -348,7 +337,6 @@ function buildFrame(msgId, body, phone) {
             return ((Math.floor(n / 10) << 4) | (n % 10));
         })
     ).copy(header, 4);
-
     header.writeUInt16BE(Math.floor(Math.random() * 0xFFFF), 10);
     const payload = Buffer.concat([header, body]);
     let cs = 0; payload.forEach(b => cs ^= b);
@@ -412,25 +400,30 @@ function parseAdditionalInfo(buf) {
 
 // ── TCP server ────────────────────────────────────────────────────────────────
 const tcpServer = net.createServer(socket => {
+    // Guard against sockets with no remote address (unix sockets, internal)
+    if (!socket.remoteAddress) {
+        socket.destroy();
+        return;
+    }
+
     const remote = `${socket.remoteAddress}:${socket.remotePort}`;
     console.log(`Device connected: ${remote}`);
     let buffer = Buffer.alloc(0);
-    let phone  = null;  // set from signalling; stream packets carry their own phone
+    let phone  = null;
+
+    // If this IP already has an authenticated phone (video-only connection), use it
+    if (phoneByIp[socket.remoteAddress]) {
+        phone = phoneByIp[socket.remoteAddress];
+        console.log(`[stream] Video connection identified as ${phone} by IP`);
+    }
 
     socket.on('data', data => {
         try {
-            // If this is a video-only connection (no signalling), identify by IP
-            if (!phone && phoneByIp[socket.remoteAddress]) {
-                phone = phoneByIp[socket.remoteAddress];
-                console.log(`[stream] Video connection identified as ${phone} by IP`);
-            }
-
             buffer = Buffer.concat([buffer, data]);
             let offset = 0;
 
             while (offset < buffer.length - 4) {
 
-                // ── Stream data packet (T/98 §5.5.3 — 0x30316364 header) ────
                 // ── Stream data packet (T/98 §5.5.3 — 0x30316364 header) ────
                 if (buffer[offset]   === 0x30 && buffer[offset+1] === 0x31 &&
                     buffer[offset+2] === 0x63 && buffer[offset+3] === 0x64) {
@@ -445,7 +438,6 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    // Only process video if we know which device this is (set by signalling handshake)
                     if (phone) {
                         processVideoPacket(rawData, channel, dataType, subpktMarker, phone);
                     }
@@ -472,34 +464,31 @@ const tcpServer = net.createServer(socket => {
                     const body = unescaped.slice(12);
                     console.log(`[signalling] msgId: 0x${msgId.toString(16).padStart(4,'0')} phone: ${phone}`);
 
-                    // ── 0x0001: General response from device ─────────────────
                     if (msgId === 0x0001) {
                         const replyMsgId  = body.readUInt16BE(2);
                         const replyResult = body[4];
                         const resultText  = ['Success','Failed','Wrong Msg','Not Supported','Alarm Confirmed','Update Required'][replyResult] || `Unknown(${replyResult})`;
                         console.log(`[ACK] replyTo:0x${replyMsgId.toString(16).padStart(4,'0')} result:${replyResult} (${resultText})`);
 
-                    // ── 0x0100: Device register ──────────────────────────────
                     } else if (msgId === 0x0100) {
                         socket.write(buildRegisterResponse(phone, seq, 0, 'AUTH1234'));
 
-                    // ── 0x0102: Auth complete — start live stream ────────────
                     } else if (msgId === 0x0102) {
-                            socket.write(buildAck(phone, seq, msgId));
-                            socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
-                            tcpSockets[phone] = socket;
+                        socket.write(buildAck(phone, seq, msgId));
+                        socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
+                        tcpSockets[phone] = socket;
 
-                            const ip = socket.remoteAddress;
-                            phoneByIp[ip] = phone;
-                            console.log(`[signalling] Registered socket for ${phone} ip=${ip}`);
+                        // Map IP → phone for the separate video connection
+                        phoneByIp[socket.remoteAddress] = phone;
+                        console.log(`[signalling] Registered socket for ${phone} ip=${socket.remoteAddress}`);
 
-                            ensureFFmpeg(phone, 1);
+                        // Start FFmpeg for this device
+                        ensureFFmpeg(phone, 1);
 
-                            // Tell all browser clients a new device is live
-                            const connMsg = JSON.stringify({ type: 'device_connected', phone });
-                            wss.clients.forEach(c => { if (c.readyState === 1) c.send(connMsg); });
+                        // Tell all browsers this device is live
+                        const msg = JSON.stringify({ type: 'device_connected', phone });
+                        wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
 
-                    // ── 0x0200: Location / GPS report ────────────────────────
                     } else if (msgId === 0x0200) {
                         socket.write(buildAck(phone, seq, msgId));
 
@@ -543,12 +532,10 @@ const tcpServer = net.createServer(socket => {
                         };
 
                         console.log(`[GPS] ${phone} lat=${lat} lon=${lon} speed=${speed}km/h dir=${direction}° dt=${dt}`);
-
                         wss.clients.forEach(client => {
                             if (client.readyState === 1) client.send(JSON.stringify(locationData));
                         });
 
-                        // GPS CSV log
                         const fileName  = `gps_log_${new Date().toISOString().slice(0, 10)}.txt`;
                         const gpsRecord = {
                             phone,
@@ -558,16 +545,16 @@ const tcpServer = net.createServer(socket => {
                             speed_kmh:       speed,
                             direction_deg:   direction,
                             elevation_m:     elevation,
-                            acc:             accOn   ? 'ON'    : 'OFF',
-                            located:         located ? 'YES'   : 'NO',
+                            acc:             accOn   ? 'ON'  : 'OFF',
+                            located:         located ? 'YES' : 'NO',
                             mileage:         extra.mileage        || '0',
                             voltage:         extra.voltage        || '0',
                             satellites:      extra.satellites     || '0',
                             signal:          extra.signalStrength || '0',
                             sensor_speed:    extra.sensorSpeed    || '0',
-                            oil_circuit:     !!(statusBits & (1<<10)) ? 'CUT'    : 'NORMAL',
-                            vehicle_circuit: !!(statusBits & (1<<11)) ? 'CUT'    : 'NORMAL',
-                            door:            !!(statusBits & (1<<13)) ? 'OPEN'   : 'CLOSED',
+                            oil_circuit:     !!(statusBits & (1<<10)) ? 'CUT'  : 'NORMAL',
+                            vehicle_circuit: !!(statusBits & (1<<11)) ? 'CUT'  : 'NORMAL',
+                            door:            !!(statusBits & (1<<13)) ? 'OPEN' : 'CLOSED',
                             alarms:          alarmFlags !== 0 ? [
                                 (alarmFlags & (1<<0)) ? 'EMERGENCY'   : null,
                                 (alarmFlags & (1<<1)) ? 'OVERSPEED'   : null,
@@ -583,7 +570,6 @@ const tcpServer = net.createServer(socket => {
                             if (err) console.error('[GPS LOG] write error:', err.message);
                         });
 
-                    // ── Everything else: generic ACK ─────────────────────────
                     } else {
                         socket.write(buildAck(phone, seq, msgId));
                     }
@@ -604,12 +590,26 @@ const tcpServer = net.createServer(socket => {
 
     socket.on('close', () => {
         console.log(`Device disconnected: ${remote} phone:${phone}`);
-        if (phone) delete tcpSockets[phone];
-        if (socket.remoteAddress) delete phoneByIp[socket.remoteAddress];
+        if (phone) {
+            delete tcpSockets[phone];
+            // Clean up IP mapping only if it still points to this phone
+            if (socket.remoteAddress && phoneByIp[socket.remoteAddress] === phone) {
+                delete phoneByIp[socket.remoteAddress];
+            }
+            // Kill FFmpeg cleanly
+            if (devices[phone]) {
+                Object.values(devices[phone]).forEach(ch => {
+                    if (ch.ffmpeg) {
+                        try { ch.ffmpeg.stdin.end(); } catch(e) {}
+                        ch.ffmpeg = null;
+                    }
+                });
+                delete devices[phone];
+            }
+        }
     });
+
     socket.on('error', err => console.error(`[TCP] Socket error: ${err.message}`));
 });
 
 tcpServer.listen(CONFIG.tcpPort, () => console.log(`✓ TCP server on :${CONFIG.tcpPort}`));
-
-// FFmpeg starts on demand when each device authenticates — no boot-time start needed.
