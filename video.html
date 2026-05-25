@@ -4,40 +4,68 @@
     <title>Vehicle Camera</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
+        * { box-sizing: border-box; }
         body { background: #111; color: #fff; font-family: Arial; padding: 20px; margin: 0; }
-        h3   { color: #00d4ff; }
-        video { width: 100%; max-width: 900px; display: block; margin: 10px 0; background: #000; }
+        h3   { color: #00d4ff; margin: 16px 0 8px; }
+
+        /* ── Video grid ── */
+        #devices {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .device-card {
+            background: #1a1a1a;
+            border-radius: 8px;
+            padding: 12px;
+            border: 1px solid #333;
+        }
+        .device-card h3 { margin-top: 0; }
+        video {
+            width: 100%;
+            display: block;
+            background: #000;
+            border-radius: 4px;
+        }
         .live-badge {
             background: #f00; color: #fff; padding: 2px 8px;
             border-radius: 4px; font-size: 11px; margin-left: 8px;
             animation: blink 1.2s infinite;
         }
         @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.4} }
-        #map { height: 400px; border-radius: 8px; border: 1px solid #333; }
+
+        /* ── Map ── */
+        #map { height: 400px; border-radius: 8px; border: 1px solid #333; margin-bottom: 16px; }
+
+        /* ── GPS info panel ── */
         #gpsInfo {
             background: #1a1a1a; padding: 15px; border-radius: 8px;
-            display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 15px;
+            display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px;
         }
         .info-box {
             background: #222; padding: 10px; border-radius: 6px;
             font-size: 13px; border-left: 3px solid #00d4ff;
         }
+        #info-panel-title { color: #aaa; font-size: 12px; margin-bottom: 4px; }
     </style>
 </head>
 <body>
 
-<!-- Live Video -->
-<div>
-    <h3>Channel 1 - Front <span class="live-badge">LIVE</span></h3>
-    <video id="ch1" autoplay muted controls></video>
+<!-- Video players — one card added per device as it connects -->
+<h3>Live Cameras</h3>
+<div id="devices">
+    <p id="no-devices" style="color:#555; font-size:13px;">Waiting for devices to connect…</p>
 </div>
 
-<!-- Map -->
-<h3>Vehicle Location</h3>
+<!-- Map — all devices shown simultaneously -->
+<h3>Vehicle Locations</h3>
 <div id="map"></div>
 
-<!-- GPS Info -->
+<!-- GPS info — updates for whichever device sent the most recent packet -->
+<div id="info-panel-title">Last update: —</div>
 <div id="gpsInfo">
+    <div class="info-box" id="info-phone">Device: --</div>
     <div class="info-box" id="info-lat">Latitude: --</div>
     <div class="info-box" id="info-lon">Longitude: --</div>
     <div class="info-box" id="info-speed">Speed: --</div>
@@ -55,45 +83,97 @@
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-// ── Live stream ───────────────────────────────────────────────────────────────
-function startLive(videoId, src) {
-    const video = document.getElementById(videoId);
-    const hls   = new Hls({ lowLatencyMode: true });
-    hls.loadSource(src);
-    hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
-    hls.on(Hls.Events.ERROR, (e, d) => console.error(videoId, d));
-}
-startLive('ch1', '/public/ch1.m3u8');
 
 // ── Leaflet Map ───────────────────────────────────────────────────────────────
-const map = L.map('map').setView([20, 0], 2);
+const map = L.map('map').setView([20, 78], 5);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '© OpenStreetMap contributors'
 }).addTo(map);
 
-const truckIcon = L.divIcon({
-    html: `<div style="background:#00d4ff;width:20px;height:20px;border-radius:50%;
-                       border:3px solid #fff;box-shadow:0 0 8px #00d4ff;"></div>`,
-    iconSize: [20, 20], iconAnchor: [10, 10], className: ''
-});
+// Per-device map state: { marker, polyline, trail }
+const deviceMapState = {};
 
-let marker = null, polyline = null, trail = [];
+function makeIcon(phone) {
+    return L.divIcon({
+        html: `<div style="
+            background:#00d4ff; width:24px; height:24px; border-radius:50%;
+            border:3px solid #fff; box-shadow:0 0 8px #00d4ff;
+            display:flex; align-items:center; justify-content:center;
+            font-size:7px; color:#000; font-weight:bold; line-height:1;
+        ">${phone.slice(-4)}</div>`,
+        iconSize: [24, 24], iconAnchor: [12, 12], className: ''
+    });
+}
 
-function updateMap(lat, lon, speed, direction) {
+function updateMap(phone, lat, lon, speed, direction) {
     const pos = [lat, lon];
-    if (!marker) {
-        marker = L.marker(pos, { icon: truckIcon }).addTo(map);
+
+    if (!deviceMapState[phone]) {
+        deviceMapState[phone] = {
+            marker:   L.marker(pos, { icon: makeIcon(phone) }).addTo(map),
+            polyline: null,
+            trail:    [],
+        };
         map.setView(pos, 15);
-    } else {
-        marker.setLatLng(pos);
     }
-    marker.bindPopup(`<b>Vehicle</b><br>Lat: ${lat.toFixed(6)}<br>Lon: ${lon.toFixed(6)}<br>Speed: ${speed} km/h<br>Dir: ${direction}°`);
-    trail.push(pos);
-    if (trail.length > 50) trail.shift();
-    if (polyline) map.removeLayer(polyline);
-    polyline = L.polyline(trail, { color: '#00d4ff', weight: 2 }).addTo(map);
+
+    const s = deviceMapState[phone];
+    s.marker.setLatLng(pos);
+    s.marker.bindPopup(
+        `<b>${phone}</b><br>` +
+        `Lat: ${lat.toFixed(6)}<br>` +
+        `Lon: ${lon.toFixed(6)}<br>` +
+        `Speed: ${speed} km/h<br>` +
+        `Dir: ${direction}°`
+    );
+
+    s.trail.push(pos);
+    if (s.trail.length > 50) s.trail.shift();
+    if (s.polyline) map.removeLayer(s.polyline);
+    s.polyline = L.polyline(s.trail, { color: '#00d4ff', weight: 2 }).addTo(map);
     map.panTo(pos);
+}
+
+// ── Live video players ────────────────────────────────────────────────────────
+const hlsPlayers = {};  // { [phone]: Hls instance or true for native }
+
+function ensureVideoPlayer(phone) {
+    if (hlsPlayers[phone]) return;  // already created
+
+    // Remove the "waiting" placeholder on first device
+    const placeholder = document.getElementById('no-devices');
+    if (placeholder) placeholder.remove();
+
+    const card = document.createElement('div');
+    card.className = 'device-card';
+    card.id = `device-${phone}`;
+    card.innerHTML = `
+        <h3>📷 ${phone} — Ch1 <span class="live-badge">LIVE</span></h3>
+        <video id="vid-${phone}" autoplay muted controls></video>
+    `;
+    document.getElementById('devices').appendChild(card);
+
+    const video = document.getElementById(`vid-${phone}`);
+    // HLS path: public/<phone>/<phone>_ch1.m3u8
+    const src = `/public/${phone}/${phone}_ch1.m3u8`;
+
+    if (Hls.isSupported()) {
+        const hls = new Hls({ lowLatencyMode: true });
+        hls.loadSource(src);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+        hls.on(Hls.Events.ERROR, (e, d) => {
+            if (d.fatal) console.error(`[HLS ${phone}]`, d);
+        });
+        hlsPlayers[phone] = hls;
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Safari native HLS
+        video.src = src;
+        video.play();
+        hlsPlayers[phone] = true;
+    } else {
+        console.warn(`[HLS] Browser does not support HLS for device ${phone}`);
+    }
 }
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -107,21 +187,32 @@ ws.onmessage = e => {
     try { msg = JSON.parse(e.data); } catch(err) { return; }
 
     if (msg.type === 'location') {
-        updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
-        document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}`;
-        document.getElementById('info-lon').textContent        = `Longitude: ${msg.lon.toFixed(6)}`;
-        document.getElementById('info-speed').textContent      = `Speed: ${msg.speed} km/h`;
-        document.getElementById('info-dir').textContent        = `Direction: ${msg.direction}°`;
-        document.getElementById('info-elev').textContent       = `Elevation: ${msg.elevation} m`;
-        document.getElementById('info-dt').textContent         = `DateTime: ${msg.datetime}`;
-        document.getElementById('info-acc').textContent        = `ACC: ${msg.accOn ? 'ON' : 'OFF'}`;
-        document.getElementById('info-located').textContent    = `Located: ${msg.located ? 'Yes' : 'No'}`;
-        document.getElementById('info-mileage').textContent    = `Mileage: ${msg.mileage || '--'}`;
-        document.getElementById('info-voltage').textContent    = `Voltage: ${msg.voltage || '--'}`;
-        document.getElementById('info-satellites').textContent = `Satellites: ${msg.satellites || '--'}`;
-        document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms && msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
+        const phone = msg.phone;
+
+        // Create video player card for this device if it's new
+        ensureVideoPlayer(phone);
+
+        // Update map marker / trail
+        updateMap(phone, msg.lat, msg.lon, msg.speed, msg.direction);
+
+        // Update GPS info panel (always shows the most recent device's data)
+        document.getElementById('info-panel-title').textContent = `Last update: ${phone} @ ${msg.datetime}`;
+        document.getElementById('info-phone').textContent       = `Device: ${phone}`;
+        document.getElementById('info-lat').textContent         = `Latitude: ${msg.lat.toFixed(6)}`;
+        document.getElementById('info-lon').textContent         = `Longitude: ${msg.lon.toFixed(6)}`;
+        document.getElementById('info-speed').textContent       = `Speed: ${msg.speed} km/h`;
+        document.getElementById('info-dir').textContent         = `Direction: ${msg.direction}°`;
+        document.getElementById('info-elev').textContent        = `Elevation: ${msg.elevation} m`;
+        document.getElementById('info-dt').textContent          = `DateTime: ${msg.datetime}`;
+        document.getElementById('info-acc').textContent         = `ACC: ${msg.accOn ? 'ON' : 'OFF'}`;
+        document.getElementById('info-located').textContent     = `Located: ${msg.located ? 'Yes' : 'No'}`;
+        document.getElementById('info-mileage').textContent     = `Mileage: ${msg.mileage || '--'}`;
+        document.getElementById('info-voltage').textContent     = `Voltage: ${msg.voltage || '--'}`;
+        document.getElementById('info-satellites').textContent  = `Satellites: ${msg.satellites || '--'}`;
+        document.getElementById('info-alarms').textContent      = `Alarms: ${msg.alarms && msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
     }
 };
+
 </script>
 </body>
 </html>
