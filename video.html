@@ -155,7 +155,7 @@ function ensureVideoPlayer(phone) {
 
     const video = document.getElementById(`vid-${phone}`);
     // HLS path: public/<phone>/<phone>_ch1.m3u8
-    const src = `/public/${phone}/${phone}_ch1.m3u8`;
+    const src = `/public/${phone}/video1.m3u8`;
 
     if (Hls.isSupported()) {
         const hls = new Hls({ lowLatencyMode: true });
@@ -186,10 +186,13 @@ ws.onmessage = e => {
     let msg;
     try { msg = JSON.parse(e.data); } catch(err) { return; }
 
+    if (msg.type === 'device_connected') {
+        ensureVideoPlayer(msg.phone);
+        return;
+    }
+
     if (msg.type === 'location') {
         const phone = msg.phone;
-
-        // Create video player card for this device if it's new
         ensureVideoPlayer(phone);
 
         // Update map marker / trail

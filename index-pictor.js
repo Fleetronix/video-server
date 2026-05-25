@@ -114,8 +114,8 @@ function startFFmpeg(phone, channel) {
     const dir = `./public/${phone}`;
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-    const playlist = `${dir}/${phone}_ch${channel}.m3u8`;
-    const segments = `${dir}/${phone}_ch${channel}_%03d.ts`;
+    const playlist = `${dir}/video${channel}.m3u8`;
+    const segments = `${dir}/video${channel}_%03d.ts`;
 
     console.log(`[FFmpeg] Starting for ${phone} ch${channel} → ${playlist}`);
 
@@ -477,17 +477,19 @@ const tcpServer = net.createServer(socket => {
 
                     // ── 0x0102: Auth complete — start live stream ────────────
                     } else if (msgId === 0x0102) {
-                        socket.write(buildAck(phone, seq, msgId));
-                        socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
-                        tcpSockets[phone] = socket;
+                            socket.write(buildAck(phone, seq, msgId));
+                            socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
+                            tcpSockets[phone] = socket;
 
-                        // Save IP → phone so the video-only connection can identify itself
-                        const ip = socket.remoteAddress;
-                        phoneByIp[ip] = phone;
-                        console.log(`[signalling] Registered socket for ${phone} ip=${ip}`);
+                            const ip = socket.remoteAddress;
+                            phoneByIp[ip] = phone;
+                            console.log(`[signalling] Registered socket for ${phone} ip=${ip}`);
 
-                        ensureFFmpeg(phone, 1);
-                        console.log(`[FFmpeg] Ensured for ${phone} ch1 → public/${phone}/${phone}_ch1.m3u8`);
+                            ensureFFmpeg(phone, 1);
+
+                            // Tell all browser clients a new device is live
+                            const connMsg = JSON.stringify({ type: 'device_connected', phone });
+                            wss.clients.forEach(c => { if (c.readyState === 1) c.send(connMsg); });
 
                     // ── 0x0200: Location / GPS report ────────────────────────
                     } else if (msgId === 0x0200) {
