@@ -30,6 +30,7 @@ if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 
 // ── Device state ──────────────────────────────────────────────────────────────
 const tcpSockets = {};  // { [phone]: socket }
+const phoneByIp  = {};  // { [ip]: phone }
 
 // devices[phone][channel] = { ffmpeg, gotIFrame, subpackets, patPmtSent, tsCounter }
 const devices = {};
@@ -401,6 +402,12 @@ const tcpServer = net.createServer(socket => {
 
     socket.on('data', data => {
         try {
+            // If this is a video-only connection (no signalling), identify by IP
+            if (!phone && phoneByIp[socket.remoteAddress]) {
+                phone = phoneByIp[socket.remoteAddress];
+                console.log(`[stream] Video connection identified as ${phone} by IP`);
+            }
+
             buffer = Buffer.concat([buffer, data]);
             let offset = 0;
 
@@ -464,9 +471,12 @@ const tcpServer = net.createServer(socket => {
                         socket.write(buildAck(phone, seq, msgId));
                         socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
                         tcpSockets[phone] = socket;
-                        console.log(`[signalling] Registered socket for ${phone}`);
 
-                        // ✅ Create device folder + start FFmpeg now that we know the phone
+                        // Save IP → phone so the video-only connection can identify itself
+                        const ip = socket.remoteAddress;
+                        phoneByIp[ip] = phone;
+                        console.log(`[signalling] Registered socket for ${phone} ip=${ip}`);
+
                         ensureFFmpeg(phone, 1);
                         console.log(`[FFmpeg] Ensured for ${phone} ch1 → public/${phone}/${phone}_ch1.m3u8`);
 
@@ -576,6 +586,7 @@ const tcpServer = net.createServer(socket => {
     socket.on('close', () => {
         console.log(`Device disconnected: ${remote} phone:${phone}`);
         if (phone) delete tcpSockets[phone];
+        if (socket.remoteAddress) delete phoneByIp[socket.remoteAddress];
     });
     socket.on('error', err => console.error(`[TCP] Socket error: ${err.message}`));
 });
