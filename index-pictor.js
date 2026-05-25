@@ -140,10 +140,7 @@ function startFFmpeg(phone, channel) {
     ]);
 
     ffmpeg.stderr.on('data', d => {
-        const msg = d.toString().trim();
-        if (msg.includes('Error') || msg.includes('Invalid') || msg.includes('error')) {
-            console.error(`[FFmpeg ${phone} ch${channel}]`, msg);
-        }
+        console.log(`[FFmpeg ${phone} ch${channel}] ${d.toString().trim()}`);
     });
 
     ffmpeg.on('close', code => {
@@ -249,7 +246,19 @@ function wrapFrameInTS(frameData, counter) {
 // ── Handle one complete video frame ──────────────────────────────────────────
 function handleVideoFrame(frameData, channel, dataType, phone) {
     const ch = getOrCreateDeviceChannel(phone, channel);
-    if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
+
+    // If FFmpeg isn't ready yet, wait up to 3 seconds and retry
+    if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) {
+        if (!ch._retryCount) ch._retryCount = 0;
+        if (ch._retryCount < 30) {
+            ch._retryCount++;
+            setTimeout(() => handleVideoFrame(frameData, channel, dataType, phone), 100);
+        } else {
+            console.warn(`[${phone}] ch${channel} FFmpeg not ready after 3s, dropping frame`);
+        }
+        return;
+    }
+    ch._retryCount = 0;
 
     const isVideo = (dataType === 0 || dataType === 1 || dataType === 2);
     if (!isVideo) return;
