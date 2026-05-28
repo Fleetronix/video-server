@@ -459,6 +459,7 @@ const tcpServer = net.createServer(socket => {
                         const rawPhone = unescaped.slice(4, 10)
                             .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`).join('');
                         console.log('[AUTH] raw BCD phone:', rawPhone, 'stripped:', rawPhone.replace(/^0/,''));
+                        console.log('[AUTH] raw bytes:', unescaped.slice(4, 10).toString('hex'));
                         socket.write(buildAck(phone, seq, msgId));
                         socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
                         tcpSockets[phone] = socket;
