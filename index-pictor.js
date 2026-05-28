@@ -433,7 +433,7 @@ const tcpServer = net.createServer(socket => {
                     console.log(`[PHONE RAW BYTES] ${unescaped.slice(4,10).toString('hex')}`);
 
                     phone = unescaped.slice(4, 10)
-                        .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`)
+                        .map(b => b.toString(16).padStart(2, '0'))
                         .join('')
                         .replace(/^0/, '');
                     const seq  = unescaped.readUInt16BE(10);
