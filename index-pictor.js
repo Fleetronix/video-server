@@ -457,7 +457,7 @@ const tcpServer = net.createServer(socket => {
                     // ── 0x0102: Auth complete — start live stream ────────────
                     } else if (msgId === 0x0102) {
                         const rawPhone = unescaped.slice(4, 10)
-                            .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`).join('');
+                            .map(b => String((b >> 4) & 0x0F) + String(b & 0x0F)).join('');
                         console.log('[AUTH] raw BCD phone:', rawPhone, 'stripped:', rawPhone.replace(/^0/,''));
                         console.log('[AUTH] raw bytes:', unescaped.slice(4, 10).toString('hex'));
                         socket.write(buildAck(phone, seq, msgId));
