@@ -432,10 +432,8 @@ const tcpServer = net.createServer(socket => {
                     const msgId = unescaped.readUInt16BE(0);
                     console.log(`[PHONE RAW BYTES] ${unescaped.slice(4,10).toString('hex')}`);
 
-                    phone = unescaped.slice(4, 10)
-                        .map(b => b.toString(16).padStart(2, '0'))
-                        .join('')
-                        .replace(/^0/, '');
+                    phone = Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2, '0')).join('')
+    .replace(/^0/, '');
                     const seq  = unescaped.readUInt16BE(10);
                     const body = unescaped.slice(12);
                     // console.log(`[signalling] msgId: 0x${msgId.toString(16).padStart(4,'0')} phone: ${phone}`);
@@ -456,11 +454,10 @@ const tcpServer = net.createServer(socket => {
 
                     // ── 0x0102: Auth complete — start live stream ────────────
                     } else if (msgId === 0x0102) {
-                        const rawPhone = unescaped.slice(4, 10)
-                        .map(b => b.toString(16).padStart(2, '0')).join('');
+                        const rawPhone = Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2, '0')).join('');
                         console.log('[AUTH] raw BCD phone:', rawPhone, 'stripped:', rawPhone.replace(/^0/,''));
                         console.log('[AUTH] raw bytes:', unescaped.slice(4, 10).toString('hex'));
-                        console.log('[AUTH] digits:', unescaped.slice(4, 10).map(b => b.toString(16).padStart(2,'0')).join('-'));
+                        console.log('[AUTH] digits:', Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2,'0')).join('-'));
                         socket.write(buildAck(phone, seq, msgId));
                         socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
                         tcpSockets[phone] = socket;
