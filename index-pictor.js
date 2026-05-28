@@ -430,6 +430,8 @@ const tcpServer = net.createServer(socket => {
                     if (unescaped.length < 12) { offset = end + 1; continue; }
 
                     const msgId = unescaped.readUInt16BE(0);
+                    console.log(`[PHONE RAW BYTES] ${unescaped.slice(4,10).toString('hex')}`);
+
                     phone = unescaped.slice(4, 10)
                         .map(b => `${(b >> 4) & 0x0F}${b & 0x0F}`)
                         .join('')
