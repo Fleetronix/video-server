@@ -100,7 +100,7 @@ function _write(data) {
  *   1576064474,2026-05-13 19:49:03,17.437335,78.369083,0,233,579,ON,YES,--,--,--,--,--,NORMAL,NORMAL,CLOSED,NONE
  */
 function sendGpsRecord(gpsRecord) {
-    const phone = `10000${gpsRecord.phone}`;
+    const phone = `1000${gpsRecord.phone}`;
     const csv = [
         phone,
         gpsRecord.datetime,
