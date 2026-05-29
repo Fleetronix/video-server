@@ -272,11 +272,28 @@ function _makeFtpHandler() {
                     }
 
                     case 'LIST':
-                    case 'NLST':
+                    case 'NLST': {
                         reply(150, 'Here comes the directory listing');
                         const _sendListing = () => {
                             if (_pasvDataSocket) {
-                                _pasvDataSocket.end('');
+                                try {
+                                    const entries = fs.readdirSync(_recordingsDir);
+                                    const listing = entries.map(name => {
+                                        const full = path.join(_recordingsDir, name);
+                                        const stat = fs.statSync(full);
+                                        const isDir = stat.isDirectory();
+                                        const size  = stat.size;
+                                        const d     = stat.mtime;
+                                        const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                                        const dateStr = `${months[d.getMonth()]} ${String(d.getDate()).padStart(2,' ')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+                                        const perms = isDir ? 'drwxr-xr-x' : '-rw-r--r--';
+                                        return `${perms} 1 ftp ftp ${size} ${dateStr} ${name}`;
+                                    }).join('\r\n') + '\r\n';
+                                    _pasvDataSocket.end(listing);
+                                } catch (e) {
+                                    _warn(`LIST read error: ${e.message}`);
+                                    _pasvDataSocket.end('');
+                                }
                                 _pasvDataSocket = null;
                                 reply(226, 'Directory send OK');
                             } else {
@@ -285,6 +302,7 @@ function _makeFtpHandler() {
                         };
                         _sendListing();
                         break;
+                    }
 
                     case 'STOR': {
                         // Device is about to upload the file
