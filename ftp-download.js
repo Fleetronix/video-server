@@ -265,8 +265,16 @@ function _makeFtpHandler() {
                     case 'LIST':
                     case 'NLST':
                         reply(150, 'Here comes the directory listing');
-                        if (_pasvDataSocket) { _pasvDataSocket.end(''); _pasvDataSocket = null; }
-                        reply(226, 'Directory send OK');
+                        const _sendListing = () => {
+                            if (_pasvDataSocket) {
+                                _pasvDataSocket.end('');
+                                _pasvDataSocket = null;
+                                reply(226, 'Directory send OK');
+                            } else {
+                                setTimeout(_sendListing, 100);
+                            }
+                        };
+                        _sendListing();
                         break;
 
                     case 'STOR': {
