@@ -239,9 +239,18 @@ function _makeFtpHandler() {
                         reply(250, 'Directory changed');
                         break;
 
-                    case 'MKD':
-                        reply(257, `"/${arg}" created`);
+                    case 'MKD': {
+                        const dirPath = path.join(_recordingsDir, arg.replace(/^\//, ''));
+                        try {
+                            fs.mkdirSync(dirPath, { recursive: true });
+                            _log(`MKD created: ${dirPath}`);
+                            reply(257, `"/${arg}" created`);
+                        } catch (e) {
+                            _warn(`MKD failed: ${e.message}`);
+                            reply(550, 'Failed to create directory');
+                        }
                         break;
+                    }
 
                     case 'EPSV':
                         // Some devices try EPSV first — refuse so they fall back to PASV
