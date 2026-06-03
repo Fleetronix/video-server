@@ -97,9 +97,9 @@
         <input type="number" id="recCh" value="1" min="1" max="8"
                style="width:50px;background:#222;color:#fff;border:1px solid #444;padding:6px;border-radius:4px;font-size:13px;" />
         <label>From:</label>
-        <input type="datetime-local" id="recFrom" />
+        <input type="datetime-local" id="recFrom" step="1" onchange="autoSetEndTime()" />
         <label>To:</label>
-        <input type="datetime-local" id="recTo" />
+        <input type="datetime-local" id="recTo" step="1" />
         <button class="btn btn-primary" onclick="requestFtpDownload()">⬇ Request Download</button>
         <button class="btn btn-danger"  onclick="cancelDownload()" id="btnCancel" style="display:none">🛑 Cancel</button>
         <span id="recStatus"></span>
@@ -203,6 +203,18 @@ ws.onmessage = e => {
     if (msg.type === 'error')  setStatus('❌ ' + msg.message);
 };
 
+// ── Auto-set end time to +10 seconds ──────────────────────────────────────────
+function autoSetEndTime() {
+    const from = document.getElementById('recFrom').value;
+    if (!from) return;
+    const d = new Date(from);
+    d.setSeconds(d.getSeconds() + 10);
+    // Format to datetime-local: YYYY-MM-DDTHH:mm:ss
+    const pad = n => String(n).padStart(2, '0');
+    const val = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    document.getElementById('recTo').value = val;
+}
+
 // ── Status helper ─────────────────────────────────────────────────────────────
 function setStatus(txt) {
     document.getElementById('recStatus').textContent = txt;
@@ -219,7 +231,7 @@ function requestFtpDownload() {
 
     // ADD THIS — validate range
     const diffMs = new Date(to.replace('T',' ')) - new Date(from.replace('T',' '));
-    if (diffMs <= 0) { setStatus('⚠️ End time must be after start time'); return; }
+    if (diffMs < 10000) { setStatus('⚠️ End time must be at least 10 seconds after start'); return; }
     if (diffMs > 60 * 60 * 1000) { setStatus('⚠️ Max range is 1 hour — camera has 2-minute files, pick a short window'); return; }
     if (ws.readyState !== WebSocket.OPEN) { setStatus('❌ Not connected'); return; }
 
