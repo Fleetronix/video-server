@@ -51,6 +51,7 @@ const _sessions = {};
 let _pasvDataSocket = null;
 let _pasvServer     = null;
 let _ftpServer      = null;
+let _pendingStor     = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 // Phone → SN mapping (protocol phone differs from SN by one digit)
@@ -118,7 +119,7 @@ function _build9206(phone, channel, startTime, endTime) {
     //const tag        = startTime.replace(/[: -]/g, '');
     //const uploadPath = `/`;  // root path — camera picks its own filename
     const tag = `${phone}-${Date.now()}-1`;
-    const uploadPath = `/FtpDownload/${tag}`;
+    const uploadPath = `/FtpDownload/`;
     const s = _parseDateTime(startTime, '00:00:00');
     const e = _parseDateTime(endTime,   '23:59:59');
 
@@ -152,12 +153,12 @@ function _build9206(phone, channel, startTime, endTime) {
     body.fill(0x00, p, p + 8);              p += 8;
     // avType: 0 = audio+video — matches what camera actually stores
     body[p++] = 0;
-    // streamType: 0 = main or sub, 1 = main, 2 = sub — use 1 (main)
-    body[p++] = 0;
+    // streamType: 1 = main stream (explicit)
+    body[p++] = 1;
     // storageType: 0 = any, 1 = main, 2 = disaster — use 0
     body[p++] = 0;   // storageType: 99 — matches camera memType
     // taskCondition bits: bit0=WiFi bit1=LAN bit2=3G/4G — 0xFF = allow all
-    body[p++] = 0x0F;
+    body[p++] = 0xFF;
 
     _log(`0x9206 body breakdown:
       FTP IP     : ${_serverIp} (len ${k})
@@ -307,56 +308,50 @@ function _makeFtpHandler() {
                         break;
                     }
 
-                    case 'STOR': {
-                        // Device is about to upload the file
+                                        case 'STOR': {
                         const filename = path.basename(arg || `rec_${Date.now()}.mp4`);
                         uploadPath   = path.join(_recordingsDir, filename);
                         uploadStream = fs.createWriteStream(uploadPath);
                         _log(`STOR → writing to ${uploadPath}`);
                         reply(150, 'Ok to send data');
 
-                        // Find the session that matches this filename (best-effort)
-                        const matchPhone = Object.keys(_sessions).find(ph =>
-                            _sessions[ph] && path.basename(_sessions[ph].ftpPath || '') === filename
-                        );
-
                         const _onComplete = () => {
                             const fname = path.basename(uploadPath);
                             _log(`✅ File transfer complete: ${fname}`);
                             reply(226, 'Transfer complete');
                             _broadcast({ type: 'ftp_ready', url: `/recordings/${fname}`, filename: fname });
-                            if (matchPhone) delete _sessions[matchPhone];
                             _pasvDataSocket = null;
-                            dataSocket      = null;
                         };
 
-                        // Wait up to 10 s for the device to open the PASV data connection
-                        let tries = 0;
-                        const waitForData = setInterval(() => {
-                            if (!dataSocket && _pasvDataSocket) {
-                                dataSocket = _pasvDataSocket;
-                                _log(`Data socket acquired after ${tries * 100}ms`);
-                            }
-                            if (!dataSocket) {
-                                if (++tries > 100) {
-                                    clearInterval(waitForData);
-                                    _err('No data connection after 10s');
+                        const _onError = (err) => {
+                            _err('Data socket error:', err?.message || err);
+                            reply(426, 'Connection closed, transfer aborted');
+                            try { uploadStream.destroy(); } catch(e) {}
+                        };
+
+                        const handleDataSocket = (s) => {
+                            _log(`Piping data → ${uploadPath}`);
+                            dataSocket = s;
+                            s.pipe(uploadStream);
+                            uploadStream.on('finish', _onComplete);
+                            s.on('end', () => { uploadStream.end(); });
+                            s.on('close', () => { uploadStream.end(); });
+                            s.on('error', _onError);
+                        };
+
+                        if (_pasvDataSocket) {
+                            handleDataSocket(_pasvDataSocket);
+                            _pasvDataSocket = null;
+                        } else {
+                            _pendingStor = handleDataSocket;
+                            setTimeout(() => {
+                                if (_pendingStor === handleDataSocket) {
+                                    _pendingStor = null;
+                                    _err('No data connection after 30s');
                                     reply(425, 'No data connection established');
                                 }
-                                return;
-                            }
-                            clearInterval(waitForData);
-                            _log(`Piping data → ${uploadPath}`);
-
-                            dataSocket.pipe(uploadStream);
-                            uploadStream.on('finish', _onComplete);
-                            dataSocket.on('end',   () => uploadStream.end());
-                            dataSocket.on('close', () => uploadStream.end());
-                            dataSocket.on('error', err => {
-                                _err('Data socket error:', err.message);
-                                reply(426, 'Connection closed, transfer aborted');
-                            });
-                        }, 100);
+                            }, 30000);
+                        }
                         break;
                     }
 
@@ -397,10 +392,16 @@ function _makeFtpHandler() {
 function _startFtpServer() {
     // ── Permanent PASV data server ──────────────────────────────────────────
     // Stays open forever — re-creating per PASV causes EADDRINUSE on 2nd upload
-    _pasvServer = net.createServer(s => {
-        _log(`PASV data connection from ${s.remoteAddress}:${s.remotePort}`);
-        _pasvDataSocket = s;
-    });
+        _pasvServer = net.createServer(s => {
+            _log(`PASV data connection from ${s.remoteAddress}:${s.remotePort}`);
+            if (_pendingStor) {
+                _pendingStor(s);
+                _pendingStor = null;
+            } else {
+                _pasvDataSocket = s;
+                setTimeout(() => { if (_pasvDataSocket === s) { s.end(); _pasvDataSocket = null; } }, 30000);
+            }
+        });
     _pasvServer.listen(_pasvDataPort, '0.0.0.0', () => {
         _log(`✓ PASV data server on :${_pasvDataPort}`);
     });
@@ -491,7 +492,12 @@ function handleWsMessage(msg, ws) {
             ws.send(JSON.stringify({ type: 'error', message: m }));
             return;
         }
-
+        // Cancel any previous stuck download
+        if (_sessions[phone] && _tcpSockets[phone] && !_tcpSockets[phone].destroyed) {
+            _tcpSockets[phone].write(_build9207(phone, 0, 2));
+            _log(`Sent 0x9207 cancel for previous session`);
+            delete _sessions[phone];
+        }
         // Step 1 — send 0x9205 (query list) so camera verifies file exists on SD card
         const queryFrame = _build9205(phone, ch, startTime, endTime);
         _tcpSockets[phone].write(queryFrame);

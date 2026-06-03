@@ -548,6 +548,15 @@ const tcpServer = net.createServer(socket => {
                             if (err) console.error('[GPS LOG] write error:', err.message);
                         });
 
+                    // ── 0x1205: File list response from camera ────────────────
+                    } else if (msgId === 0x1205) {
+                        const replySerial = body.readUInt16BE(0);
+                        const totalFiles  = body.readUInt32BE(2);
+                        console.log(`[0x1205] File list response — serial:${replySerial} files:${totalFiles}`);
+                        if (totalFiles === 0) {
+                            console.warn('[0x1205] ⚠️ Camera reports 0 files found for this time range!');
+                        }
+
                     // ── 0x1206: File upload completion from camera ────────────
                     } else if (msgId === 0x1206) {
                         ftpDownload.handleSignalling(msgId, body, seq, phone, socket);
