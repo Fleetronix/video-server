@@ -217,11 +217,30 @@ function _makeFtpHandler() {
 
                 switch (cmd.toUpperCase()) {
                     case 'USER':
-                        reply(230, 'User logged in, proceed');
+                        reply(331, 'Please specify the password');
                         break;
 
                     case 'PASS':
                         reply(230, 'User logged in, proceed');
+                        break;
+                                        case 'SIZE':
+                        reply(213, '0');  // or actual file size if exists
+                        break;
+
+                    case 'MDTM':
+                        reply(213, '20260101000000');
+                        break;
+
+                    case 'DELE':
+                        reply(250, 'Delete operation successful');
+                        break;
+
+                    case 'RNFR':
+                        reply(350, 'Ready for RNTO');
+                        break;
+
+                    case 'RNTO':
+                        reply(250, 'Rename successful');
                         break;
 
                     case 'SYST':
