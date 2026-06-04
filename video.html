@@ -126,11 +126,57 @@
 // ── Live stream ───────────────────────────────────────────────────────────────
 function startLive(videoId, src) {
     const video = document.getElementById(videoId);
-    const hls   = new Hls({ lowLatencyMode: true });
+ 
+    const hls = new Hls({
+        lowLatencyMode:         false,   // true hurts stability on embedded cams
+        liveSyncDurationCount:  3,       // keep 3 segments buffered
+        liveMaxLatencyDurationCount: 6,  // allow up to 6 before jumping ahead
+        maxBufferLength:        10,      // seconds of forward buffer
+        maxMaxBufferLength:     20,
+        maxBufferHole:          0.5,     // tolerate 0.5s holes before seeking
+        enableWorker:           true,
+        manifestLoadingTimeOut: 10000,
+        manifestLoadingMaxRetry: 10,
+        fragLoadingTimeOut:     10000,
+        fragLoadingMaxRetry:    6,
+    });
+ 
     hls.loadSource(src);
     hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
-    hls.on(Hls.Events.ERROR, (e, d) => console.error(videoId, d));
+ 
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        video.play().catch(() => {});
+    });
+ 
+    hls.on(Hls.Events.ERROR, (event, data) => {
+        console.warn(`[HLS ${videoId}]`, data.type, data.details);
+        if (data.fatal) {
+            switch (data.type) {
+                case Hls.ErrorTypes.NETWORK_ERROR:
+                    console.log(`[HLS ${videoId}] network error — retrying`);
+                    setTimeout(() => hls.startLoad(), 2000);
+                    break;
+                case Hls.ErrorTypes.MEDIA_ERROR:
+                    console.log(`[HLS ${videoId}] media error — recovering`);
+                    hls.recoverMediaError();
+                    break;
+                default:
+                    console.log(`[HLS ${videoId}] fatal — restarting`);
+                    hls.destroy();
+                    setTimeout(() => startLive(videoId, src), 3000);
+                    break;
+            }
+        }
+    });
+ 
+    // Jump to live edge if we fall more than 8 s behind
+    setInterval(() => {
+        if (!video.paused && hls.liveSyncPosition &&
+            video.currentTime < hls.liveSyncPosition - 8) {
+            console.log(`[HLS ${videoId}] too far behind live edge, jumping`);
+            video.currentTime = hls.liveSyncPosition;
+        }
+    }, 5000);
 }
 startLive('ch1', '/public/ch1.m3u8');
 

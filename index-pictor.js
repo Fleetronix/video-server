@@ -115,25 +115,31 @@ http.createServer((req, res) => {
 // We wrap raw frames in MPEG-TS packets and feed to FFmpeg which transcodes
 // AVS → H.264 for browser-compatible HLS output.
 function startFFmpeg(channel) {
-    const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
-        '-fflags',          '+genpts+discardcorrupt+igndts',
-        '-err_detect',      'ignore_err',
-        '-f',               'mpegts',
-        '-probesize',       '500000',
-        '-analyzeduration', '1000000',
-        '-i',               'pipe:0',
-        '-c:v',             'libx264',
-        '-preset',          'ultrafast',
-        '-tune',            'zerolatency',
-        '-g',               '50',
-        '-keyint_min',      '25',
-        '-f',               'hls',
-        '-hls_time',        '1',
-        '-hls_list_size',   '3',
-        '-hls_flags',       'delete_segments+append_list',
-        '-hls_segment_filename', `./public/ch${channel}_%03d.ts`,
-        `./public/ch${channel}.m3u8`,
-    ]);
+        const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
+            '-fflags',          '+genpts+discardcorrupt+igndts+flush_packets',
+            '-err_detect',      'ignore_err',
+            '-f',               'mpegts',
+            '-probesize',       '2000000',
+            '-analyzeduration', '3000000',
+            '-i',               'pipe:0',
+            '-c:v',             'libx264',
+            '-preset',          'ultrafast',
+            '-tune',            'zerolatency',
+            '-profile:v',       'baseline',
+            '-level',           '3.1',
+            '-g',               '15',
+            '-keyint_min',      '15',
+            '-sc_threshold',    '0',
+            '-bufsize',         '1000k',
+            '-maxrate',         '1500k',
+            '-f',               'hls',
+            '-hls_time',        '1',
+            '-hls_list_size',   '4',
+            '-hls_flags',       'delete_segments+append_list+independent_segments',
+            '-hls_segment_type','mpegts',
+            '-hls_segment_filename', `./public/ch${channel}_%03d.ts`,
+            `./public/ch${channel}.m3u8`,
+        ]);
 
     ffmpeg.stderr.on('data', d => {
         const msg = d.toString().trim();
@@ -144,7 +150,15 @@ function startFFmpeg(channel) {
 
     ffmpeg.on('close', code => {
         console.log(`[FFmpeg ch${channel}] closed (code ${code}), restarting in 1s...`);
+        channels[channel].gotIFrame = false;
+        patPmtSent = false;
+        tsCounter  = 0;
         setTimeout(() => { channels[channel].ffmpeg = startFFmpeg(channel); }, 1000);
+    });
+ 
+    // Prevent stdin buffer from growing unbounded if FFmpeg falls behind
+    ffmpeg.stdin.on('error', err => {
+        if (err.code !== 'EPIPE') console.error(`[FFmpeg ch${channel}] stdin error:`, err.message);
     });
 
     return ffmpeg;
@@ -158,6 +172,13 @@ const channels = {
 const TS_PACKET_SIZE = 188;
 const VIDEO_PID      = 256;
 const PMT_PID        = 4096;
+
+// Set to 0x42 for AVS (Pictor / most Chinese cameras),
+//         0x1B for H.264 (some Acumen models),
+//         0x24 for H.265
+// Check Acumen spec or watch FFmpeg stderr for "Could not find codec"
+const STREAM_TYPE = parseInt(process.env.STREAM_TYPE || '0x42', 16);
+console.log(`[TS] Using PMT stream_type: 0x${STREAM_TYPE.toString(16).toUpperCase()}`);
 
 function buildPAT() {
     const pkt = Buffer.alloc(TS_PACKET_SIZE, 0xFF);
@@ -191,27 +212,47 @@ function buildPMT() {
     s[8]  = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
     s[9]  = VIDEO_PID & 0xFF;
     s[10] = 0xF0; s[11] = 0x00;
-    s[12] = 0x42;  // stream_type: AVS (0x42)
+    s[12] = STREAM_TYPE;  // configurable: 0x42=AVS, 0x1B=H.264, 0x24=H.265
     s[13] = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
     s[14] = VIDEO_PID & 0xFF;
     s[15] = 0xF0; s[16] = 0x00;
     return pkt;
 }
 
+ 
+// Wall-clock PTS base so timestamps are monotonically increasing
+let _ptsBase = null;
+const PTS_HZ = 90000; // MPEG PTS clock is 90 kHz
+ 
 function wrapFrameInTS(frameData, counter) {
-    const pesHdr = Buffer.from([
-        0x00, 0x00, 0x01,  // start code
-        0xE0,              // stream_id: video
-        0x00, 0x00,        // PES_packet_length = 0 (unbounded)
-        0x80,              // flags
-        0x00,              // PTS_DTS_flags = 0
-        0x00,              // header_data_length = 0
-    ]);
+    // Build a real PTS from elapsed time since first frame
+    if (_ptsBase === null) _ptsBase = Date.now();
+    const elapsedMs = Date.now() - _ptsBase;
+    const pts90     = BigInt(Math.round(elapsedMs * PTS_HZ / 1000));
+ 
+    // PES header with PTS (14 bytes total)
+    const pesHdr = Buffer.alloc(14);
+    pesHdr[0] = 0x00; pesHdr[1] = 0x00; pesHdr[2] = 0x01; // start code
+    pesHdr[3] = 0xE0;                                       // stream_id: video
+    pesHdr[4] = 0x00; pesHdr[5] = 0x00;                    // PES length = 0 (unbounded)
+    pesHdr[6] = 0x80;                                       // marker bits
+    pesHdr[7] = 0x80;                                       // PTS_DTS_flags = PTS only
+    pesHdr[8] = 0x05;                                       // header_data_length = 5
+ 
+    // PTS: 5-byte encoding per ISO 13818-1
+    // pts_32_30, marker, pts_29_15, marker, pts_14_0, marker
+    const pts = pts90 & 0x1FFFFFFFFn;
+    pesHdr[9]  = 0x21 | (Number((pts >> 29n) & 0x07n) << 1);
+    pesHdr[10] = Number((pts >> 22n) & 0xFFn);
+    pesHdr[11] = 0x01 | (Number((pts >> 14n) & 0x7Fn) << 1);
+    pesHdr[12] = Number((pts >> 7n)  & 0xFFn);
+    pesHdr[13] = 0x01 | (Number(pts  & 0x7Fn) << 1);
+ 
     const pes = Buffer.concat([pesHdr, frameData]);
-
+ 
     const packets = [];
     let pos = 0, first = true, ctr = counter;
-
+ 
     while (pos < pes.length) {
         const pkt = Buffer.alloc(TS_PACKET_SIZE, 0xFF);
         pkt[0] = 0x47;
@@ -219,7 +260,7 @@ function wrapFrameInTS(frameData, counter) {
         pkt[2] = VIDEO_PID & 0xFF;
         pkt[3] = 0x10 | (ctr & 0x0F);
         ctr    = (ctr + 1) & 0x0F;
-
+ 
         const room  = TS_PACKET_SIZE - 4;
         const chunk = pes.slice(pos, pos + room);
         chunk.copy(pkt, 4);
@@ -227,12 +268,14 @@ function wrapFrameInTS(frameData, counter) {
         first = false;
         packets.push(pkt);
     }
-
+ 
     return { packets, nextCounter: ctr };
 }
 
-let patPmtSent = false;
-let tsCounter  = 0;
+let patPmtSent  = false;
+let tsCounter   = 0;
+let frameCount  = 0;        // counts frames since last PAT+PMT injection
+const PAT_PMT_INTERVAL = 75; // inject every 75 frames (~3 s at 25 fps)
 
 // ── Handle one complete video frame ──────────────────────────────────────────
 function handleVideoFrame(frameData, channel, dataType) {
@@ -252,16 +295,22 @@ function handleVideoFrame(frameData, channel, dataType) {
 
     if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
 
-    if (!patPmtSent) {
+    if (!patPmtSent || frameCount % PAT_PMT_INTERVAL === 0) {
         ch.ffmpeg.stdin.write(buildPAT());
         ch.ffmpeg.stdin.write(buildPMT());
-        patPmtSent = true;
-        console.log(`ch${channel} 📺 Sent PAT+PMT (AVS stream type 0x42)`);
+        if (!patPmtSent) {
+            patPmtSent = true;
+            console.log(`ch${channel} 📺 Sent PAT+PMT (AVS stream type 0x42)`);
+        }
     }
-
+    frameCount++;
+ 
     const { packets, nextCounter } = wrapFrameInTS(frameData, tsCounter);
     tsCounter = nextCounter;
-    for (const pkt of packets) ch.ffmpeg.stdin.write(pkt);
+    // Only write if stdin is not backed up (backpressure guard)
+    if (ch.ffmpeg.stdin.writable && !ch.ffmpeg.stdin.writableNeedDrain) {
+        for (const pkt of packets) ch.ffmpeg.stdin.write(pkt);
+    }
 }
 
 // ── Reassemble subpackets (T/98 §5.5.3) ─────────────────────────────────────
@@ -386,6 +435,8 @@ function parseAdditionalInfo(buf) {
 
 // ── TCP server ────────────────────────────────────────────────────────────────
 const tcpServer = net.createServer(socket => {
+    socket.setNoDelay(true);          // disable Nagle — send packets immediately
+    socket.setKeepAlive(true, 10000); // detect dead connections after 10 s
     const remote = `${socket.remoteAddress}:${socket.remotePort}`;
     console.log(`Device connected: ${remote}`);
     let buffer = Buffer.alloc(0);
