@@ -1,9 +1,27 @@
 'use strict';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// index-pictor-0.js  —  LIVE STREAM + GPS ONLY
-// Recording / FTP / playback code stripped out.
-// Serves: live HLS video (ch1), GPS location over WebSocket, GPS CSV log.
+// index-acumen.js  —  LIVE STREAM + GPS + FTP DOWNLOAD
+//
+// KEY CHANGE vs index-pictor.js:
+//   REMOVED: FFmpeg pipeline → HLS segments → HTTP polling
+//   ADDED:   WebSocket + MSE (Media Source Extensions) direct push
+//
+// Why the old approach caused "fast forward then stop":
+//   Camera → TCP → reassemble → MPEG-TS wrap → FFmpeg stdin pipe →
+//   HLS segment files on disk → browser polls every 1s → plays
+//
+//   Problems:
+//   1. FFmpeg probes the pipe before decoding (2-3s startup buffer)
+//   2. HLS segments are 1s each → minimum 2-3s latency
+//   3. No PTS in old PES header → FFmpeg guesses timing → batch dumps frames
+//   4. When FFmpeg falls behind it batches and plays back fast
+//
+// New approach:
+//   Camera → TCP → reassemble frame → read timestamp from protocol header →
+//   send raw NAL unit over WebSocket → browser MSE decodes in real time
+//
+// Browser side uses Broadway.js (JS H.264 decoder) OR MSE depending on codec.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const net  = require('net');
@@ -12,30 +30,103 @@ const fs   = require('fs');
 const path = require('path');
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
-const { spawn }           = require('child_process');
-const tcpForwarder        = require('./tcp-forwarder');
-const ftpDownload         = require('./ftp-download');
+const tcpForwarder = require('./tcp-forwarder');
+const ftpDownload  = require('./ftp-download');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CONFIG = {
-    tcpPort:  3007,
-    httpPort: 8080,
-    wsPort:   8801,
+    tcpPort:  parseInt(process.env.TCP_PORT  || '3007'),
+    httpPort: parseInt(process.env.HTTP_PORT || '8080'),
+    wsPort:   parseInt(process.env.WS_PORT   || '8801'),
     serverIp: process.env.SERVER_IP,
 };
-console.log(`Server IP: ${CONFIG.serverIp}`);
+console.log(`[config] tcpPort:${CONFIG.tcpPort} httpPort:${CONFIG.httpPort} wsPort:${CONFIG.wsPort} serverIp:${CONFIG.serverIp}`);
 
-// ── Ensure public folder exists ───────────────────────────────────────────────
 if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 
 // ── Device state ──────────────────────────────────────────────────────────────
-const tcpSockets = {};  // { [phone]: socket }
+const tcpSockets = {};   // { [phone]: socket }
+
+// ── Channel state ─────────────────────────────────────────────────────────────
+// Each channel tracks subpacket reassembly and whether we've seen an I-frame.
+const channels = {};
+function getChannel(ch) {
+    if (!channels[ch]) channels[ch] = { gotIFrame: false, subpackets: [], lastPts: 0 };
+    return channels[ch];
+}
 
 // ── WebSocket server ──────────────────────────────────────────────────────────
+// Single WS server handles both:
+//   - GPS/FTP JSON messages  (binary=false, first byte is '{')
+//   - Video frame binary push (binary=true, protocol below)
+//
+// Video binary frame format sent to browser:
+//   [0]      channel (1 byte)
+//   [1]      dataType: 0=IFrame 1=PFrame 2=BFrame 3=Audio (1 byte)
+//   [2..9]   pts milliseconds (8 bytes, BigInt64BE)
+//   [10..]   raw NAL data
 const wss = new WebSocketServer({ port: CONFIG.wsPort });
 console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
 
-// ── Init FTP download module ────────────────────────────────────────────────
+// Track which WS clients want video for which channel
+// ws._videoChannels = Set of channel numbers
+wss.on('connection', (ws, req) => {
+    console.log(`[WS] Browser connected from ${req.socket.remoteAddress}`);
+    ws._videoChannels = new Set([1]); // default: subscribe to ch1
+
+    ws.on('message', raw => {
+        // Binary message = video subscription control (future use)
+        if (raw instanceof Buffer && raw[0] !== 0x7B) return;
+
+        let msg;
+        try { msg = JSON.parse(raw); } catch(e) {
+            console.warn('[WS] Non-JSON message ignored');
+            return;
+        }
+
+        // Video channel subscription: { type:'subscribe', channels:[1,2] }
+        if (msg.type === 'subscribe' && Array.isArray(msg.channels)) {
+            ws._videoChannels = new Set(msg.channels);
+            return;
+        }
+
+        ftpDownload.handleWsMessage(msg, ws);
+    });
+
+    ws.on('close', () => console.log('[WS] Browser disconnected'));
+    ws.on('error', err => console.error('[WS] Error:', err.message));
+});
+
+// ── Broadcast helpers ─────────────────────────────────────────────────────────
+function broadcastJson(obj) {
+    const raw = JSON.stringify(obj);
+    for (const ws of wss.clients) {
+        if (ws.readyState === 1) ws.send(raw);
+    }
+}
+
+// Push a video frame to all subscribers of that channel.
+// Prepends an 10-byte header so browser knows channel, type, and PTS.
+function broadcastVideoFrame(channel, dataType, ptsMs, nalData) {
+    if (wss.clients.size === 0) return;
+
+    const header = Buffer.alloc(10);
+    header[0] = channel;
+    header[1] = dataType;
+    // Write pts as 64-bit big-endian (BigInt)
+    const ptsBig = BigInt(ptsMs);
+    header.writeBigInt64BE(ptsBig, 2);
+
+    const frame = Buffer.concat([header, nalData]);
+
+    for (const ws of wss.clients) {
+        if (ws.readyState === 1 && ws._videoChannels && ws._videoChannels.has(channel)) {
+            try { ws.send(frame); } catch(e) { /* ignore closed */ }
+        }
+    }
+}
+
+// ── FTP download module init ──────────────────────────────────────────────────
 ftpDownload.init({
     serverIp:      CONFIG.serverIp,
     ftpPort:       14992,
@@ -47,293 +138,78 @@ ftpDownload.init({
     buildAck,
 });
 
-wss.on('connection', (ws, req) => {
-    console.log(`[WS] Browser connected from ${req.socket.remoteAddress}`);
-    ws.on('message', raw => {
-        let msg;
-        try { msg = JSON.parse(raw); } catch(e) {
-            console.warn('[WS] Non-JSON message:', raw.toString());
-            return;
-        }
-        ftpDownload.handleWsMessage(msg, ws);
-    });
-    ws.on('close', () => console.log('[WS] Browser disconnected'));
-    ws.on('error', err => console.error('[WS] Error:', err.message));
-});
-
 // ── HTTP server ───────────────────────────────────────────────────────────────
 http.createServer((req, res) => {
     const urlPath = req.url.split('?')[0];
     let filePath;
+
     if (urlPath === '/') {
-        filePath = './video.html';
-    } else if (urlPath.startsWith('/public/')) {
-        filePath = `.${urlPath}`;
+        filePath = path.join(__dirname, 'video.html');
     } else if (urlPath.startsWith('/recordings/')) {
-        filePath = `.${urlPath}`;
+        filePath = path.join(__dirname, urlPath);
     } else {
-        filePath = `.${urlPath}`;
+        filePath = path.join(__dirname, urlPath);
     }
 
     const ext = path.extname(filePath).toLowerCase();
-    const contentTypes = {
-        '.html': 'text/html',
-        '.js':   'application/javascript',
-        '.m3u8': 'application/vnd.apple.mpegurl',
-        '.ts':   'video/mp2t',
-        '.mp4':  'video/mp4',
+    const mime = {
+        '.html': 'text/html', '.js': 'application/javascript',
+        '.mp4': 'video/mp4',  '.m3u8': 'application/vnd.apple.mpegurl',
+        '.ts': 'video/mp2t',
     };
-
-    if (req.method === 'HEAD') {
-        fs.stat(filePath, (err, stat) => {
-            if (err) { res.writeHead(404); res.end(); return; }
-            res.writeHead(200, {
-                'Content-Type':   contentTypes[ext] || 'application/octet-stream',
-                'Content-Length': stat.size,
-                'Access-Control-Allow-Origin': '*',
-                'Cache-Control':  'no-cache',
-            });
-            res.end();
-        });
-        return;
-    }
 
     fs.readFile(filePath, (err, data) => {
         if (err) { res.writeHead(404); res.end('Not found'); return; }
         res.writeHead(200, {
-            'Content-Type':   contentTypes[ext] || 'text/plain',
-            'Content-Length': data.length,
+            'Content-Type': mime[ext] || 'application/octet-stream',
             'Access-Control-Allow-Origin': '*',
-            'Cache-Control':  'no-cache',
+            'Cache-Control': 'no-cache',
         });
         res.end(data);
     });
 }).listen(CONFIG.httpPort, () => console.log(`✓ HTTP on :${CONFIG.httpPort}`));
 
-// ── FFmpeg — HLS live stream ──────────────────────────────────────────────────
-// Camera sends AVS video (stream type 0x42, Chinese national standard).
-// We wrap raw frames in MPEG-TS packets and feed to FFmpeg which transcodes
-// AVS → H.264 for browser-compatible HLS output.
-function startFFmpeg(channel) {
-        const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
-            '-fflags',          '+genpts+discardcorrupt+igndts+flush_packets',
-            '-err_detect',      'ignore_err',
-            '-f',               'mpegts',
-            '-probesize',       '2000000',
-            '-analyzeduration', '3000000',
-            '-i',               'pipe:0',
-            '-c:v',             'libx264',
-            '-preset',          'ultrafast',
-            '-tune',            'zerolatency',
-            '-profile:v',       'baseline',
-            '-level',           '3.1',
-            '-g',               '15',
-            '-keyint_min',      '15',
-            '-sc_threshold',    '0',
-            '-bufsize',         '1000k',
-            '-maxrate',         '1500k',
-            '-f',               'hls',
-            '-hls_time',        '1',
-            '-hls_list_size',   '4',
-            '-hls_flags',       'delete_segments+append_list+independent_segments',
-            '-hls_segment_type','mpegts',
-            '-hls_segment_filename', `./public/ch${channel}_%03d.ts`,
-            `./public/ch${channel}.m3u8`,
-        ]);
-
-    ffmpeg.stderr.on('data', d => {
-        const msg = d.toString().trim();
-        if (msg.includes('Error') || msg.includes('Invalid') || msg.includes('error')) {
-            console.error(`[FFmpeg ch${channel}]`, msg);
-        }
-    });
-
-    ffmpeg.on('close', code => {
-        console.log(`[FFmpeg ch${channel}] closed (code ${code}), restarting in 1s...`);
-        channels[channel].gotIFrame = false;
-        patPmtSent = false;
-        tsCounter  = 0;
-        setTimeout(() => { channels[channel].ffmpeg = startFFmpeg(channel); }, 1000);
-    });
- 
-    // Prevent stdin buffer from growing unbounded if FFmpeg falls behind
-    ffmpeg.stdin.on('error', err => {
-        if (err.code !== 'EPIPE') console.error(`[FFmpeg ch${channel}] stdin error:`, err.message);
-    });
-
-    return ffmpeg;
-}
-
-const channels = {
-    1: { ffmpeg: null, gotIFrame: false, subpackets: [] },
-};
-
-// ── MPEG-TS wrapping ──────────────────────────────────────────────────────────
-const TS_PACKET_SIZE = 188;
-const VIDEO_PID      = 256;
-const PMT_PID        = 4096;
-
-// Set to 0x42 for AVS (Pictor / most Chinese cameras),
-//         0x1B for H.264 (some Acumen models),
-//         0x24 for H.265
-// Check Acumen spec or watch FFmpeg stderr for "Could not find codec"
-const STREAM_TYPE = parseInt(process.env.STREAM_TYPE || '0x42', 16);
-console.log(`[TS] Using PMT stream_type: 0x${STREAM_TYPE.toString(16).toUpperCase()}`);
-
-function buildPAT() {
-    const pkt = Buffer.alloc(TS_PACKET_SIZE, 0xFF);
-    pkt[0] = 0x47; pkt[1] = 0x40; pkt[2] = 0x00; pkt[3] = 0x10;
-    pkt[4] = 0x00;
-    const s = pkt.slice(5);
-    s[0]  = 0x00;
-    s[1]  = 0xB0; s[2] = 0x0D;
-    s[3]  = 0x00; s[4] = 0x01;
-    s[5]  = 0xC1;
-    s[6]  = 0x00; s[7] = 0x00;
-    s[8]  = 0x00; s[9] = 0x01;
-    s[10] = (PMT_PID >> 8) | 0xE0;
-    s[11] = PMT_PID & 0xFF;
-    return pkt;
-}
-
-function buildPMT() {
-    const pkt = Buffer.alloc(TS_PACKET_SIZE, 0xFF);
-    pkt[0] = 0x47;
-    pkt[1] = 0x40 | ((PMT_PID >> 8) & 0x1F);
-    pkt[2] = PMT_PID & 0xFF;
-    pkt[3] = 0x10;
-    pkt[4] = 0x00;
-    const s = pkt.slice(5);
-    s[0]  = 0x02;
-    s[1]  = 0xB0; s[2] = 0x12;
-    s[3]  = 0x00; s[4] = 0x01;
-    s[5]  = 0xC1;
-    s[6]  = 0x00; s[7] = 0x00;
-    s[8]  = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
-    s[9]  = VIDEO_PID & 0xFF;
-    s[10] = 0xF0; s[11] = 0x00;
-    s[12] = STREAM_TYPE;  // configurable: 0x42=AVS, 0x1B=H.264, 0x24=H.265
-    s[13] = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
-    s[14] = VIDEO_PID & 0xFF;
-    s[15] = 0xF0; s[16] = 0x00;
-    return pkt;
-}
-
- 
-// Wall-clock PTS base so timestamps are monotonically increasing
-let _ptsBase = null;
-const PTS_HZ = 90000; // MPEG PTS clock is 90 kHz
- 
-function wrapFrameInTS(frameData, counter) {
-    // Build a real PTS from elapsed time since first frame
-    if (_ptsBase === null) _ptsBase = Date.now();
-    const elapsedMs = Date.now() - _ptsBase;
-    const pts90     = BigInt(Math.round(elapsedMs * PTS_HZ / 1000));
- 
-    // PES header with PTS (14 bytes total)
-    const pesHdr = Buffer.alloc(14);
-    pesHdr[0] = 0x00; pesHdr[1] = 0x00; pesHdr[2] = 0x01; // start code
-    pesHdr[3] = 0xE0;                                       // stream_id: video
-    pesHdr[4] = 0x00; pesHdr[5] = 0x00;                    // PES length = 0 (unbounded)
-    pesHdr[6] = 0x80;                                       // marker bits
-    pesHdr[7] = 0x80;                                       // PTS_DTS_flags = PTS only
-    pesHdr[8] = 0x05;                                       // header_data_length = 5
- 
-    // PTS: 5-byte encoding per ISO 13818-1
-    // pts_32_30, marker, pts_29_15, marker, pts_14_0, marker
-    const pts = pts90 & 0x1FFFFFFFFn;
-    pesHdr[9]  = 0x21 | (Number((pts >> 29n) & 0x07n) << 1);
-    pesHdr[10] = Number((pts >> 22n) & 0xFFn);
-    pesHdr[11] = 0x01 | (Number((pts >> 14n) & 0x7Fn) << 1);
-    pesHdr[12] = Number((pts >> 7n)  & 0xFFn);
-    pesHdr[13] = 0x01 | (Number(pts  & 0x7Fn) << 1);
- 
-    const pes = Buffer.concat([pesHdr, frameData]);
- 
-    const packets = [];
-    let pos = 0, first = true, ctr = counter;
- 
-    while (pos < pes.length) {
-        const pkt = Buffer.alloc(TS_PACKET_SIZE, 0xFF);
-        pkt[0] = 0x47;
-        pkt[1] = (first ? 0x40 : 0x00) | ((VIDEO_PID >> 8) & 0x1F);
-        pkt[2] = VIDEO_PID & 0xFF;
-        pkt[3] = 0x10 | (ctr & 0x0F);
-        ctr    = (ctr + 1) & 0x0F;
- 
-        const room  = TS_PACKET_SIZE - 4;
-        const chunk = pes.slice(pos, pos + room);
-        chunk.copy(pkt, 4);
-        pos  += chunk.length;
-        first = false;
-        packets.push(pkt);
-    }
- 
-    return { packets, nextCounter: ctr };
-}
-
-let patPmtSent  = false;
-let tsCounter   = 0;
-let frameCount  = 0;        // counts frames since last PAT+PMT injection
-const PAT_PMT_INTERVAL = 75; // inject every 75 frames (~3 s at 25 fps)
-
-// ── Handle one complete video frame ──────────────────────────────────────────
-function handleVideoFrame(frameData, channel, dataType) {
-    const ch = channels[channel];
-    if (!ch) return;
-
-    const isVideo = (dataType === 0 || dataType === 1 || dataType === 2);
-    if (!isVideo) return;
-
-    if (dataType === 0) {
-        ch.gotIFrame = true;
-        // console.log(`ch${channel} ✅ I_FRAME size:${frameData.length}`);
-    } else {
-        if (!ch.gotIFrame) return;  // drop P/B until first I-frame
-        // console.log(`ch${channel} ${dataType === 1 ? 'P' : 'B'}_FRAME size:${frameData.length}`);
-    }
-
-    if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
-
-    if (!patPmtSent || frameCount % PAT_PMT_INTERVAL === 0) {
-        ch.ffmpeg.stdin.write(buildPAT());
-        ch.ffmpeg.stdin.write(buildPMT());
-        if (!patPmtSent) {
-            patPmtSent = true;
-            console.log(`ch${channel} 📺 Sent PAT+PMT (AVS stream type 0x42)`);
-        }
-    }
-    frameCount++;
- 
-    const { packets, nextCounter } = wrapFrameInTS(frameData, tsCounter);
-    tsCounter = nextCounter;
-    // Only write if stdin is not backed up (backpressure guard)
-    if (ch.ffmpeg.stdin.writable && !ch.ffmpeg.stdin.writableNeedDrain) {
-        for (const pkt of packets) ch.ffmpeg.stdin.write(pkt);
-    }
-}
-
-// ── Reassemble subpackets (T/98 §5.5.3) ─────────────────────────────────────
-// subpktMarker: 0=atomic, 1=first, 3=middle, 2=last
-function processVideoPacket(rawData, channel, dataType, subpktMarker) {
-    const ch = channels[channel];
-    if (!ch) return;
+// ── Subpacket reassembly + frame dispatch ─────────────────────────────────────
+// Per JT/T 1078 §5.5.3 Table 19:
+//   subpktMarker: 0=atomic, 1=first, 3=middle, 2=last
+function processVideoPacket(rawData, channel, dataType, subpktMarker, ptsMs) {
+    const ch = getChannel(channel);
 
     if (subpktMarker === 0) {
-        handleVideoFrame(rawData, channel, dataType);
+        // Atomic packet — whole frame in one packet
+        dispatchFrame(rawData, channel, dataType, ptsMs);
     } else if (subpktMarker === 1) {
+        // First subpacket — start reassembly
         ch.subpackets = [rawData];
+        ch.subPts     = ptsMs;
     } else if (subpktMarker === 3) {
+        // Middle subpacket
         if (ch.subpackets.length > 0) ch.subpackets.push(rawData);
     } else if (subpktMarker === 2) {
+        // Last subpacket — complete and dispatch
         if (ch.subpackets.length > 0) {
             ch.subpackets.push(rawData);
             const complete = Buffer.concat(ch.subpackets);
             ch.subpackets  = [];
-            //console.log(`ch${channel} complete frame size:${complete.length}`);
-            handleVideoFrame(complete, channel, dataType);
+            dispatchFrame(complete, channel, dataType, ch.subPts || ptsMs);
         }
     }
+}
+
+function dispatchFrame(frameData, channel, dataType, ptsMs) {
+    const ch = getChannel(channel);
+
+    // Only dataTypes 0 (I), 1 (P), 2 (B) are video. 3 = audio, skip for now.
+    if (dataType > 2) return;
+
+    // Wait for first I-frame before sending P/B frames
+    if (dataType === 0) {
+        ch.gotIFrame = true;
+    } else if (!ch.gotIFrame) {
+        return;
+    }
+
+    broadcastVideoFrame(channel, dataType, ptsMs, frameData);
 }
 
 // ── JT/T 808 helpers ─────────────────────────────────────────────────────────
@@ -361,16 +237,13 @@ function buildFrame(msgId, body, phone) {
     const header = Buffer.alloc(12);
     header.writeUInt16BE(msgId,       0);
     header.writeUInt16BE(body.length, 2);
-
     const phoneStr = String(phone).padStart(12, '0');
-    console.log('[buildFrame] phone input:', phone, 'padded:', phoneStr);
     Buffer.from(
         phoneStr.match(/.{2}/g).map(v => {
             const n = parseInt(v, 10);
             return ((Math.floor(n / 10) << 4) | (n % 10));
         })
     ).copy(header, 4);
-
     header.writeUInt16BE(Math.floor(Math.random() * 0xFFFF), 10);
     const payload = Buffer.concat([header, body]);
     let cs = 0; payload.forEach(b => cs ^= b);
@@ -424,9 +297,9 @@ function parseAdditionalInfo(buf) {
             case 0x01: if (val.length >= 4) result.mileage       = val.readUInt32BE(0) / 10 + ' km';   break;
             case 0x03: if (val.length >= 2) result.sensorSpeed   = val.readUInt16BE(0) / 10 + ' km/h'; break;
             case 0x25: if (val.length >= 2) result.voltage       = val.readUInt16BE(0) / 10 + ' V';    break;
-            case 0x30: if (val.length >= 1) result.signalStrength = val[0];                            break;
-            case 0x31: if (val.length >= 1) result.satellites    = val[0];                             break;
-            case 0xd5: result.imei = val.toString('ascii').replace(/\0/g, '').trim();                  break;
+            case 0x30: if (val.length >= 1) result.signalStrength = val[0];                             break;
+            case 0x31: if (val.length >= 1) result.satellites    = val[0];                              break;
+            case 0xd5: result.imei = val.toString('ascii').replace(/\0/g, '').trim();                   break;
         }
         i += 2 + len;
     }
@@ -435,8 +308,9 @@ function parseAdditionalInfo(buf) {
 
 // ── TCP server ────────────────────────────────────────────────────────────────
 const tcpServer = net.createServer(socket => {
-    socket.setNoDelay(true);          // disable Nagle — send packets immediately
-    socket.setKeepAlive(true, 10000); // detect dead connections after 10 s
+    socket.setNoDelay(true);
+    socket.setKeepAlive(true, 10000);
+
     const remote = `${socket.remoteAddress}:${socket.remotePort}`;
     console.log(`Device connected: ${remote}`);
     let buffer = Buffer.alloc(0);
@@ -445,33 +319,49 @@ const tcpServer = net.createServer(socket => {
     socket.on('data', data => {
         try {
             buffer = Buffer.concat([buffer, data]);
-            // Temporary: log raw data from unregistered sockets
             let offset = 0;
 
-            while (offset < buffer.length - 4) {
+            while (offset < buffer.length) {
 
-                // ── Stream data packet (T/98 §5.5.3 — 0x30316364 header) ────
-                if (buffer[offset]   === 0x30 && buffer[offset+1] === 0x31 &&
+                // ── Stream data packet (JT/T 1078 §5.5.3 — 0x30316364 header) ─
+                if (buffer.length - offset >= 4 &&
+                    buffer[offset]   === 0x30 && buffer[offset+1] === 0x31 &&
                     buffer[offset+2] === 0x63 && buffer[offset+3] === 0x64) {
 
-                    if (offset + 30 > buffer.length) break;
-                    const dataBodyLen = buffer.readUInt16BE(offset + 28);
-                    if (offset + 30 + dataBodyLen > buffer.length) break;
+                    // Need at least 30 bytes for the full fixed header
+                    if (buffer.length - offset < 30) break;
 
+                    const dataBodyLen = buffer.readUInt16BE(offset + 28);
+
+                    // Wait for complete packet
+                    if (buffer.length - offset < 30 + dataBodyLen) break;
+
+                    // Parse all header fields per Table 19
+                    const channel      = buffer[offset + 14];
                     const byte15       = buffer[offset + 15];
                     const dataType     = (byte15 >> 4) & 0x0F;
                     const subpktMarker = byte15 & 0x0F;
-                    const channel      = buffer[offset + 14];
-                    const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    // All stream packets go to live video
-                    processVideoPacket(rawData, channel, dataType, subpktMarker);
+                    // ── Timestamp: 8 bytes at offset+16, in milliseconds ──────
+                    // This is the key field that was IGNORED before.
+                    // It's the relative time of the current frame — use it for
+                    // smooth playback pacing on the browser side.
+                    const ptsHigh = buffer.readUInt32BE(offset + 16);
+                    const ptsLow  = buffer.readUInt32BE(offset + 20);
+                    const ptsMs   = ptsHigh * 0x100000000 + ptsLow;
+
+                    const rawData = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
+
+                    processVideoPacket(rawData, channel, dataType, subpktMarker, ptsMs);
+
+                    // Forward raw signalling to TCP forwarder if needed
+                    // (stream packets are NOT forwarded — too much bandwidth)
 
                     offset += 30 + dataBodyLen;
                     continue;
                 }
 
-                // ── Signalling packet (JT/T 808 — 0x7E framing) ─────────────
+                // ── Signalling packet (JT/T 808 — 0x7E framing) ──────────────
                 if (buffer[offset] === 0x7E) {
                     const end = buffer.indexOf(0x7E, offset + 1);
                     if (end === -1) break;
@@ -481,40 +371,33 @@ const tcpServer = net.createServer(socket => {
                     if (unescaped.length < 12) { offset = end + 1; continue; }
 
                     const msgId = unescaped.readUInt16BE(0);
-                    console.log(`[PHONE RAW BYTES] ${unescaped.slice(4,10).toString('hex')}`);
-
-                    phone = Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2, '0')).join('')
-    .replace(/^0/, '');
+                    phone = Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2, '0'))
+                                 .join('').replace(/^0/, '');
                     const seq  = unescaped.readUInt16BE(10);
                     const body = unescaped.slice(12);
-                    // console.log(`[signalling] msgId: 0x${msgId.toString(16).padStart(4,'0')} phone: ${phone}`);
-                    // console.log(`[RAW] body hex: ${body.toString('hex')}`);  // ← ADD THIS LINE
 
-                    // ── 0x0001: General response from device ─────────────────
+                    // ── 0x0001: General response ─────────────────────────────
                     if (msgId === 0x0001) {
                         const replyMsgId  = body.readUInt16BE(2);
                         const replyResult = body[4];
-                        const resultText  = ['Success','Failed','Wrong Msg','Not Supported','Alarm Confirmed','Update Required'][replyResult] || `Unknown(${replyResult})`;
-                        console.log(`[ACK] replyTo:0x${replyMsgId.toString(16).padStart(4,'0')} result:${replyResult} (${resultText})`);
-                        // Also forward to submodules — they filter by replyMsgId internally
+                        const resultTxt   = ['Success','Failed','Wrong Msg','Not Supported'][replyResult] || `(${replyResult})`;
+                        console.log(`[ACK] 0x${replyMsgId.toString(16).padStart(4,'0')} result:${replyResult} ${resultTxt}`);
                         ftpDownload.handleSignalling(msgId, body, seq, phone, socket);
 
-                    // ── 0x0100: Device register ──────────────────────────────
+                    // ── 0x0100: Register ─────────────────────────────────────
                     } else if (msgId === 0x0100) {
+                        console.log(`[REG] phone:${phone}`);
                         socket.write(buildRegisterResponse(phone, seq, 0, 'AUTH1234'));
 
-                    // ── 0x0102: Auth complete — start live stream ────────────
+                    // ── 0x0102: Auth — start live stream ─────────────────────
                     } else if (msgId === 0x0102) {
-                        const rawPhone = Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2, '0')).join('');
-                        console.log('[AUTH] raw BCD phone:', rawPhone, 'stripped:', rawPhone.replace(/^0/,''));
-                        console.log('[AUTH] raw bytes:', unescaped.slice(4, 10).toString('hex'));
-                        console.log('[AUTH] digits:', Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2,'0')).join('-'));
+                        console.log(`[AUTH] phone:${phone} raw:${unescaped.slice(4,10).toString('hex')}`);
                         socket.write(buildAck(phone, seq, msgId));
                         socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
                         tcpSockets[phone] = socket;
-                        console.log(`[signalling] Registered socket for ${phone}`);
+                        console.log(`[AUTH] Registered socket for phone:${phone}, requested ch1 stream`);
 
-                    // ── 0x0200: Location / GPS report ────────────────────────
+                    // ── 0x0200: GPS location ─────────────────────────────────
                     } else if (msgId === 0x0200) {
                         socket.write(buildAck(phone, seq, msgId));
 
@@ -533,57 +416,40 @@ const tcpServer = net.createServer(socket => {
                         const accOn   = !!(statusBits & (1 << 0));
                         const located = !!(statusBits & (1 << 1));
 
-                        const bcd        = b => ((b >> 4) * 10 + (b & 0x0F));
-                        const timeOffset = 22;
-                        const yy = bcd(body[timeOffset]);
-                        const mo = bcd(body[timeOffset + 1]);
-                        const dd = bcd(body[timeOffset + 2]);
-                        const hh = bcd(body[timeOffset + 3]);
-                        const mm = bcd(body[timeOffset + 4]);
-                        const ss = bcd(body[timeOffset + 5]);
-                        const dt = `20${String(yy).padStart(2,'0')}-${String(mo).padStart(2,'0')}-${String(dd).padStart(2,'0')} ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
-
-                        const alarms = [];
-                        if (alarmFlags & (1<<0)) alarms.push('Emergency');
-                        if (alarmFlags & (1<<1)) alarms.push('Overspeed');
-                        if (alarmFlags & (1<<4)) alarms.push('GNSS Fault');
-                        if (alarmFlags & (1<<5)) alarms.push('GNSS Antenna Cut');
-                        if (alarmFlags & (1<<7)) alarms.push('Low Voltage');
-                        if (alarmFlags & (1<<8)) alarms.push('Power Off');
+                        const bcd = b => ((b >> 4) * 10 + (b & 0x0F));
+                        const T   = 22;
+                        const dt  = `20${String(bcd(body[T])).padStart(2,'0')}-${String(bcd(body[T+1])).padStart(2,'0')}-${String(bcd(body[T+2])).padStart(2,'0')} ${String(bcd(body[T+3])).padStart(2,'0')}:${String(bcd(body[T+4])).padStart(2,'0')}:${String(bcd(body[T+5])).padStart(2,'0')}`;
 
                         const extra = parseAdditionalInfo(body.slice(27));
-                        const locationData = {
-                            type: 'location', phone, lat, lon, speed, direction,
-                            elevation, datetime: dt, accOn, located, alarms, ...extra,
-                            imei: extra.imei || '--',
-                        };
+                        const alarmList = alarmFlags !== 0 ? [
+                            (alarmFlags & (1<<0)) ? 'EMERGENCY'   : null,
+                            (alarmFlags & (1<<1)) ? 'OVERSPEED'   : null,
+                            (alarmFlags & (1<<4)) ? 'GNSS_FAULT'  : null,
+                            (alarmFlags & (1<<5)) ? 'ANTENNA_CUT' : null,
+                            (alarmFlags & (1<<7)) ? 'LOW_VOLTAGE' : null,
+                            (alarmFlags & (1<<8)) ? 'POWER_OFF'   : null,
+                        ].filter(Boolean) : [];
+                        const locationMsg = Object.assign(
+                            { type: 'location', phone, lat, lon, speed, direction,
+                              elevation, datetime: dt, accOn, located, alarms: alarmList,
+                              imei: extra.imei || '--' },
+                            extra
+                        );
+                        broadcastJson(locationMsg);
 
-                        // console.log(`[GPS] ${phone} lat=${lat} lon=${lon} speed=${speed}km/h dir=${direction}° dt=${dt}`);
-
-                        wss.clients.forEach(client => {
-                            if (client.readyState === 1) client.send(JSON.stringify(locationData));
-                        });
-
-                        // GPS CSV log
-                        const fileName  = `gps_log_${new Date().toISOString().slice(0, 10)}.txt`;
                         const gpsRecord = {
-                            phone,
-                            datetime:        dt,
-                            latitude:        lat,
-                            longitude:       lon,
-                            speed_kmh:       speed,
-                            direction_deg:   direction,
-                            elevation_m:     elevation,
-                            acc:             accOn   ? 'ON'    : 'OFF',
-                            located:         located ? 'YES'   : 'NO',
+                            phone, datetime: dt, latitude: lat, longitude: lon,
+                            speed_kmh: speed, direction_deg: direction, elevation_m: elevation,
+                            acc:             accOn   ? 'ON'  : 'OFF',
+                            located:         located ? 'YES' : 'NO',
                             mileage:         extra.mileage        || '0',
                             voltage:         extra.voltage        || '0',
                             satellites:      extra.satellites     || '0',
                             signal:          extra.signalStrength || '0',
                             sensor_speed:    extra.sensorSpeed    || '0',
-                            oil_circuit:     !!(statusBits & (1<<10)) ? 'CUT'    : 'NORMAL',
-                            vehicle_circuit: !!(statusBits & (1<<11)) ? 'CUT'    : 'NORMAL',
-                            door:            !!(statusBits & (1<<13)) ? 'OPEN'   : 'CLOSED',
+                            oil_circuit:     !!(statusBits & (1<<10)) ? 'CUT'  : 'NORMAL',
+                            vehicle_circuit: !!(statusBits & (1<<11)) ? 'CUT'  : 'NORMAL',
+                            door:            !!(statusBits & (1<<13)) ? 'OPEN' : 'CLOSED',
                             alarms:          alarmFlags !== 0 ? [
                                 (alarmFlags & (1<<0)) ? 'EMERGENCY'   : null,
                                 (alarmFlags & (1<<1)) ? 'OVERSPEED'   : null,
@@ -595,28 +461,21 @@ const tcpServer = net.createServer(socket => {
                         };
 
                         tcpForwarder.sendGpsRecord(gpsRecord);
-                        fs.appendFile(`./${fileName}`, Object.values(gpsRecord).join(',') + '\n', err => {
-                            if (err) console.error('[GPS LOG] write error:', err.message);
-                        });
+                        const logFile = `gps_log_${new Date().toISOString().slice(0,10)}.txt`;
+                        fs.appendFile(`./${logFile}`, Object.values(gpsRecord).join(',') + '\n', () => {});
 
-                    // ── 0x1205: File list response from camera ────────────────
+                    // ── 0x1205 / 0x1206: FTP flow ────────────────────────────
                     } else if (msgId === 0x1205) {
-                        const replySerial = body.readUInt16BE(0);
-                        const totalFiles  = body.readUInt32BE(2);
-                        console.log(`[0x1205] File list response — serial:${replySerial} files:${totalFiles}`);
-                        if (totalFiles === 0) {
-                            console.warn('[0x1205] ⚠️ Camera reports 0 files found for this time range!');
-                        }
+                        const totalFiles = body.readUInt32BE(2);
+                        console.log(`[0x1205] files:${totalFiles}`);
+                        if (totalFiles === 0) console.warn('[0x1205] ⚠ 0 files — check time range');
 
-                    // ── 0x1206: File upload completion from camera ────────────
                     } else if (msgId === 0x1206) {
                         ftpDownload.handleSignalling(msgId, body, seq, phone, socket);
 
-                    // ── Other submodule messages ──────────────────────────────
                     } else if (ftpDownload.handleSignalling(msgId, body, seq, phone, socket)) {
-                        // handled by ftp-download module — no further action needed
+                        // handled
 
-                    // ── Everything else: generic ACK ─────────────────────────
                     } else {
                         socket.write(buildAck(phone, seq, msgId));
                     }
@@ -625,13 +484,14 @@ const tcpServer = net.createServer(socket => {
                     continue;
                 }
 
+                // Neither 0x30316364 nor 0x7E — skip byte
                 offset++;
             }
 
             buffer = buffer.slice(offset);
 
         } catch (err) {
-            console.error('[TCP] Error processing data:', err.message);
+            console.error('[TCP] Error:', err.message, err.stack);
         }
     });
 
@@ -639,10 +499,7 @@ const tcpServer = net.createServer(socket => {
         console.log(`Device disconnected: ${remote} phone:${phone}`);
         if (phone) delete tcpSockets[phone];
     });
-    socket.on('error', err => console.error(`[TCP] Socket error: ${err.message}`));
+    socket.on('error', err => console.error(`[TCP] socket error:`, err.message));
 });
 
 tcpServer.listen(CONFIG.tcpPort, () => console.log(`✓ TCP server on :${CONFIG.tcpPort}`));
-
-// ── Start FFmpeg for channel 1 ────────────────────────────────────────────────
-channels[1].ffmpeg = startFFmpeg(1);

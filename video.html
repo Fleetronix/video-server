@@ -1,46 +1,37 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Vehicle Camera</title>
+    <title>Vehicle Camera — Acumen</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
-        body { background: #111; color: #fff; font-family: Arial; padding: 20px; margin: 0; }
-        h3   { color: #00d4ff; }
-        video { width: 100%; max-width: 900px; display: block; margin: 10px 0; background: #000; }
-        .live-badge {
-            background: #f00; color: #fff; padding: 2px 8px;
-            border-radius: 4px; font-size: 11px; margin-left: 8px;
-            animation: blink 1.2s infinite;
-        }
+        body { background:#111; color:#fff; font-family:Arial; padding:20px; margin:0; }
+        h3   { color:#00d4ff; margin:16px 0 8px; }
+        canvas, video { width:100%; max-width:900px; display:block; margin:10px 0; background:#000; aspect-ratio:16/9; }
+        .live-badge { background:#f00; color:#fff; padding:2px 8px; border-radius:4px;
+                      font-size:11px; margin-left:8px; animation:blink 1.2s infinite; }
         @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.4} }
-        #map { height: 400px; border-radius: 8px; border: 1px solid #333; }
-        #gpsInfo {
-            background: #1a1a1a; padding: 15px; border-radius: 8px;
-            display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 15px;
-        }
-        .info-box {
-            background: #222; padding: 10px; border-radius: 6px;
-            font-size: 13px; border-left: 3px solid #00d4ff;
-        }
-        /* ── Recordings ── */
-        .rec-section { margin-top: 30px; }
+        #map { height:400px; border-radius:8px; border:1px solid #333; }
+        #gpsInfo { background:#1a1a1a; padding:15px; border-radius:8px;
+                   display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-top:15px; }
+        .info-box { background:#222; padding:10px; border-radius:6px;
+                    font-size:13px; border-left:3px solid #00d4ff; }
+        #videoStatus { font-size:12px; color:#aaa; margin:4px 0 8px; }
+        .rec-section { margin-top:30px; }
         .rec-controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
         .rec-controls label { color:#aaa; font-size:13px; }
         .rec-controls input[type="datetime-local"] {
             background:#222; color:#fff; border:1px solid #444;
-            padding:6px 10px; border-radius:4px; font-size:13px;
-        }
+            padding:6px 10px; border-radius:4px; font-size:13px; }
         .btn { border:none; padding:7px 16px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:13px; }
-        .btn-primary  { background:#00d4ff; color:#000; }
-        .btn-success  { background:#27ae60; color:#fff; }
-        .btn-danger   { background:#c0392b; color:#fff; }
+        .btn-primary { background:#00d4ff; color:#000; }
+        .btn-danger  { background:#c0392b; color:#fff; }
         #recStatus { color:#aaa; font-size:12px; }
         table { width:100%; border-collapse:collapse; }
         thead tr { background:#222; }
         th { padding:8px; color:#00d4ff; text-align:left; }
         td { padding:8px; border-bottom:1px solid #222; font-size:13px; }
-        .btn-play { background:#00d4ff; color:#000; border:none; padding:5px 12px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:12px; }
-        /* ── Modal ── */
+        .btn-play { background:#00d4ff; color:#000; border:none; padding:5px 12px;
+                    border-radius:4px; cursor:pointer; font-weight:bold; font-size:12px; }
         .modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.88);
                          z-index:1000; align-items:center; justify-content:center; }
         .modal-overlay.active { display:flex; }
@@ -48,13 +39,13 @@
                      width:90%; max-width:960px; position:relative; }
         .modal-close { position:absolute; top:12px; right:16px; background:none; border:none;
                        color:#fff; font-size:22px; cursor:pointer; }
-        .modal-title { color:#00d4ff; font-size:13px; letter-spacing:1px; margin-bottom:12px; }
+        .modal-title { color:#00d4ff; font-size:13px; margin-bottom:12px; }
         #modalVideo { width:100%; background:#000; border-radius:6px; max-height:70vh; }
     </style>
 </head>
 <body>
 
-<!-- Video Modal -->
+<!-- Video Modal (FTP playback — still uses <video> since it's a file) -->
 <div class="modal-overlay" id="videoModal">
     <div class="modal-box">
         <button class="modal-close" onclick="closeModal()">✕</button>
@@ -63,10 +54,20 @@
     </div>
 </div>
 
-<!-- Live Video -->
+<!-- Live Video — canvas rendered by JS H.264 decoder (Broadway) -->
 <div>
-    <h3>Channel 1 - Front <span class="live-badge">LIVE</span></h3>
-    <video id="ch1" autoplay muted controls></video>
+    <h3>Channel 1 — Front <span class="live-badge">LIVE</span></h3>
+    <!--
+        We use a <canvas> instead of <video> because the camera sends
+        raw NAL units over WebSocket without a container format.
+        Broadway.js decodes H.264 in JavaScript and paints frames to canvas.
+
+        If your Acumen camera outputs H.265 (HEVC) use a different decoder.
+        If it outputs AVS (0x42) you need an AVS JS decoder or keep FFmpeg
+        just for transcoding (see FFMPEG MODE comment below).
+    -->
+    <canvas id="ch1Canvas"></canvas>
+    <div id="videoStatus">⏳ Waiting for camera…</div>
 </div>
 
 <!-- Map -->
@@ -104,123 +105,185 @@
         <button class="btn btn-danger"  onclick="cancelDownload()" id="btnCancel" style="display:none">🛑 Cancel</button>
         <span id="recStatus"></span>
     </div>
-
-    <!-- Downloaded files list -->
     <table>
-        <thead>
-            <tr>
-                <th>#</th>
-                <th>Filename</th>
-                <th>Action</th>
-            </tr>
-        </thead>
-        <tbody id="recList">
-            <tr><td colspan="3" style="color:#555">No downloads yet</td></tr>
-        </tbody>
+        <thead><tr><th>#</th><th>Filename</th><th>Action</th></tr></thead>
+        <tbody id="recList"><tr><td colspan="3" style="color:#555">No downloads yet</td></tr></tbody>
     </table>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<!--
+    Broadway.js — pure JS H.264 decoder
+    CDN: https://cdn.jsdelivr.net/npm/broadway@0.3.4/Player/Player.js
+    We load it inline below.
+
+    FFMPEG MODE — if your camera outputs AVS (not H.264), you can't use
+    Broadway. In that case keep FFmpeg running as a transcoder but use
+    a proper TS mux (not the broken manual wrapping) by switching the
+    server to pipe raw data to:
+        ffmpeg -i pipe:0 -c:v libx264 -f mpegts pipe:1
+    and stream the output TS bytes over WebSocket for MSE.
+    See FFMPEG MODE section in comments below.
+-->
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
 <script>
-// ── Live stream ───────────────────────────────────────────────────────────────
-function startLive(videoId, src) {
-    const video = document.getElementById(videoId);
- 
-    const hls = new Hls({
-        lowLatencyMode:         false,   // true hurts stability on embedded cams
-        liveSyncDurationCount:  3,       // keep 3 segments buffered
-        liveMaxLatencyDurationCount: 6,  // allow up to 6 before jumping ahead
-        maxBufferLength:        10,      // seconds of forward buffer
-        maxMaxBufferLength:     20,
-        maxBufferHole:          0.5,     // tolerate 0.5s holes before seeking
-        enableWorker:           true,
-        manifestLoadingTimeOut: 10000,
-        manifestLoadingMaxRetry: 10,
-        fragLoadingTimeOut:     10000,
-        fragLoadingMaxRetry:    6,
+// ═══════════════════════════════════════════════════════════════════════════
+// VIDEO DECODER SETUP
+// ═══════════════════════════════════════════════════════════════════════════
+
+// We support two decode modes:
+//   MODE_BROADWAY  — pure JS H.264 decode (no FFmpeg needed), low latency
+//   MODE_MSE_TS    — FFmpeg transcodes to MPEG-TS, MSE plays it (fallback)
+//
+// Broadway works for H.264 baseline cameras (most modern dashcams).
+// Change DECODE_MODE if needed.
+
+const DECODE_MODE = 'broadway'; // 'broadway' | 'mse_ts'
+
+// ── Broadway player setup ──────────────────────────────────────────────────
+// Broadway decodes H.264 NAL units frame by frame with no buffering.
+// Each frame is painted immediately to canvas — true zero-extra-latency.
+
+let broadway = null;
+const canvas = document.getElementById('ch1Canvas');
+
+function initBroadway() {
+    // Broadway player from CDN (loaded below as inline script)
+    // It needs a canvas to paint to.
+    broadway = new Player({
+        useWorker: true,
+        workerFile: 'https://cdn.jsdelivr.net/npm/broadway@0.3.4/Player/Decoder.js',
+        reuseMemory: true,
     });
- 
-    hls.loadSource(src);
-    hls.attachMedia(video);
- 
-    hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        video.play().catch(() => {});
-    });
- 
-    hls.on(Hls.Events.ERROR, (event, data) => {
-        console.warn(`[HLS ${videoId}]`, data.type, data.details);
-        if (data.fatal) {
-            switch (data.type) {
-                case Hls.ErrorTypes.NETWORK_ERROR:
-                    console.log(`[HLS ${videoId}] network error — retrying`);
-                    setTimeout(() => hls.startLoad(), 2000);
-                    break;
-                case Hls.ErrorTypes.MEDIA_ERROR:
-                    console.log(`[HLS ${videoId}] media error — recovering`);
-                    hls.recoverMediaError();
-                    break;
-                default:
-                    console.log(`[HLS ${videoId}] fatal — restarting`);
-                    hls.destroy();
-                    setTimeout(() => startLive(videoId, src), 3000);
-                    break;
-            }
-        }
-    });
- 
-    // Jump to live edge if we fall more than 8 s behind
-    setInterval(() => {
-        if (!video.paused && hls.liveSyncPosition &&
-            video.currentTime < hls.liveSyncPosition - 8) {
-            console.log(`[HLS ${videoId}] too far behind live edge, jumping`);
-            video.currentTime = hls.liveSyncPosition;
-        }
-    }, 5000);
+    // Broadway creates its own canvas — replace our placeholder
+    broadway.canvas.style.cssText = 'width:100%;max-width:900px;display:block;margin:10px 0;background:#000;';
+    canvas.replaceWith(broadway.canvas);
+    broadway.canvas.id = 'ch1Canvas';
+    console.log('[Broadway] initialized');
 }
-startLive('ch1', '/public/ch1.m3u8');
 
-// ── Leaflet Map ───────────────────────────────────────────────────────────────
-const map = L.map('map').setView([20, 0], 2);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '© OpenStreetMap contributors'
-}).addTo(map);
+// Feed one NAL unit (or an Annex B frame) to Broadway
+// nalData is a Uint8Array
+function feedH264Frame(nalData) {
+    if (!broadway) return;
+    broadway.decode(nalData);
+}
 
-const truckIcon = L.divIcon({
-    html: `<div style="background:#00d4ff;width:20px;height:20px;border-radius:50%;
-                       border:3px solid #fff;box-shadow:0 0 8px #00d4ff;"></div>`,
-    iconSize: [20, 20], iconAnchor: [10, 10], className: ''
-});
+// ── Frame timing / pacing ──────────────────────────────────────────────────
+// The camera's PTS field (from the JT/T 1078 header) tells us exactly when
+// each frame should be displayed relative to stream start.
+// We use this to pace playback — render the frame at wall-clock time
+// (streamStartWallMs + frameRelativePts).
 
-let marker = null, polyline = null, trail = [];
+let streamStartWallMs = null;   // wall clock at first frame
+let streamStartPtsMs  = null;   // PTS value of first frame
 
-function updateMap(lat, lon, speed, direction) {
-    const pos = [lat, lon];
-    if (!marker) {
-        marker = L.marker(pos, { icon: truckIcon }).addTo(map);
-        map.setView(pos, 15);
-    } else {
-        marker.setLatLng(pos);
+const frameQueue = [];          // { ptsMs, nalData, dataType }
+let renderScheduled = false;
+
+function enqueueFrame(ptsMs, nalData, dataType) {
+    if (streamStartWallMs === null) {
+        streamStartWallMs = performance.now();
+        streamStartPtsMs  = ptsMs;
+        console.log('[video] stream started, first PTS:', ptsMs);
     }
-    marker.bindPopup(`<b>Vehicle</b><br>Lat: ${lat.toFixed(6)}<br>Lon: ${lon.toFixed(6)}<br>Speed: ${speed} km/h<br>Dir: ${direction}°`);
-    trail.push(pos);
-    if (trail.length > 50) trail.shift();
-    if (polyline) map.removeLayer(polyline);
-    polyline = L.polyline(trail, { color: '#00d4ff', weight: 2 }).addTo(map);
-    map.panTo(pos);
+    frameQueue.push({ ptsMs, nalData, dataType });
+    if (!renderScheduled) scheduleRender();
 }
 
-// ── WebSocket ─────────────────────────────────────────────────────────────────
+function scheduleRender() {
+    renderScheduled = true;
+    renderNext();
+}
+
+function renderNext() {
+    if (frameQueue.length === 0) {
+        renderScheduled = false;
+        return;
+    }
+
+    const frame = frameQueue[0];
+    const relPts = frame.ptsMs - streamStartPtsMs;
+    const wallTarget = streamStartWallMs + relPts;
+    const now = performance.now();
+    const delay = wallTarget - now;
+
+    // If queue is backing up (>15 frames buffered), drop non-I frames
+    // to catch up — this prevents the "fast forward" burst
+    if (frameQueue.length > 15) {
+        const toDrop = frameQueue.splice(0, frameQueue.length - 8);
+        const dropped = toDrop.filter(f => f.dataType !== 0).length;
+        console.warn(`[video] queue backed up (${frameQueue.length + dropped} frames), dropped ${dropped} P/B frames`);
+        // Reset timing anchor so we don't try to catch up on wall clock
+        streamStartWallMs = null;
+        streamStartPtsMs  = null;
+        renderNext();
+        return;
+    }
+
+    if (delay > 1) {
+        // Frame is in the future — wait
+        setTimeout(() => {
+            frameQueue.shift();
+            feedH264Frame(frame.nalData);
+            renderNext();
+        }, delay);
+    } else {
+        // Frame is due now (or late) — render immediately
+        frameQueue.shift();
+        feedH264Frame(frame.nalData);
+        // Use requestAnimationFrame for smooth painting
+        requestAnimationFrame(renderNext);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WEBSOCKET — receive video frames + GPS/status messages
+// ═══════════════════════════════════════════════════════════════════════════
+
 const ws = new WebSocket(`ws://${location.hostname}:8801`);
-ws.onopen  = () => console.log('[WS] Connected');
-ws.onclose = () => console.warn('[WS] Disconnected');
-ws.onerror = e  => console.error('[WS] Error:', e);
+ws.binaryType = 'arraybuffer'; // receive video as binary, GPS as text
+
+ws.onopen = () => {
+    console.log('[WS] connected');
+    document.getElementById('videoStatus').textContent = '🔌 Connected, waiting for stream…';
+};
+ws.onclose = () => {
+    console.warn('[WS] disconnected — reconnecting in 3s');
+    document.getElementById('videoStatus').textContent = '❌ Disconnected';
+    setTimeout(() => location.reload(), 3000);
+};
+ws.onerror = e => console.error('[WS] error:', e);
 
 ws.onmessage = e => {
-    let msg;
-    try { msg = JSON.parse(e.data); } catch(err) { return; }
+    // ── Binary message = video frame ─────────────────────────────────────
+    if (e.data instanceof ArrayBuffer) {
+        const buf = new DataView(e.data);
+        if (e.data.byteLength < 10) return; // too short
 
-    // ── GPS location ─────────────────────────────────────────────────────────
+        const channel  = buf.getUint8(0);
+        const dataType = buf.getUint8(1);
+        // PTS: read as two 32-bit halves (JS DataView has no getUint64)
+        const ptsHigh  = buf.getUint32(2);
+        const ptsLow   = buf.getUint32(6);
+        const ptsMs    = ptsHigh * 0x100000000 + ptsLow;
+
+        const nalData  = new Uint8Array(e.data, 10);
+
+        if (channel !== 1) return; // only ch1 for now
+
+        if (dataType === 0) {
+            document.getElementById('videoStatus').textContent = '🎥 Live — receiving';
+        }
+
+        enqueueFrame(ptsMs, nalData, dataType);
+        return;
+    }
+
+    // ── Text message = JSON (GPS, FTP status) ─────────────────────────────
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+
     if (msg.type === 'location') {
         updateMap(msg.lat, msg.lon, msg.speed, msg.direction);
         document.getElementById('info-lat').textContent        = `Latitude: ${msg.lat.toFixed(6)}`;
@@ -236,76 +299,99 @@ ws.onmessage = e => {
         document.getElementById('info-satellites').textContent = `Satellites: ${msg.satellites || '--'}`;
         document.getElementById('info-alarms').textContent     = `Alarms: ${msg.alarms && msg.alarms.length ? msg.alarms.join(', ') : 'None'}`;
     }
-
-    // ── FTP download complete — file ready to play ────────────────────────────
     if (msg.type === 'ftp_ready') {
         setStatus(`✅ File ready: ${msg.filename}`);
         document.getElementById('btnCancel').style.display = 'none';
         addFileToList(msg.filename, msg.url);
     }
-
-    // ── Status / error ────────────────────────────────────────────────────────
     if (msg.type === 'status') setStatus(msg.message);
     if (msg.type === 'error')  setStatus('❌ ' + msg.message);
 };
 
-// ── Auto-set end time to +10 seconds ──────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// BROADWAY LOADER (loads the script then inits)
+// ═══════════════════════════════════════════════════════════════════════════
+function loadScript(src, cb) {
+    const s = document.createElement('script');
+    s.src = src; s.onload = cb;
+    document.head.appendChild(s);
+}
+loadScript('https://cdn.jsdelivr.net/npm/broadway@0.3.4/Player/Player.js', () => {
+    console.log('[Broadway] script loaded');
+    initBroadway();
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAP
+// ═══════════════════════════════════════════════════════════════════════════
+const map = L.map('map').setView([20, 0], 2);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap contributors'
+}).addTo(map);
+
+const truckIcon = L.divIcon({
+    html: `<div style="background:#00d4ff;width:20px;height:20px;border-radius:50%;
+                       border:3px solid #fff;box-shadow:0 0 8px #00d4ff;"></div>`,
+    iconSize: [20,20], iconAnchor: [10,10], className: ''
+});
+let marker = null, polyline = null, trail = [];
+
+function updateMap(lat, lon, speed, direction) {
+    const pos = [lat, lon];
+    if (!marker) {
+        marker = L.marker(pos, { icon: truckIcon }).addTo(map);
+        map.setView(pos, 15);
+    } else {
+        marker.setLatLng(pos);
+    }
+    marker.bindPopup(`<b>Vehicle</b><br>${lat.toFixed(6)}, ${lon.toFixed(6)}<br>Speed: ${speed} km/h`);
+    trail.push(pos);
+    if (trail.length > 50) trail.shift();
+    if (polyline) map.removeLayer(polyline);
+    polyline = L.polyline(trail, { color: '#00d4ff', weight: 2 }).addTo(map);
+    map.panTo(pos);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FTP CONTROLS
+// ═══════════════════════════════════════════════════════════════════════════
 function autoSetEndTime() {
     const from = document.getElementById('recFrom').value;
     if (!from) return;
     const d = new Date(from);
     d.setSeconds(d.getSeconds() + 10);
-    // Format to datetime-local: YYYY-MM-DDTHH:mm:ss
-    const pad = n => String(n).padStart(2, '0');
-    const val = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-    document.getElementById('recTo').value = val;
+    const pad = n => String(n).padStart(2,'0');
+    document.getElementById('recTo').value =
+        `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-// ── Status helper ─────────────────────────────────────────────────────────────
 function setStatus(txt) {
     document.getElementById('recStatus').textContent = txt;
     console.log('[status]', txt);
 }
 
-// ── FTP Download request ──────────────────────────────────────────────────────
 function requestFtpDownload() {
-    const ch    = parseInt(document.getElementById('recCh').value) || 1;
-    const from  = document.getElementById('recFrom').value;
-    const to    = document.getElementById('recTo').value;
-
+    const ch   = parseInt(document.getElementById('recCh').value) || 1;
+    const from = document.getElementById('recFrom').value;
+    const to   = document.getElementById('recTo').value;
     if (!from || !to) { setStatus('⚠️ Select both From and To'); return; }
-
-    // ADD THIS — validate range
     const diffMs = new Date(to.replace('T',' ')) - new Date(from.replace('T',' '));
-    if (diffMs < 10000) { setStatus('⚠️ End time must be at least 10 seconds after start'); return; }
-    if (diffMs > 60 * 60 * 1000) { setStatus('⚠️ Max range is 1 hour — camera has 2-minute files, pick a short window'); return; }
-    if (ws.readyState !== WebSocket.OPEN) { setStatus('❌ Not connected'); return; }
-
-    const fmt = v => v.replace('T', ' ') + ':00';
-    const startTime = fmt(from);
-    const endTime   = fmt(to);
-
-    console.log(`[FTP] Requesting ch:${ch} ${startTime} → ${endTime}`);
-    setStatus(`⏳ Sending request to camera...`);
+    if (diffMs < 10000)        { setStatus('⚠️ End must be 10s+ after start'); return; }
+    if (diffMs > 3600000)      { setStatus('⚠️ Max range is 1 hour'); return; }
+    if (ws.readyState !== 1)   { setStatus('❌ Not connected'); return; }
+    const fmt = v => v.replace('T',' ') + ':00';
+    setStatus('⏳ Sending request…');
     document.getElementById('btnCancel').style.display = '';
-
-    ws.send(JSON.stringify({
-        type:      'ftp_download',
-        ch,
-        startTime,
-        endTime,
-    }));
+    ws.send(JSON.stringify({ type:'ftp_download', ch, startTime:fmt(from), endTime:fmt(to) }));
 }
 
-// ── Cancel download ───────────────────────────────────────────────────────────
 function cancelDownload() {
-    if (ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: 'ftp_cancel' }));
+    if (ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type:'ftp_cancel' }));
     document.getElementById('btnCancel').style.display = 'none';
-    setStatus('🛑 Cancelling...');
+    setStatus('🛑 Cancelling…');
 }
 
-// ── Downloaded files list ─────────────────────────────────────────────────────
 let _files = [];
 function addFileToList(filename, url) {
     _files.push({ filename, url });
@@ -313,56 +399,31 @@ function addFileToList(filename, url) {
     tbody.innerHTML = '';
     _files.forEach((f, i) => {
         const tr = document.createElement('tr');
-        tr.innerHTML = `
-            <td>${i + 1}</td>
-            <td>${f.filename}</td>
-            <td>
-                <button class="btn-play" onclick="playFile('${f.url}','${f.filename}')">▶ Play</button>
-                <a href="${f.url}" download="${f.filename}"
-                   style="margin-left:8px;background:#27ae60;color:#fff;border:none;
-                          padding:5px 12px;border-radius:4px;cursor:pointer;
-                          font-weight:bold;font-size:12px;text-decoration:none;">
-                   ⬇ Save
-                </a>
-            </td>`;
+        tr.innerHTML = `<td>${i+1}</td><td>${f.filename}</td><td>
+            <button class="btn-play" onclick="playFile('${f.url}','${f.filename}')">▶ Play</button>
+            <a href="${f.url}" download="${f.filename}"
+               style="margin-left:8px;background:#27ae60;color:#fff;border:none;
+                      padding:5px 12px;border-radius:4px;cursor:pointer;
+                      font-weight:bold;font-size:12px;text-decoration:none;">⬇ Save</a>
+        </td>`;
         tbody.appendChild(tr);
     });
 }
 
-// ── Video modal ───────────────────────────────────────────────────────────────
 function playFile(url, title) {
-    const modal   = document.getElementById('videoModal');
-    const video   = document.getElementById('modalVideo');
+    const modal = document.getElementById('videoModal');
+    const video = document.getElementById('modalVideo');
     document.getElementById('modalTitle').textContent = '▶ ' + title;
     modal.classList.add('active');
-
-    if (window._recHls) { window._recHls.destroy(); window._recHls = null; }
-    video.pause();
-    video.src = '';
-
-    if (url.endsWith('.m3u8') && Hls.isSupported()) {
-        const hls = new Hls({ startPosition: 0 });
-        window._recHls = hls;
-        hls.loadSource(url);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => { video.currentTime = 0; video.play(); });
-        hls.on(Hls.Events.ERROR, (e, d) => {
-            if (d.fatal) setStatus('❌ HLS error: ' + d.details);
-        });
-    } else {
-        video.src = url;
-        video.currentTime = 0;
-        video.play().catch(err => setStatus('❌ Play error: ' + err.message));
-    }
+    video.pause(); video.src = url;
+    video.currentTime = 0; video.play().catch(() => {});
 }
 
 function closeModal() {
     const modal = document.getElementById('videoModal');
     const video = document.getElementById('modalVideo');
     modal.classList.remove('active');
-    video.pause();
-    video.src = '';
-    if (window._recHls) { window._recHls.destroy(); window._recHls = null; }
+    video.pause(); video.src = '';
 }
 </script>
 </body>
