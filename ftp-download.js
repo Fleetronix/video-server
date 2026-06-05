@@ -187,8 +187,7 @@ function _build9207(phone, sessionId, control) {
     const body = Buffer.alloc(3);
     body.writeUInt16BE(sessionId & 0xFFFF, 0);
     body[2] = control;
-    // return _buildFrame(0x9207, body, phone);
-    return _buildFrame(0x9207, body, framePhone);
+    return _buildFrame(0x9207, body, _framePhone(phone));
 }
 
 // ── FTP server ────────────────────────────────────────────────────────────────
@@ -298,10 +297,20 @@ function _makeFtpHandler() {
                         reply(150, 'Here comes the directory listing');
                         const _sendListing = () => {
                             if (_pasvDataSocket) {
+                                const ds = _pasvDataSocket;
+                                _pasvDataSocket = null;
+                                // Must attach error handler BEFORE writing — camera closes
+                                // the data socket immediately after receiving data, which
+                                // causes ECONNRESET if Node is still reading. This was
+                                // crashing PM2.
+                                ds.on('error', err => {
+                                    if (err.code !== 'ECONNRESET') _warn(`LIST data socket: ${err.message}`);
+                                });
+                                let listing = '';
                                 try {
                                     const absDir  = path.join(_recordingsDir, currentDir);
                                     const entries = fs.readdirSync(absDir);
-                                    const listing = entries.map(name => {
+                                    listing = entries.map(name => {
                                         const full = path.join(absDir, name);
                                         const stat = fs.statSync(full);
                                         const isDir = stat.isDirectory();
@@ -312,13 +321,12 @@ function _makeFtpHandler() {
                                         const perms = isDir ? 'drwxr-xr-x' : '-rw-r--r--';
                                         return `${perms} 1 ftp ftp ${size} ${dateStr} ${name}`;
                                     }).join('\r\n') + '\r\n';
-                                    _pasvDataSocket.end(listing);
                                 } catch (e) {
                                     _warn(`LIST read error: ${e.message}`);
-                                    _pasvDataSocket.end('');
                                 }
-                                _pasvDataSocket = null;
-                                reply(226, 'Directory send OK');
+                                // Send 226 only AFTER data socket fully closes
+                                ds.on('close', () => reply(226, 'Directory send OK'));
+                                ds.end(listing);
                             } else {
                                 setTimeout(_sendListing, 100);
                             }
@@ -351,11 +359,20 @@ function _makeFtpHandler() {
                         const handleDataSocket = (s) => {
                             _log(`Piping data → ${uploadPath}`);
                             dataSocket = s;
-                            s.pipe(uploadStream);
+                            // Error handler must be attached before pipe to prevent
+                            // unhandled ECONNRESET if camera drops connection mid-upload
+                            s.on('error', err => {
+                                if (err.code !== 'ECONNRESET') _onError(err);
+                                else _warn('Data socket ECONNRESET during STOR (camera closed connection)');
+                            });
+                            uploadStream.on('error', err => _onError(err));
+                            // Use finish (not close) on the writeStream — called exactly once
                             uploadStream.on('finish', _onComplete);
-                            s.on('end', () => { uploadStream.end(); });
-                            s.on('close', () => { uploadStream.end(); });
-                            s.on('error', _onError);
+                            // end the writeStream when data socket signals end of data
+                            s.on('end', () => {
+                                if (!uploadStream.writableEnded) uploadStream.end();
+                            });
+                            s.pipe(uploadStream, { end: false }); // we control end manually above
                         };
 
                         if (_pasvDataSocket) {
