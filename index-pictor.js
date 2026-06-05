@@ -459,7 +459,7 @@ const tcpServer = net.createServer(socket => {
                         console.log('[AUTH] raw bytes:', unescaped.slice(4, 10).toString('hex'));
                         console.log('[AUTH] digits:', Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2,'0')).join('-'));
                         socket.write(buildAck(phone, seq, msgId));
-                        socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
+                        //socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
                         tcpSockets[phone] = socket;
                         console.log(`[signalling] Registered socket for ${phone}`);
 
