@@ -359,7 +359,7 @@ function buildVideoRequest(phone, serverIp, serverPort, channel) {
     body.writeUInt16BE(0,          3 + N);  // UDP port = 0 (TCP only)
     body[5 + N] = channel;
     body[6 + N] = 1;   // video only
-    body[7 + N] = 1;   // main stream
+    body[7 + N] = 0;   // main stream
     return buildFrame(0x9101, body, phone);
 }
 
