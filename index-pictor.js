@@ -1,9 +1,18 @@
 'use strict';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// index-pictor-0.js  —  LIVE STREAM + GPS ONLY
-// Recording / FTP / playback code stripped out.
-// Serves: live HLS video (ch1), GPS location over WebSocket, GPS CSV log.
+// index-pictor.js  —  LIVE STREAM + GPS
+//
+// Responsibilities:
+//   • TCP server  — accepts device connections, decodes JT/T 808 frames
+//   • Live HLS    — AVS video → FFmpeg → HLS segments
+//   • GPS         — parses 0x0200, broadcasts over WebSocket, logs CSV,
+//                   forwards to tcp-forwarder
+//   • Device bus  — emits events so ftp-service.js can send FTP commands
+//                   without being directly coupled to this file
+//
+// ftp-service.js runs as a SEPARATE process (node ftp-service.js).
+// They share device-bus.js as the only bridge.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const net  = require('net');
@@ -14,7 +23,7 @@ require('dotenv').config();
 const { WebSocketServer } = require('ws');
 const { spawn }           = require('child_process');
 const tcpForwarder        = require('./tcp-forwarder');
-const ftpDownload         = require('./ftp-download');
+const bus                 = require('./device-bus');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CONFIG = {
@@ -29,36 +38,26 @@ console.log(`Server IP: ${CONFIG.serverIp}`);
 if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 
 // ── Device state ──────────────────────────────────────────────────────────────
-const tcpSockets = {};  // { [phone]: socket }
+const tcpSockets = {};   // { [phone]: socket }
 
 // ── WebSocket server ──────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ port: CONFIG.wsPort });
 console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
 
-// ── Init FTP download module ────────────────────────────────────────────────
-ftpDownload.init({
-    serverIp:      CONFIG.serverIp,
-    ftpPort:       14992,
-    pasvDataPort:  14993,
-    recordingsDir: './recordings',
-    wss,
-    tcpSockets,
-    buildFrame,
-    buildAck,
-});
-
 wss.on('connection', (ws, req) => {
     console.log(`[WS] Browser connected from ${req.socket.remoteAddress}`);
-    ws.on('message', raw => {
-        let msg;
-        try { msg = JSON.parse(raw); } catch(e) {
-            console.warn('[WS] Non-JSON message:', raw.toString());
-            return;
-        }
-        ftpDownload.handleWsMessage(msg, ws);
-    });
     ws.on('close', () => console.log('[WS] Browser disconnected'));
     ws.on('error', err => console.error('[WS] Error:', err.message));
+});
+
+// ── Bus: ftp-service sends frames back through the bus ────────────────────────
+bus.on('device:send', ({ phone, frame }) => {
+    const socket = tcpSockets[String(phone)];
+    if (!socket || socket.destroyed) {
+        console.warn(`[BUS] device:send — no socket for phone:${phone}`);
+        return;
+    }
+    socket.write(frame);
 });
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
@@ -111,9 +110,6 @@ http.createServer((req, res) => {
 }).listen(CONFIG.httpPort, () => console.log(`✓ HTTP on :${CONFIG.httpPort}`));
 
 // ── FFmpeg — HLS live stream ──────────────────────────────────────────────────
-// Camera sends AVS video (stream type 0x42, Chinese national standard).
-// We wrap raw frames in MPEG-TS packets and feed to FFmpeg which transcodes
-// AVS → H.264 for browser-compatible HLS output.
 function startFFmpeg(channel) {
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
         '-fflags',          '+genpts+discardcorrupt+igndts',
@@ -191,7 +187,7 @@ function buildPMT() {
     s[8]  = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
     s[9]  = VIDEO_PID & 0xFF;
     s[10] = 0xF0; s[11] = 0x00;
-    s[12] = 0x42;  // stream_type: AVS (0x42)
+    s[12] = 0x42;  // stream_type: AVS
     s[13] = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
     s[14] = VIDEO_PID & 0xFF;
     s[15] = 0xF0; s[16] = 0x00;
@@ -200,12 +196,12 @@ function buildPMT() {
 
 function wrapFrameInTS(frameData, counter) {
     const pesHdr = Buffer.from([
-        0x00, 0x00, 0x01,  // start code
-        0xE0,              // stream_id: video
-        0x00, 0x00,        // PES_packet_length = 0 (unbounded)
-        0x80,              // flags
-        0x00,              // PTS_DTS_flags = 0
-        0x00,              // header_data_length = 0
+        0x00, 0x00, 0x01,
+        0xE0,
+        0x00, 0x00,
+        0x80,
+        0x00,
+        0x00,
     ]);
     const pes = Buffer.concat([pesHdr, frameData]);
 
@@ -234,7 +230,6 @@ function wrapFrameInTS(frameData, counter) {
 let patPmtSent = false;
 let tsCounter  = 0;
 
-// ── Handle one complete video frame ──────────────────────────────────────────
 function handleVideoFrame(frameData, channel, dataType) {
     const ch = channels[channel];
     if (!ch) return;
@@ -244,10 +239,8 @@ function handleVideoFrame(frameData, channel, dataType) {
 
     if (dataType === 0) {
         ch.gotIFrame = true;
-        // console.log(`ch${channel} ✅ I_FRAME size:${frameData.length}`);
     } else {
-        if (!ch.gotIFrame) return;  // drop P/B until first I-frame
-        // console.log(`ch${channel} ${dataType === 1 ? 'P' : 'B'}_FRAME size:${frameData.length}`);
+        if (!ch.gotIFrame) return;
     }
 
     if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
@@ -256,7 +249,7 @@ function handleVideoFrame(frameData, channel, dataType) {
         ch.ffmpeg.stdin.write(buildPAT());
         ch.ffmpeg.stdin.write(buildPMT());
         patPmtSent = true;
-        console.log(`ch${channel} 📺 Sent PAT+PMT (AVS stream type 0x42)`);
+        console.log(`ch${channel} 📺 Sent PAT+PMT`);
     }
 
     const { packets, nextCounter } = wrapFrameInTS(frameData, tsCounter);
@@ -264,8 +257,6 @@ function handleVideoFrame(frameData, channel, dataType) {
     for (const pkt of packets) ch.ffmpeg.stdin.write(pkt);
 }
 
-// ── Reassemble subpackets (T/98 §5.5.3) ─────────────────────────────────────
-// subpktMarker: 0=atomic, 1=first, 3=middle, 2=last
 function processVideoPacket(rawData, channel, dataType, subpktMarker) {
     const ch = channels[channel];
     if (!ch) return;
@@ -281,7 +272,6 @@ function processVideoPacket(rawData, channel, dataType, subpktMarker) {
             ch.subpackets.push(rawData);
             const complete = Buffer.concat(ch.subpackets);
             ch.subpackets  = [];
-            //console.log(`ch${channel} complete frame size:${complete.length}`);
             handleVideoFrame(complete, channel, dataType);
         }
     }
@@ -356,7 +346,7 @@ function buildVideoRequest(phone, serverIp, serverPort, channel) {
     body[0] = N;
     ipBuf.copy(body, 1);
     body.writeUInt16BE(serverPort, 1 + N);
-    body.writeUInt16BE(0,          3 + N);  // UDP port = 0 (TCP only)
+    body.writeUInt16BE(0,          3 + N);
     body[5 + N] = channel;
     body[6 + N] = 1;   // video only
     body[7 + N] = 1;   // main stream
@@ -375,9 +365,9 @@ function parseAdditionalInfo(buf) {
             case 0x01: if (val.length >= 4) result.mileage       = val.readUInt32BE(0) / 10 + ' km';   break;
             case 0x03: if (val.length >= 2) result.sensorSpeed   = val.readUInt16BE(0) / 10 + ' km/h'; break;
             case 0x25: if (val.length >= 2) result.voltage       = val.readUInt16BE(0) / 10 + ' V';    break;
-            case 0x30: if (val.length >= 1) result.signalStrength = val[0];                            break;
-            case 0x31: if (val.length >= 1) result.satellites    = val[0];                             break;
-            case 0xd5: result.imei = val.toString('ascii').replace(/\0/g, '').trim();                  break;
+            case 0x30: if (val.length >= 1) result.signalStrength = val[0];                             break;
+            case 0x31: if (val.length >= 1) result.satellites    = val[0];                              break;
+            case 0xd5: result.imei = val.toString('ascii').replace(/\0/g, '').trim();                   break;
         }
         i += 2 + len;
     }
@@ -394,12 +384,11 @@ const tcpServer = net.createServer(socket => {
     socket.on('data', data => {
         try {
             buffer = Buffer.concat([buffer, data]);
-            // Temporary: log raw data from unregistered sockets
             let offset = 0;
 
             while (offset < buffer.length - 4) {
 
-                // ── Stream data packet (T/98 §5.5.3 — 0x30316364 header) ────
+                // ── Stream data packet (T/98 §5.5.3 — 0x30316364 header) ─────
                 if (buffer[offset]   === 0x30 && buffer[offset+1] === 0x31 &&
                     buffer[offset+2] === 0x63 && buffer[offset+3] === 0x64) {
 
@@ -413,14 +402,13 @@ const tcpServer = net.createServer(socket => {
                     const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    // All stream packets go to live video
                     processVideoPacket(rawData, channel, dataType, subpktMarker);
 
                     offset += 30 + dataBodyLen;
                     continue;
                 }
 
-                // ── Signalling packet (JT/T 808 — 0x7E framing) ─────────────
+                // ── Signalling packet (JT/T 808 — 0x7E framing) ──────────────
                 if (buffer[offset] === 0x7E) {
                     const end = buffer.indexOf(0x7E, offset + 1);
                     if (end === -1) break;
@@ -433,37 +421,35 @@ const tcpServer = net.createServer(socket => {
                     console.log(`[PHONE RAW BYTES] ${unescaped.slice(4,10).toString('hex')}`);
 
                     phone = Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2, '0')).join('')
-    .replace(/^0/, '');
+                        .replace(/^0/, '');
                     const seq  = unescaped.readUInt16BE(10);
                     const body = unescaped.slice(12);
-                    // console.log(`[signalling] msgId: 0x${msgId.toString(16).padStart(4,'0')} phone: ${phone}`);
-                    // console.log(`[RAW] body hex: ${body.toString('hex')}`);  // ← ADD THIS LINE
 
-                    // ── 0x0001: General response from device ─────────────────
+                    // ── 0x0001: General response from device ──────────────────
                     if (msgId === 0x0001) {
                         const replyMsgId  = body.readUInt16BE(2);
                         const replyResult = body[4];
                         const resultText  = ['Success','Failed','Wrong Msg','Not Supported','Alarm Confirmed','Update Required'][replyResult] || `Unknown(${replyResult})`;
                         console.log(`[ACK] replyTo:0x${replyMsgId.toString(16).padStart(4,'0')} result:${replyResult} (${resultText})`);
-                        // Also forward to submodules — they filter by replyMsgId internally
-                        ftpDownload.handleSignalling(msgId, body, seq, phone, socket);
+                        // Forward to ftp-service for 0x9206 ack handling
+                        bus.emit('device:message', { msgId, body, seq, phone, socket });
 
-                    // ── 0x0100: Device register ──────────────────────────────
+                    // ── 0x0100: Device register ───────────────────────────────
                     } else if (msgId === 0x0100) {
                         socket.write(buildRegisterResponse(phone, seq, 0, 'AUTH1234'));
 
-                    // ── 0x0102: Auth complete — start live stream ────────────
+                    // ── 0x0102: Auth complete — start live stream ─────────────
                     } else if (msgId === 0x0102) {
                         const rawPhone = Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2, '0')).join('');
                         console.log('[AUTH] raw BCD phone:', rawPhone, 'stripped:', rawPhone.replace(/^0/,''));
-                        console.log('[AUTH] raw bytes:', unescaped.slice(4, 10).toString('hex'));
-                        console.log('[AUTH] digits:', Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2,'0')).join('-'));
                         socket.write(buildAck(phone, seq, msgId));
                         socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
                         tcpSockets[phone] = socket;
                         console.log(`[signalling] Registered socket for ${phone}`);
+                        // Notify ftp-service that this device is now available
+                        bus.emit('device:connected', { phone, socket });
 
-                    // ── 0x0200: Location / GPS report ────────────────────────
+                    // ── 0x0200: Location / GPS report ─────────────────────────
                     } else if (msgId === 0x0200) {
                         socket.write(buildAck(phone, seq, msgId));
 
@@ -507,13 +493,10 @@ const tcpServer = net.createServer(socket => {
                             imei: extra.imei || '--',
                         };
 
-                        // console.log(`[GPS] ${phone} lat=${lat} lon=${lon} speed=${speed}km/h dir=${direction}° dt=${dt}`);
-
                         wss.clients.forEach(client => {
                             if (client.readyState === 1) client.send(JSON.stringify(locationData));
                         });
 
-                        // GPS CSV log
                         const fileName  = `gps_log_${new Date().toISOString().slice(0, 10)}.txt`;
                         const gpsRecord = {
                             phone,
@@ -523,17 +506,17 @@ const tcpServer = net.createServer(socket => {
                             speed_kmh:       speed,
                             direction_deg:   direction,
                             elevation_m:     elevation,
-                            acc:             accOn   ? 'ON'    : 'OFF',
-                            located:         located ? 'YES'   : 'NO',
+                            acc:             accOn   ? 'ON'  : 'OFF',
+                            located:         located ? 'YES' : 'NO',
                             mileage:         extra.mileage        || '0',
                             voltage:         extra.voltage        || '0',
                             satellites:      extra.satellites     || '0',
                             signal:          extra.signalStrength || '0',
                             sensor_speed:    extra.sensorSpeed    || '0',
-                            oil_circuit:     !!(statusBits & (1<<10)) ? 'CUT'    : 'NORMAL',
-                            vehicle_circuit: !!(statusBits & (1<<11)) ? 'CUT'    : 'NORMAL',
-                            door:            !!(statusBits & (1<<13)) ? 'OPEN'   : 'CLOSED',
-                            alarms:          alarmFlags !== 0 ? [
+                            oil_circuit:     !!(statusBits & (1<<10)) ? 'CUT'  : 'NORMAL',
+                            vehicle_circuit: !!(statusBits & (1<<11)) ? 'CUT'  : 'NORMAL',
+                            door:            !!(statusBits & (1<<13)) ? 'OPEN' : 'CLOSED',
+                            alarms: alarmFlags !== 0 ? [
                                 (alarmFlags & (1<<0)) ? 'EMERGENCY'   : null,
                                 (alarmFlags & (1<<1)) ? 'OVERSPEED'   : null,
                                 (alarmFlags & (1<<4)) ? 'GNSS_FAULT'  : null,
@@ -548,24 +531,20 @@ const tcpServer = net.createServer(socket => {
                             if (err) console.error('[GPS LOG] write error:', err.message);
                         });
 
-                    // ── 0x1205: File list response from camera ────────────────
+                    // ── 0x1205: File list response ────────────────────────────
                     } else if (msgId === 0x1205) {
                         const replySerial = body.readUInt16BE(0);
                         const totalFiles  = body.readUInt32BE(2);
                         console.log(`[0x1205] File list response — serial:${replySerial} files:${totalFiles}`);
                         if (totalFiles === 0) {
-                            console.warn('[0x1205] ⚠️ Camera reports 0 files found for this time range!');
+                            console.warn('[0x1205] ⚠️ Camera reports 0 files for this time range');
                         }
 
-                    // ── 0x1206: File upload completion from camera ────────────
+                    // ── 0x1206: File upload completion — forward to ftp-service ─
                     } else if (msgId === 0x1206) {
-                        ftpDownload.handleSignalling(msgId, body, seq, phone, socket);
+                        bus.emit('device:message', { msgId, body, seq, phone, socket });
 
-                    // ── Other submodule messages ──────────────────────────────
-                    } else if (ftpDownload.handleSignalling(msgId, body, seq, phone, socket)) {
-                        // handled by ftp-download module — no further action needed
-
-                    // ── Everything else: generic ACK ─────────────────────────
+                    // ── Everything else: generic ACK ──────────────────────────
                     } else {
                         socket.write(buildAck(phone, seq, msgId));
                     }
@@ -579,14 +558,17 @@ const tcpServer = net.createServer(socket => {
 
             buffer = buffer.slice(offset);
 
-        } catch (err) {
-            console.error('[TCP] Error processing data:', err.message);
+        } catch (e) {
+            console.error('[TCP] Error processing data:', e.message);
         }
     });
 
     socket.on('close', () => {
         console.log(`Device disconnected: ${remote} phone:${phone}`);
-        if (phone) delete tcpSockets[phone];
+        if (phone) {
+            delete tcpSockets[phone];
+            bus.emit('device:disconnected', { phone });
+        }
     });
     socket.on('error', err => console.error(`[TCP] Socket error: ${err.message}`));
 });
