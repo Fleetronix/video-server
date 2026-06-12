@@ -81,13 +81,28 @@ function allocatePasvPort(phone) {
     return null;
 }
 
+// Allocate any free port regardless of phone
+function allocatePasvPortAny() {
+    for (const [portStr, slot] of Object.entries(_pasvPool)) {
+        if (!slot.inUse) {
+            slot.inUse = true;
+            return parseInt(portStr);
+        }
+    }
+    return null;
+}
+
 function freePasvPort(port) {
     const slot = _pasvPool[port];
     if (!slot) return;
-    slot.inUse       = false;
-    slot.phone       = null;
-    slot.dataSocket  = null;
-    slot.pendingStor = null;
+    // Only free if no active data transfer
+    if (!slot.dataSocket && !slot.pendingStor) {
+        slot.inUse       = false;
+        slot.phone       = null;
+        slot.dataSocket  = null;
+        slot.pendingStor = null;
+        log(`PASV port ${port} freed`);
+    }
 }
 
 // ── Logging ───────────────────────────────────────────────────────────────────
@@ -471,11 +486,13 @@ function makeFtpHandler(sessionPasvPort) {
                     }
 
                     case 'PASV': {
-                        // Allocate a fresh port for this FTP session
-                        if (!assignedPort) {
-                            const phone = _pasvPool[assignedPort]?.phone || 'unknown';
-                            assignedPort = allocatePasvPort(phone);
+                        // Free previous port if camera sends PASV twice
+                        if (assignedPort) {
+                            freePasvPort(assignedPort);
+                            assignedPort = null;
                         }
+                        // Allocate fresh port for this session
+                        assignedPort = allocatePasvPortAny();
                         if (!assignedPort) {
                             reply(421, 'No data ports available, try again later');
                             break;
