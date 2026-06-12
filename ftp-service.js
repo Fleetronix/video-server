@@ -578,8 +578,10 @@ function makeFtpHandler(sessionPasvPort) {
                                 url:      `/recordings/${relPath}`,
                                 filename: filename,
                             });
-                            if (assignedPort) freePasvPort(assignedPort);
-                            assignedPort = null;
+                            if (assignedPort) {
+                                freePasvPort(assignedPort);
+                                assignedPort = null;
+                            }
                         };
 
                         const handleData = (ds) => {
@@ -626,10 +628,14 @@ function makeFtpHandler(sessionPasvPort) {
             });
         });
 
-        ftpSock.on('close', () => {
+       ftpSock.on('close', () => {
             log('FTP control connection closed');
-            if (uploadStream) { try { uploadStream.end(); } catch (_) {} }
-            if (assignedPort) freePasvPort(assignedPort);
+            // Do NOT end uploadStream here — data socket may still be transferring
+            // The write stream will be ended by the data socket's 'end'/'close' events
+            // Only free PASV port after data is done
+            if (assignedPort && !_pasvPool[assignedPort]?.dataSocket) {
+                freePasvPort(assignedPort);
+            }
         });
         ftpSock.on('error', e => err('FTP control socket error:', e.message));
     };
