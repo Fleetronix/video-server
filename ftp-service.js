@@ -528,11 +528,17 @@ function makeFtpHandler(sessionPasvPort) {
 
                         if (!fs.existsSync(saveDir)) {
                             fs.mkdirSync(saveDir, { recursive: true });
-                            log(`STOR created folder: ${saveDir}`);
                         }
 
                         const filename   = path.basename(arg || `rec_${Date.now()}.mp4`);
                         const uploadPath = path.join(saveDir, filename);
+
+                        // ── Ignore duplicate STOR for same file ──────────────────────────
+                        if (fs.existsSync(uploadPath) && fs.statSync(uploadPath).size > 1024) {
+                            log(`STOR duplicate ignored — file already exists: ${filename}`);
+                            reply(125, 'Already received, skipping');
+                            break;
+                        }
                         uploadStream     = fs.createWriteStream(uploadPath);
                         log(`STOR → ${uploadPath}`);
                         reply(150, 'Ready to receive');
