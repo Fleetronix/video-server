@@ -1,18 +1,15 @@
 'use strict';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// index-pictor.js  —  LIVE STREAM + GPS
+// index-pictor.js  —  LIVE STREAM + GPS  (multi-camera)
 //
-// Responsibilities:
-//   • TCP server  — accepts device connections, decodes JT/T 808 frames
-//   • Live HLS    — AVS video → FFmpeg → HLS segments
-//   • GPS         — parses 0x0200, broadcasts over WebSocket, logs CSV,
-//                   forwards to tcp-forwarder
-//   • Device bus  — emits events so ftp-service.js can send FTP commands
-//                   without being directly coupled to this file
+// Each camera gets:
+//   • Its own FFmpeg process  → ./public/<phone>.m3u8
+//   • Its own HLS segments    → ./public/<phone>_NNN.ts
+//   • Its own GPS log         → ./gps_log_<phone>_<date>.txt
 //
-// ftp-service.js runs as a SEPARATE process (node ftp-service.js).
-// They share device-bus.js as the only bridge.
+// ftp-service.js runs in the same process via server.js (require both).
+// They communicate only through device-bus.js.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const net  = require('net');
@@ -27,34 +24,59 @@ const bus                 = require('./device-bus');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CONFIG = {
-    tcpPort:  3007,
-    httpPort: 8080,
-    wsPort:   8801,
+    tcpPort:  parseInt(process.env.TCP_PORT  || '3007'),
+    httpPort: parseInt(process.env.HTTP_PORT || '8080'),
+    wsPort:   parseInt(process.env.WS_PORT   || '8801'),
     serverIp: process.env.SERVER_IP,
 };
-console.log(`Server IP: ${CONFIG.serverIp}`);
+console.log(`[Pictor] Server IP: ${CONFIG.serverIp}`);
 
 // ── Ensure public folder exists ───────────────────────────────────────────────
 if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 
-// ── Device state ──────────────────────────────────────────────────────────────
+// ── Per-camera state ──────────────────────────────────────────────────────────
+// cameras[phone] = { ffmpeg, gotIFrame, subpackets, patPmtSent, tsCounter }
+const cameras    = {};
 const tcpSockets = {};   // { [phone]: socket }
+
+function getCamera(phone) {
+    if (!cameras[phone]) {
+        cameras[phone] = {
+            ffmpeg:     null,
+            gotIFrame:  false,
+            subpackets: [],
+            patPmtSent: false,
+            tsCounter:  0,
+        };
+    }
+    return cameras[phone];
+}
 
 // ── WebSocket server ──────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ port: CONFIG.wsPort });
-console.log(`✓ WebSocket on :${CONFIG.wsPort}`);
+console.log(`[Pictor] ✓ WebSocket on :${CONFIG.wsPort}`);
 
 wss.on('connection', (ws, req) => {
     console.log(`[WS] Browser connected from ${req.socket.remoteAddress}`);
+
+    // Send list of currently connected cameras immediately on connect
+    ws.send(JSON.stringify({
+        type:    'cameras',
+        cameras: Object.keys(tcpSockets),
+    }));
+
     ws.on('close', () => console.log('[WS] Browser disconnected'));
-    ws.on('error', err => console.error('[WS] Error:', err.message));
+    ws.on('error', e  => console.error('[WS] Error:', e.message));
 });
+
+function broadcast(obj) {
+    const raw = JSON.stringify(obj);
+    wss.clients.forEach(c => { if (c.readyState === 1) c.send(raw); });
+}
 
 // ── Bus: ftp-service sends frames back through the bus ────────────────────────
 bus.on('device:send', ({ phone, frame }) => {
-    console.log(`[BUS] device:send — phone:${phone} frame:${frame.length} bytes hex:${frame.toString('hex')}`);
     const socket = tcpSockets[String(phone)];
-    console.log(`[BUS] socket keys:`, Object.keys(tcpSockets));
     if (!socket || socket.destroyed) {
         console.warn(`[BUS] device:send — no socket for phone:${phone}`);
         return;
@@ -66,18 +88,25 @@ bus.on('device:send', ({ phone, frame }) => {
 // ── HTTP server ───────────────────────────────────────────────────────────────
 http.createServer((req, res) => {
     const urlPath = req.url.split('?')[0];
-    let filePath;
-    if (urlPath === '/') {
-        filePath = './video.html';
-    } else if (urlPath.startsWith('/public/')) {
-        filePath = `.${urlPath}`;
-    } else if (urlPath.startsWith('/recordings/')) {
-        filePath = `.${urlPath}`;
-    } else {
-        filePath = `.${urlPath}`;
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-cache');
+
+    // ── GET /api/cameras — list connected cameras ─────────────────────────────
+    if (req.method === 'GET' && urlPath === '/api/cameras') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            cameras: Object.keys(tcpSockets).map(phone => ({
+                phone,
+                stream: `/public/${phone}.m3u8`,
+            })),
+        }));
+        return;
     }
 
-    const ext = path.extname(filePath).toLowerCase();
+    // ── Static files ──────────────────────────────────────────────────────────
+    const filePath = urlPath === '/' ? './video.html' : `.${urlPath}`;
+    const ext      = path.extname(filePath).toLowerCase();
     const contentTypes = {
         '.html': 'text/html',
         '.js':   'application/javascript',
@@ -87,33 +116,34 @@ http.createServer((req, res) => {
     };
 
     if (req.method === 'HEAD') {
-        fs.stat(filePath, (err, stat) => {
-            if (err) { res.writeHead(404); res.end(); return; }
+        fs.stat(filePath, (e, stat) => {
+            if (e) { res.writeHead(404); res.end(); return; }
             res.writeHead(200, {
                 'Content-Type':   contentTypes[ext] || 'application/octet-stream',
                 'Content-Length': stat.size,
-                'Access-Control-Allow-Origin': '*',
-                'Cache-Control':  'no-cache',
             });
             res.end();
         });
         return;
     }
 
-    fs.readFile(filePath, (err, data) => {
-        if (err) { res.writeHead(404); res.end('Not found'); return; }
+    fs.readFile(filePath, (e, data) => {
+        if (e) { res.writeHead(404); res.end('Not found'); return; }
         res.writeHead(200, {
             'Content-Type':   contentTypes[ext] || 'text/plain',
             'Content-Length': data.length,
-            'Access-Control-Allow-Origin': '*',
-            'Cache-Control':  'no-cache',
         });
         res.end(data);
     });
-}).listen(CONFIG.httpPort, () => console.log(`✓ HTTP on :${CONFIG.httpPort}`));
 
-// ── FFmpeg — HLS live stream ──────────────────────────────────────────────────
-function startFFmpeg(channel) {
+}).listen(CONFIG.httpPort, '0.0.0.0', () =>
+    console.log(`[Pictor] ✓ HTTP on :${CONFIG.httpPort}`)
+);
+
+// ── FFmpeg — one instance per camera ─────────────────────────────────────────
+function startFFmpeg(phone) {
+    console.log(`[FFmpeg ${phone}] Starting...`);
+
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
         '-fflags',          '+genpts+discardcorrupt+igndts',
         '-err_detect',      'ignore_err',
@@ -130,28 +160,34 @@ function startFFmpeg(channel) {
         '-hls_time',        '1',
         '-hls_list_size',   '3',
         '-hls_flags',       'delete_segments+append_list',
-        '-hls_segment_filename', `./public/ch${channel}_%03d.ts`,
-        `./public/ch${channel}.m3u8`,
+        '-hls_segment_filename', `./public/${phone}_%03d.ts`,
+        `./public/${phone}.m3u8`,
     ]);
 
     ffmpeg.stderr.on('data', d => {
         const msg = d.toString().trim();
         if (msg.includes('Error') || msg.includes('Invalid') || msg.includes('error')) {
-            console.error(`[FFmpeg ch${channel}]`, msg);
+            console.error(`[FFmpeg ${phone}]`, msg);
         }
     });
 
     ffmpeg.on('close', code => {
-        console.log(`[FFmpeg ch${channel}] closed (code ${code}), restarting in 1s...`);
-        setTimeout(() => { channels[channel].ffmpeg = startFFmpeg(channel); }, 1000);
+        console.log(`[FFmpeg ${phone}] closed (code ${code})`);
+        // Only restart if camera is still connected
+        if (cameras[phone]) {
+            console.log(`[FFmpeg ${phone}] restarting in 1s...`);
+            cameras[phone].patPmtSent = false;
+            cameras[phone].gotIFrame  = false;
+            setTimeout(() => {
+                if (cameras[phone]) {
+                    cameras[phone].ffmpeg = startFFmpeg(phone);
+                }
+            }, 1000);
+        }
     });
 
     return ffmpeg;
 }
-
-const channels = {
-    1: { ffmpeg: null, gotIFrame: false, subpackets: [] },
-};
 
 // ── MPEG-TS wrapping ──────────────────────────────────────────────────────────
 const TS_PACKET_SIZE = 188;
@@ -230,52 +266,51 @@ function wrapFrameInTS(frameData, counter) {
     return { packets, nextCounter: ctr };
 }
 
-let patPmtSent = false;
-let tsCounter  = 0;
-
-function handleVideoFrame(frameData, channel, dataType) {
-    const ch = channels[channel];
-    if (!ch) return;
+// ── Handle one complete video frame — per camera ──────────────────────────────
+function handleVideoFrame(frameData, phone, dataType) {
+    const cam = cameras[phone];
+    if (!cam) return;
 
     const isVideo = (dataType === 0 || dataType === 1 || dataType === 2);
     if (!isVideo) return;
 
     if (dataType === 0) {
-        ch.gotIFrame = true;
+        cam.gotIFrame = true;
     } else {
-        if (!ch.gotIFrame) return;
+        if (!cam.gotIFrame) return;
     }
 
-    if (!ch.ffmpeg || !ch.ffmpeg.stdin.writable) return;
+    if (!cam.ffmpeg || !cam.ffmpeg.stdin.writable) return;
 
-    if (!patPmtSent) {
-        ch.ffmpeg.stdin.write(buildPAT());
-        ch.ffmpeg.stdin.write(buildPMT());
-        patPmtSent = true;
-        console.log(`ch${channel} 📺 Sent PAT+PMT`);
+    if (!cam.patPmtSent) {
+        cam.ffmpeg.stdin.write(buildPAT());
+        cam.ffmpeg.stdin.write(buildPMT());
+        cam.patPmtSent = true;
+        console.log(`[${phone}] 📺 Sent PAT+PMT`);
     }
 
-    const { packets, nextCounter } = wrapFrameInTS(frameData, tsCounter);
-    tsCounter = nextCounter;
-    for (const pkt of packets) ch.ffmpeg.stdin.write(pkt);
+    const { packets, nextCounter } = wrapFrameInTS(frameData, cam.tsCounter);
+    cam.tsCounter = nextCounter;
+    for (const pkt of packets) cam.ffmpeg.stdin.write(pkt);
 }
 
-function processVideoPacket(rawData, channel, dataType, subpktMarker) {
-    const ch = channels[channel];
-    if (!ch) return;
+// ── Reassemble subpackets — per camera ───────────────────────────────────────
+function processVideoPacket(rawData, phone, dataType, subpktMarker) {
+    const cam = cameras[phone];
+    if (!cam) return;
 
     if (subpktMarker === 0) {
-        handleVideoFrame(rawData, channel, dataType);
+        handleVideoFrame(rawData, phone, dataType);
     } else if (subpktMarker === 1) {
-        ch.subpackets = [rawData];
+        cam.subpackets = [rawData];
     } else if (subpktMarker === 3) {
-        if (ch.subpackets.length > 0) ch.subpackets.push(rawData);
+        if (cam.subpackets.length > 0) cam.subpackets.push(rawData);
     } else if (subpktMarker === 2) {
-        if (ch.subpackets.length > 0) {
-            ch.subpackets.push(rawData);
-            const complete = Buffer.concat(ch.subpackets);
-            ch.subpackets  = [];
-            handleVideoFrame(complete, channel, dataType);
+        if (cam.subpackets.length > 0) {
+            cam.subpackets.push(rawData);
+            const complete = Buffer.concat(cam.subpackets);
+            cam.subpackets = [];
+            handleVideoFrame(complete, phone, dataType);
         }
     }
 }
@@ -307,7 +342,6 @@ function buildFrame(msgId, body, phone) {
     header.writeUInt16BE(body.length, 2);
 
     const phoneStr = String(phone).padStart(12, '0');
-    console.log('[buildFrame] phone input:', phone, 'padded:', phoneStr);
     Buffer.from(
         phoneStr.match(/.{2}/g).map(v => {
             const n = parseInt(v, 10);
@@ -380,7 +414,7 @@ function parseAdditionalInfo(buf) {
 // ── TCP server ────────────────────────────────────────────────────────────────
 const tcpServer = net.createServer(socket => {
     const remote = `${socket.remoteAddress}:${socket.remotePort}`;
-    console.log(`Device connected: ${remote}`);
+    console.log(`[TCP] Device connected: ${remote}`);
     let buffer = Buffer.alloc(0);
     let phone  = null;
 
@@ -399,13 +433,19 @@ const tcpServer = net.createServer(socket => {
                     const dataBodyLen = buffer.readUInt16BE(offset + 28);
                     if (offset + 30 + dataBodyLen > buffer.length) break;
 
+                    // Extract phone from stream packet SIM field (bytes 8-13, BCD)
+                    const simBytes   = buffer.slice(offset + 8, offset + 14);
+                    const streamPhone = Array.from(simBytes, b =>
+                        b.toString(16).padStart(2, '0')).join('').replace(/^0+/, '');
+
                     const byte15       = buffer[offset + 15];
                     const dataType     = (byte15 >> 4) & 0x0F;
                     const subpktMarker = byte15 & 0x0F;
-                    const channel      = buffer[offset + 14];
                     const rawData      = buffer.slice(offset + 30, offset + 30 + dataBodyLen);
 
-                    processVideoPacket(rawData, channel, dataType, subpktMarker);
+                    // Route to correct camera by phone
+                    const camPhone = streamPhone || phone;
+                    if (camPhone) processVideoPacket(rawData, camPhone, dataType, subpktMarker);
 
                     offset += 30 + dataBodyLen;
                     continue;
@@ -420,40 +460,58 @@ const tcpServer = net.createServer(socket => {
                     const unescaped = unescapeBuffer(inner);
                     if (unescaped.length < 12) { offset = end + 1; continue; }
 
-                    const msgId = unescaped.readUInt16BE(0);
-                    console.log(`[PHONE RAW BYTES] ${unescaped.slice(4,10).toString('hex')}`);
-
-                    phone = Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2, '0')).join('')
-                        .replace(/^0/, '');
+                    const msgId    = unescaped.readUInt16BE(0);
+                    const rawPhone = Array.from(unescaped.slice(4, 10), b =>
+                        b.toString(16).padStart(2, '0')).join('');
+                    phone = rawPhone.replace(/^0+/, '');
                     const seq  = unescaped.readUInt16BE(10);
                     const body = unescaped.slice(12);
 
-                    // ── 0x0001: General response from device ──────────────────
+                    // ── 0x0001: General device ACK ────────────────────────────
                     if (msgId === 0x0001) {
                         const replyMsgId  = body.readUInt16BE(2);
                         const replyResult = body[4];
                         const resultText  = ['Success','Failed','Wrong Msg','Not Supported','Alarm Confirmed','Update Required'][replyResult] || `Unknown(${replyResult})`;
-                        console.log(`[ACK] replyTo:0x${replyMsgId.toString(16).padStart(4,'0')} result:${replyResult} (${resultText})`);
-                        // Forward to ftp-service for 0x9206 ack handling
+                        console.log(`[${phone}] ACK replyTo:0x${replyMsgId.toString(16).padStart(4,'0')} result:${replyResult} (${resultText})`);
                         bus.emit('device:message', { msgId, body, seq, phone, socket });
 
-                    // ── 0x0100: Device register ───────────────────────────────
+                    // ── 0x0100: Register ──────────────────────────────────────
                     } else if (msgId === 0x0100) {
+                        console.log(`[${phone}] Register`);
                         socket.write(buildRegisterResponse(phone, seq, 0, 'AUTH1234'));
 
-                    // ── 0x0102: Auth complete — start live stream ─────────────
+                    // ── 0x0102: Auth — register camera, start FFmpeg ──────────
                     } else if (msgId === 0x0102) {
-                        const rawPhone = Array.from(unescaped.slice(4, 10), b => b.toString(16).padStart(2, '0')).join('');
-                        console.log('[AUTH] raw BCD phone:', rawPhone, 'stripped:', rawPhone.replace(/^0/,''));
+                        console.log(`[${phone}] Auth — registering camera`);
                         socket.write(buildAck(phone, seq, msgId));
+
+                        // Create camera state if new
+                        const cam = getCamera(phone);
+
+                        // Start FFmpeg only if not already running
+                        if (!cam.ffmpeg) {
+                            cam.ffmpeg = startFFmpeg(phone);
+                        }
+
+                        // Request live video stream
                         socket.write(buildVideoRequest(phone, CONFIG.serverIp, CONFIG.tcpPort, 1));
+
+                        // Store socket
                         tcpSockets[phone] = socket;
-                        console.log('[AUTH] storing phone as:', phone, 'keys now:', Object.keys(tcpSockets));
-                        console.log(`[signalling] Registered socket for ${phone}`);
-                        // Notify ftp-service that this device is now available
+                        console.log(`[${phone}] ✅ Camera registered. Total cameras: ${Object.keys(tcpSockets).length}`);
+
+                        // Notify browser of new camera
+                        broadcast({
+                            type:    'camera_connected',
+                            phone,
+                            stream:  `/public/${phone}.m3u8`,
+                            cameras: Object.keys(tcpSockets),
+                        });
+
+                        // Notify ftp-service
                         bus.emit('device:connected', { phone, socket });
 
-                    // ── 0x0200: Location / GPS report ─────────────────────────
+                    // ── 0x0200: GPS location report ───────────────────────────
                     } else if (msgId === 0x0200) {
                         socket.write(buildAck(phone, seq, msgId));
 
@@ -472,36 +530,26 @@ const tcpServer = net.createServer(socket => {
                         const accOn   = !!(statusBits & (1 << 0));
                         const located = !!(statusBits & (1 << 1));
 
-                        const bcd        = b => ((b >> 4) * 10 + (b & 0x0F));
-                        const timeOffset = 22;
-                        const yy = bcd(body[timeOffset]);
-                        const mo = bcd(body[timeOffset + 1]);
-                        const dd = bcd(body[timeOffset + 2]);
-                        const hh = bcd(body[timeOffset + 3]);
-                        const mm = bcd(body[timeOffset + 4]);
-                        const ss = bcd(body[timeOffset + 5]);
-                        const dt = `20${String(yy).padStart(2,'0')}-${String(mo).padStart(2,'0')}-${String(dd).padStart(2,'0')} ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
-
-                        const alarms = [];
-                        if (alarmFlags & (1<<0)) alarms.push('Emergency');
-                        if (alarmFlags & (1<<1)) alarms.push('Overspeed');
-                        if (alarmFlags & (1<<4)) alarms.push('GNSS Fault');
-                        if (alarmFlags & (1<<5)) alarms.push('GNSS Antenna Cut');
-                        if (alarmFlags & (1<<7)) alarms.push('Low Voltage');
-                        if (alarmFlags & (1<<8)) alarms.push('Power Off');
+                        const bcd = b => ((b >> 4) * 10 + (b & 0x0F));
+                        const t   = 22;
+                        const dt  = `20${String(bcd(body[t])).padStart(2,'0')}-${String(bcd(body[t+1])).padStart(2,'0')}-${String(bcd(body[t+2])).padStart(2,'0')} ${String(bcd(body[t+3])).padStart(2,'0')}:${String(bcd(body[t+4])).padStart(2,'0')}:${String(bcd(body[t+5])).padStart(2,'0')}`;
 
                         const extra = parseAdditionalInfo(body.slice(27));
-                        const locationData = {
-                            type: 'location', phone, lat, lon, speed, direction,
-                            elevation, datetime: dt, accOn, located, alarms, ...extra,
-                            imei: extra.imei || '--',
-                        };
 
-                        wss.clients.forEach(client => {
-                            if (client.readyState === 1) client.send(JSON.stringify(locationData));
+                        broadcast({
+                            type: 'location', phone, lat, lon, speed, direction,
+                            elevation, datetime: dt, accOn, located,
+                            alarms: alarmFlags !== 0 ? Object.entries({
+                                EMERGENCY:   alarmFlags & (1<<0),
+                                OVERSPEED:   alarmFlags & (1<<1),
+                                GNSS_FAULT:  alarmFlags & (1<<4),
+                                ANTENNA_CUT: alarmFlags & (1<<5),
+                                LOW_VOLTAGE: alarmFlags & (1<<7),
+                                POWER_OFF:   alarmFlags & (1<<8),
+                            }).filter(([,v]) => v).map(([k]) => k) : [],
+                            ...extra,
                         });
 
-                        const fileName  = `gps_log_${new Date().toISOString().slice(0, 10)}.txt`;
                         const gpsRecord = {
                             phone,
                             datetime:        dt,
@@ -520,32 +568,29 @@ const tcpServer = net.createServer(socket => {
                             oil_circuit:     !!(statusBits & (1<<10)) ? 'CUT'  : 'NORMAL',
                             vehicle_circuit: !!(statusBits & (1<<11)) ? 'CUT'  : 'NORMAL',
                             door:            !!(statusBits & (1<<13)) ? 'OPEN' : 'CLOSED',
-                            alarms: alarmFlags !== 0 ? [
-                                (alarmFlags & (1<<0)) ? 'EMERGENCY'   : null,
-                                (alarmFlags & (1<<1)) ? 'OVERSPEED'   : null,
-                                (alarmFlags & (1<<4)) ? 'GNSS_FAULT'  : null,
-                                (alarmFlags & (1<<5)) ? 'ANTENNA_CUT' : null,
-                                (alarmFlags & (1<<7)) ? 'LOW_VOLTAGE' : null,
-                                (alarmFlags & (1<<8)) ? 'POWER_OFF'   : null,
-                            ].filter(Boolean).join('|') : 'NONE',
+                            alarms:          alarmFlags !== 0 ? 'ALARM' : 'NONE',
                         };
 
                         tcpForwarder.sendGpsRecord(gpsRecord);
-                        fs.appendFile(`./${fileName}`, Object.values(gpsRecord).join(',') + '\n', err => {
-                            if (err) console.error('[GPS LOG] write error:', err.message);
+
+                        // Per-camera GPS log file
+                        const logFile = `./gps_log_${phone}_${new Date().toISOString().slice(0,10)}.txt`;
+                        fs.appendFile(logFile, Object.values(gpsRecord).join(',') + '\n', e => {
+                            if (e) console.error('[GPS LOG] write error:', e.message);
                         });
 
                     // ── 0x1205: File list response ────────────────────────────
                     } else if (msgId === 0x1205) {
-                        const replySerial = body.readUInt16BE(0);
-                        const totalFiles  = body.readUInt32BE(2);
-                        console.log(`[0x1205] File list response — serial:${replySerial} files:${totalFiles}`);
+                        const totalFiles = body.readUInt32BE(2);
+                        console.log(`[${phone}] 0x1205 file list — total:${totalFiles}`);
                         if (totalFiles === 0) {
-                            console.warn('[0x1205] ⚠️ Camera reports 0 files for this time range');
+                            console.warn(`[${phone}] ⚠️ Camera reports 0 files for this time range`);
                         }
+                        bus.emit('device:message', { msgId, body, seq, phone, socket });
 
-                    // ── 0x1206: File upload completion — forward to ftp-service ─
+                    // ── 0x1206: File upload done — forward to ftp-service ─────
                     } else if (msgId === 0x1206) {
+                        console.log(`[${phone}] 0x1206 file upload notification`);
                         bus.emit('device:message', { msgId, body, seq, phone, socket });
 
                     // ── Everything else: generic ACK ──────────────────────────
@@ -563,21 +608,35 @@ const tcpServer = net.createServer(socket => {
             buffer = buffer.slice(offset);
 
         } catch (e) {
-            console.error('[TCP] Error processing data:', e.message);
+            console.error('[TCP] Error processing data:', e.message, e.stack);
         }
     });
 
     socket.on('close', () => {
-        console.log(`Device disconnected: ${remote} phone:${phone}`);
+        console.log(`[TCP] Device disconnected: ${remote} phone:${phone}`);
         if (phone) {
+            // Stop FFmpeg for this camera
+            if (cameras[phone]?.ffmpeg) {
+                cameras[phone].ffmpeg.stdin.end();
+                cameras[phone].ffmpeg.kill();
+            }
+            delete cameras[phone];
             delete tcpSockets[phone];
+
+            // Notify browser
+            broadcast({
+                type:    'camera_disconnected',
+                phone,
+                cameras: Object.keys(tcpSockets),
+            });
+
             bus.emit('device:disconnected', { phone });
         }
     });
-    socket.on('error', err => console.error(`[TCP] Socket error: ${err.message}`));
+
+    socket.on('error', e => console.error(`[TCP] Socket error (${phone}):`, e.message));
 });
 
-tcpServer.listen(CONFIG.tcpPort, () => console.log(`✓ TCP server on :${CONFIG.tcpPort}`));
-
-// ── Start FFmpeg for channel 1 ────────────────────────────────────────────────
-channels[1].ffmpeg = startFFmpeg(1);
+tcpServer.listen(CONFIG.tcpPort, '0.0.0.0', () =>
+    console.log(`[Pictor] ✓ TCP server on :${CONFIG.tcpPort}`)
+);
