@@ -188,37 +188,25 @@ function startFFmpeg(phone) {
     } catch (_) {}
 
     const ffmpeg = spawn(CONFIG.ffmpegPath, [
-        // Input
-        '-fflags',          '+genpts+discardcorrupt+igndts',
-        '-err_detect',      'ignore_err',
-        '-f',               'mpegts',
-        '-probesize',       '2000000',
-        '-analyzeduration', '2000000',
-        '-i',               'pipe:0',
+    '-fflags',          '+genpts+discardcorrupt+igndts',
+    '-err_detect',      'ignore_err',
+    '-f',               'mpegts',
+    '-probesize',       '2000000',
+    '-analyzeduration', '2000000',
+    '-i',               'pipe:0',
 
-        // Video codec
-        '-c:v',             'libx264',
-        '-preset',          'ultrafast',
-        '-tune',            'zerolatency',
-        '-g',               '30',           // keyframe every 30 frames
-        '-keyint_min',      '15',
-        '-sc_threshold',    '0',            // disable scene-cut keyframes
-        '-b:v',             '800k',         // target bitrate
-        '-maxrate',         '1200k',
-        '-bufsize',         '2000k',
+    '-c:v',             'copy',      // ← just copy the stream, no re-encode
+                                     //   faster, no quality loss, no CPU waste
+    '-an',
 
-        // No audio (cameras are video-only in your setup)
-        '-an',
-
-        // HLS output
-        '-f',               'hls',
-        '-hls_time',        '2',            // 2s segments — better than 1s for stability
-        '-hls_list_size',   '5',            // keep 5 segments in playlist
-        '-hls_flags',       'delete_segments+append_list+independent_segments',
-        '-hls_segment_type','mpegts',
-        '-hls_segment_filename', `./public/${phone}_%04d.ts`,
-        `./public/${phone}.m3u8`,
-    ]);
+    '-f',               'hls',
+    '-hls_time',        '2',
+    '-hls_list_size',   '5',
+    '-hls_flags',       'delete_segments+append_list+independent_segments',
+    '-hls_segment_type','mpegts',
+    '-hls_segment_filename', `./public/${phone}_%04d.ts`,
+    `./public/${phone}.m3u8`,
+]);
 
     // Log only errors from FFmpeg stderr
     let stderrBuf = '';
@@ -321,7 +309,7 @@ function buildPMT() {
     s[8]  = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
     s[9]  = VIDEO_PID & 0xFF;
     s[10] = 0xF0; s[11] = 0x00;
-    s[12] = 0x42;  // stream_type: AVS
+    s[12] = 0x24;  // stream_type: AVS
     s[13] = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
     s[14] = VIDEO_PID & 0xFF;
     s[15] = 0xF0; s[16] = 0x00;
@@ -359,19 +347,12 @@ function wrapFrameInTS(frameData, counter) {
     return { packets, nextCounter: ctr };
 }
 
-// ── Write to FFmpeg with backpressure ─────────────────────────────────────────
+// ── Write to FFmpeg ───────────────────────────────────────────────────────────
 function writeToFFmpeg(cam, phone, data) {
     if (!cam.ffmpeg || !cam.ffmpeg.stdin.writable) return;
-
-    // If stdin buffer is full, wait for drain before writing
-    const ok = cam.ffmpeg.stdin.write(data);
-    if (!ok) {
-        // Pause processing — will resume on drain
-        // (we don't pause the socket here because multiple cameras share it)
-        cam.ffmpeg.stdin.once('drain', () => {
-            // FFmpeg caught up — nothing to do, next frame will come naturally
-        });
-    }
+    cam.ffmpeg.stdin.write(data);
+    // No per-write drain listener — avoids MaxListenersExceeded warning.
+    // If FFmpeg falls behind, the watchdog restarts it after 15s of no frames.
 }
 
 // ── Handle one complete decoded video frame ───────────────────────────────────
@@ -588,9 +569,9 @@ const tcpServer = net.createServer(socket => {
 
     // Keepalive — detect dead connections within ~30s
     socket.setKeepAlive(true, 10000);
-    socket.setTimeout(60000);
+    socket.setTimeout(300000);  // 5 minutes — GPS keeps socket alive every 10s
     socket.on('timeout', () => {
-        console.warn(`[TCP] Socket timeout: ${remote}`);
+        console.warn(`[TCP] Socket timeout (no data for 5min): ${remote}`);
         socket.destroy();
     });
 
@@ -646,24 +627,14 @@ const tcpServer = net.createServer(socket => {
 
                     const inner     = buffer.slice(offset + 1, end);
                     const unescaped = unescapeBuffer(inner);
-                    if (unescaped.length < 13) { offset = end + 1; continue; }
-
-                    // Verify checksum
-                    const cs   = unescaped[unescaped.length - 1];
-                    const body_with_header = unescaped.slice(0, -1);
-                    let expected = 0; body_with_header.forEach(b => expected ^= b);
-                    if (expected !== cs) {
-                        console.warn(`[TCP] Checksum mismatch — skipping frame`);
-                        offset = end + 1;
-                        continue;
-                    }
+                    if (unescaped.length < 12) { offset = end + 1; continue; }
 
                     const msgId    = unescaped.readUInt16BE(0);
                     const rawPhone = Array.from(unescaped.slice(4, 10), b =>
                         b.toString(16).padStart(2, '0')).join('');
                     phone = rawPhone.replace(/^0+/, '');
                     const seq  = unescaped.readUInt16BE(10);
-                    const body = unescaped.slice(12, -1);  // exclude checksum byte
+                    const body = unescaped.slice(12);
 
                     // ── 0x0001: Device ACK ────────────────────────────────────
                     if (msgId === 0x0001) {
