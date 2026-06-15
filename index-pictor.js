@@ -327,24 +327,24 @@ function buildPMT() {
 }
 
 function wrapFrameInTS(frameData, counter, ptsMs) {
-    // PES header with PTS timestamp
-    const pts    = Math.floor((ptsMs || Date.now()) * 90);  // 90kHz clock
-    const pts32  = pts & 0xFFFFFFFF;
+    const pts   = BigInt(Math.floor((ptsMs || 0) * 90)) & 0x1FFFFFFFFn;
+    const p     = Number(pts);
+
     const pesHdr = Buffer.from([
-        0x00, 0x00, 0x01,           // start code
-        0xE0,                        // stream id: video
-        0x00, 0x00,                  // PES packet length (0 = unbounded)
-        0x80,                        // flags: marker bits
-        0x80,                        // PTS_DTS_flags: PTS only
-        0x05,                        // header data length
-        // PTS (5 bytes)
-        0x21 | ((pts32 >> 29) & 0x0E),
-        (pts32 >> 22) & 0xFF,
-        0x01 | ((pts32 >> 14) & 0xFE),
-        (pts32 >>  7) & 0xFF,
-        0x01 | ((pts32 <<  1) & 0xFE),
+        0x00, 0x00, 0x01,                           // start code
+        0xE0,                                        // stream id: video
+        0x00, 0x00,                                  // PES length (0 = unbounded)
+        0x80,                                        // marker + no flags
+        0x80,                                        // PTS present
+        0x05,                                        // header data length
+        // PTS 5 bytes
+        0x21 | ((p >>> 29) & 0x0E),
+        (p >>> 22) & 0xFF,
+        0x01 | ((p >>> 14) & 0xFE),
+        (p >>>  7) & 0xFF,
+        0x01 | ((p <<   1) & 0xFE),
     ]);
-    // ... rest unchanged
+
     const pes     = Buffer.concat([pesHdr, frameData]);
     const packets = [];
     let pos = 0, first = true, ctr = counter;
