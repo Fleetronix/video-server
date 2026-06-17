@@ -1,43 +1,61 @@
 'use strict';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ftp-service.js  —  FTP DOWNLOAD SERVICE  (multi-camera)
+// ftp-service.js  —  FTP DOWNLOAD SERVICE  (multi-camera + Redis tracking)
 //
-// Each camera gets:
-//   • Its own PASV port from a pool (14993–15002)
-//   • Its own recordings subfolder  ./recordings/<phone>/
-//   • Its own download session tracked in _sessions[phone]
+// Every download request gets a unique requestId.
+// Status is tracked in Azure Redis under key:  ftp:<phone>:<requestId>
+//
+// Redis record shape:
+// {
+//   requestId:  'abc123',
+//   phone:      '15760064474',
+//   ch:         1,
+//   startTime:  '2026-06-15 14:38:00',
+//   endTime:    '2026-06-15 14:38:20',
+//   folder:     '/15760064474/',
+//   status:     'queued' | 'in_progress' | 'complete' | 'failed',
+//   filePath:   '/full/path/to/file.mp4',   // set when complete
+//   filename:   'CH0-....MP4',              // set when complete
+//   url:        '/recordings/...',          // set when complete
+//   fileSize:   1234567,                    // set when complete
+//   createdAt:  '2026-06-15T14:38:00.000Z',
+//   updatedAt:  '2026-06-15T14:38:30.000Z',
+//   error:      'reason',                  // set when failed
+// }
 //
 // HTTP API  :8082
-//   POST /api/ftp-download  { phone, ch, startTime, endTime, folder }
-//   POST /api/ftp-cancel    { phone }
-//   GET  /api/sessions
-//   GET  /recordings/<path>
+//   POST /api/ftp-download   { phone, ch, startTime, endTime, folder }
+//        → { requestId, status:'queued', phone, ch, startTime, endTime, folder }
 //
-// WebSocket :8802
-//   { type:'status',    phone, message }
-//   { type:'ftp_ready', phone, url, filename }
-//   { type:'error',     phone, message }
+//   GET  /api/ftp-status/:requestId          → Redis record for that request
+//   GET  /api/ftp-history/:phone             → all records for a phone (latest 50)
+//   POST /api/ftp-cancel     { phone }
+//   GET  /api/sessions                       → active in-memory sessions
+//   GET  /recordings/**                      → download saved file
 // ─────────────────────────────────────────────────────────────────────────────
 
 require('dotenv').config();
-const net  = require('net');
-const fs   = require('fs');
-const path = require('path');
-const http = require('http');
+const net    = require('net');
+const fs     = require('fs');
+const path   = require('path');
+const http   = require('http');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
-const bus  = require('./device-bus');
+const Redis  = require('ioredis');
+const bus    = require('./device-bus');
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const SERVER_IP        = process.env.SERVER_IP             || '127.0.0.1';
-const FTP_PORT         = parseInt(process.env.FTP_PORT     || '14992');
-const PASV_PORT_START  = parseInt(process.env.PASV_PORT    || '14993');
-const PASV_POOL_SIZE   = parseInt(process.env.PASV_POOL    || '10');    // max concurrent uploads
-const HTTP_PORT        = parseInt(process.env.FTP_HTTP_PORT|| '8082');
-const WS_PORT          = parseInt(process.env.FTP_WS_PORT  || '8802');
-const RECORDINGS_DIR   = process.env.RECORDINGS_DIR        || './recordings';
+const SERVER_IP       = process.env.SERVER_IP             || '127.0.0.1';
+const FTP_PORT        = parseInt(process.env.FTP_PORT     || '14992');
+const PASV_PORT_START = parseInt(process.env.PASV_PORT    || '14993');
+const PASV_POOL_SIZE  = parseInt(process.env.PASV_POOL    || '10');
+const HTTP_PORT       = parseInt(process.env.FTP_HTTP_PORT|| '8082');
+const WS_PORT         = parseInt(process.env.FTP_WS_PORT  || '8802');
+const RECORDINGS_DIR  = process.env.RECORDINGS_DIR        || './recordings';
+const REDIS_TTL       = parseInt(process.env.REDIS_TTL    || String(7 * 24 * 3600)); // 7 days
 
-// Phone → SN mapping — add new cameras here
+// Phone → SN mapping
 const PHONE_TO_SN = {
     '1576064472': '15760064472',
     '1576064474': '15760064474',
@@ -46,43 +64,135 @@ function framePhone(phone) {
     return PHONE_TO_SN[String(phone)] || String(phone);
 }
 
-// ── Ensure recordings folder exists ──────────────────────────────────────────
 if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
-// ── Internal state ────────────────────────────────────────────────────────────
-const _sessions = {};   // { [phone]: { ch, startTime, endTime, folder, sentAt } }
-const _seqMap   = {};   // { [phone]: seq }
+// ── Logging ───────────────────────────────────────────────────────────────────
+const log  = (...a) => console.log ('[FTP-SVC]', ...a);
+const warn = (...a) => console.warn('[FTP-SVC]', ...a);
+const err  = (...a) => console.error('[FTP-SVC]', ...a);
 
-// ── PASV port pool ────────────────────────────────────────────────────────────
-// Each slot: { server: net.Server, inUse: bool, phone: string|null }
+// ── Redis ─────────────────────────────────────────────────────────────────────
+let redis = null;
+
+function connectRedis() {
+    const opts = {
+        host:            process.env.REDIS_HOST,
+        port:            parseInt(process.env.REDIS_PORT || '6380'),
+        password:        process.env.REDIS_PASSWORD,
+        tls:             process.env.REDIS_TLS === 'false' ? undefined : {},  // Azure Redis uses TLS
+        retryStrategy:   (times) => Math.min(times * 500, 5000),
+        lazyConnect:     true,
+        enableReadyCheck: true,
+    };
+
+    if (!opts.host) {
+        warn('REDIS_HOST not set — Redis tracking disabled. Set in .env to enable.');
+        return null;
+    }
+
+    const client = new Redis(opts);
+
+    client.on('connect',  () => log('✅ Redis connected'));
+    client.on('ready',    () => log('✅ Redis ready'));
+    client.on('error',    e  => err('Redis error:', e.message));
+    client.on('close',    () => warn('Redis connection closed'));
+    client.on('reconnecting', () => warn('Redis reconnecting...'));
+
+    client.connect().catch(e => err('Redis initial connect error:', e.message));
+    return client;
+}
+
+redis = connectRedis();
+
+// ── Redis helpers ─────────────────────────────────────────────────────────────
+function redisKey(phone, requestId) {
+    return `ftp:${phone}:${requestId}`;
+}
+function redisListKey(phone) {
+    return `ftp:list:${phone}`;
+}
+
+async function saveToRedis(record) {
+    if (!redis) return;
+    try {
+        const key     = redisKey(record.phone, record.requestId);
+        const listKey = redisListKey(record.phone);
+        const now     = new Date().toISOString();
+        record.updatedAt = now;
+
+        await redis.set(key, JSON.stringify(record), 'EX', REDIS_TTL);
+
+        // Keep ordered list of requestIds per phone (latest first, max 50)
+        await redis.lpush(listKey, record.requestId);
+        await redis.ltrim(listKey, 0, 49);
+        await redis.expire(listKey, REDIS_TTL);
+
+        log(`Redis saved: ${key} status:${record.status}`);
+    } catch (e) {
+        err('Redis save error:', e.message);
+    }
+}
+
+async function updateRedis(phone, requestId, patch) {
+    if (!redis) return;
+    try {
+        const key      = redisKey(phone, requestId);
+        const existing = await redis.get(key);
+        if (!existing) { warn(`Redis key not found: ${key}`); return; }
+
+        const record = { ...JSON.parse(existing), ...patch, updatedAt: new Date().toISOString() };
+        await redis.set(key, JSON.stringify(record), 'EX', REDIS_TTL);
+        log(`Redis updated: ${key} status:${record.status}`);
+    } catch (e) {
+        err('Redis update error:', e.message);
+    }
+}
+
+async function getFromRedis(phone, requestId) {
+    if (!redis) return null;
+    try {
+        const raw = await redis.get(redisKey(phone, requestId));
+        return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+        err('Redis get error:', e.message);
+        return null;
+    }
+}
+
+async function getHistoryFromRedis(phone) {
+    if (!redis) return [];
+    try {
+        const listKey   = redisListKey(phone);
+        const requestIds = await redis.lrange(listKey, 0, 49);
+        const keys      = requestIds.map(id => redisKey(phone, id));
+        if (!keys.length) return [];
+        const values    = await redis.mget(...keys);
+        return values
+            .filter(Boolean)
+            .map(v => JSON.parse(v))
+            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    } catch (e) {
+        err('Redis history error:', e.message);
+        return [];
+    }
+}
+
+// ── Internal state ────────────────────────────────────────────────────────────
+// _sessions[phone] = { requestId, ch, startTime, endTime, folder, sentAt }
+const _sessions = {};
+const _seqMap   = {};
+
+// PASV pool
 const _pasvPool = {};
 
 function initPasvPool() {
     for (let i = 0; i < PASV_POOL_SIZE; i++) {
         const port = PASV_PORT_START + i;
-        _pasvPool[port] = {
-            server:        null,
-            inUse:         false,
-            phone:         null,
-            dataSocket:    null,
-            pendingStor:   null,
-        };
+        _pasvPool[port] = { inUse: false, phone: null, dataSocket: null, pendingStor: null, server: null };
     }
 }
 
-function allocatePasvPort(phone) {
-    for (const [portStr, slot] of Object.entries(_pasvPool)) {
-        if (!slot.inUse) {
-            slot.inUse = true;
-            slot.phone = phone;
-            return parseInt(portStr);
-        }
-    }
-    return null;
-}
-
-// Allocate any free port regardless of phone
-function allocatePasvPortAny() {
+function allocatePasvPort() {
     for (const [portStr, slot] of Object.entries(_pasvPool)) {
         if (!slot.inUse) {
             slot.inUse = true;
@@ -95,20 +205,12 @@ function allocatePasvPortAny() {
 function freePasvPort(port) {
     const slot = _pasvPool[port];
     if (!slot) return;
-    // Only free if no active data transfer
     if (!slot.dataSocket && !slot.pendingStor) {
-        slot.inUse       = false;
-        slot.phone       = null;
-        slot.dataSocket  = null;
-        slot.pendingStor = null;
+        slot.inUse = false; slot.phone = null;
+        slot.dataSocket = null; slot.pendingStor = null;
         log(`PASV port ${port} freed`);
     }
 }
-
-// ── Logging ───────────────────────────────────────────────────────────────────
-const log  = (...a) => console.log ('[FTP-SVC]', ...a);
-const warn = (...a) => console.warn('[FTP-SVC]', ...a);
-const err  = (...a) => console.error('[FTP-SVC]', ...a);
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ port: WS_PORT });
@@ -121,13 +223,10 @@ function broadcast(obj) {
 
 wss.on('connection', (ws, req) => {
     log(`Browser connected from ${req.socket.remoteAddress}`);
-    // Send current sessions on connect
     ws.send(JSON.stringify({ type: 'sessions', sessions: _sessions }));
-
     ws.on('message', raw => {
-        let msg;
-        try { msg = JSON.parse(raw); } catch (e) { return; }
-        if      (msg.type === 'ftp_download') triggerDownload(msg);
+        let msg; try { msg = JSON.parse(raw); } catch (e) { return; }
+        if      (msg.type === 'ftp_download') triggerDownload(msg).catch(e => err(e.message));
         else if (msg.type === 'ftp_cancel')   cancelDownload(msg.phone);
     });
 });
@@ -136,16 +235,15 @@ wss.on('connection', (ws, req) => {
 http.createServer((req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
     const urlPath = req.url.split('?')[0];
 
-    // POST /api/ftp-download
+    // ── POST /api/ftp-download ────────────────────────────────────────────────
     if (req.method === 'POST' && urlPath === '/api/ftp-download') {
         let body = '';
         req.on('data', c => body += c);
-        req.on('end', () => {
+        req.on('end', async () => {
             try {
                 const { phone, ch, startTime, endTime, folder } = JSON.parse(body);
                 if (!phone || !ch || !startTime || !endTime) {
@@ -153,9 +251,11 @@ http.createServer((req, res) => {
                     res.end(JSON.stringify({ error: 'phone, ch, startTime, endTime are required' }));
                     return;
                 }
-                triggerDownload({ phone: String(phone), ch, startTime, endTime, folder });
+                const result = await triggerDownload({
+                    phone: String(phone), ch, startTime, endTime, folder,
+                });
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ status: 'queued', phone, ch, startTime, endTime }));
+                res.end(JSON.stringify(result));
             } catch (e) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: e.message }));
@@ -164,7 +264,47 @@ http.createServer((req, res) => {
         return;
     }
 
-    // POST /api/ftp-cancel
+    // ── GET /api/ftp-status/:requestId ────────────────────────────────────────
+    if (req.method === 'GET' && urlPath.startsWith('/api/ftp-status/')) {
+        const requestId = urlPath.replace('/api/ftp-status/', '');
+        // Search across all phones for this requestId
+        (async () => {
+            if (!redis) {
+                res.writeHead(503, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Redis not configured' }));
+                return;
+            }
+            try {
+                // Scan for key matching ftp:*:requestId
+                const keys = await redis.keys(`ftp:*:${requestId}`);
+                if (!keys.length) {
+                    res.writeHead(404, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'Request not found' }));
+                    return;
+                }
+                const raw = await redis.get(keys[0]);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(raw || '{}');
+            } catch (e) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: e.message }));
+            }
+        })();
+        return;
+    }
+
+    // ── GET /api/ftp-history/:phone ───────────────────────────────────────────
+    if (req.method === 'GET' && urlPath.startsWith('/api/ftp-history/')) {
+        const phone = urlPath.replace('/api/ftp-history/', '');
+        (async () => {
+            const history = await getHistoryFromRedis(phone);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(history));
+        })();
+        return;
+    }
+
+    // ── POST /api/ftp-cancel ──────────────────────────────────────────────────
     if (req.method === 'POST' && urlPath === '/api/ftp-cancel') {
         let body = '';
         req.on('data', c => body += c);
@@ -182,23 +322,24 @@ http.createServer((req, res) => {
         return;
     }
 
-    // GET /api/sessions
+    // ── GET /api/sessions ─────────────────────────────────────────────────────
     if (req.method === 'GET' && urlPath === '/api/sessions') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(_sessions));
         return;
     }
 
-    // GET /recordings/**
+    // ── GET /recordings/** ────────────────────────────────────────────────────
     if (req.method === 'GET' && urlPath.startsWith('/recordings/')) {
         const rel      = urlPath.replace('/recordings/', '');
         const filePath = path.join(RECORDINGS_DIR, rel);
         fs.stat(filePath, (e, stat) => {
             if (e) { res.writeHead(404); res.end('Not found'); return; }
             res.writeHead(200, {
-                'Content-Type':   'video/mp4',
-                'Content-Length': stat.size,
-                'Cache-Control':  'no-cache',
+                'Content-Type':        'video/mp4',
+                'Content-Length':      stat.size,
+                'Content-Disposition': `attachment; filename="${path.basename(filePath)}"`,
+                'Cache-Control':       'no-cache',
             });
             fs.createReadStream(filePath).pipe(res);
         });
@@ -218,7 +359,11 @@ bus.on('device:connected', ({ phone }) => {
 
 bus.on('device:disconnected', ({ phone }) => {
     log(`Device disconnected: ${phone}`);
-    delete _sessions[phone];
+    // Mark any in-progress session as failed
+    if (_sessions[phone]) {
+        updateRedis(phone, _sessions[phone].requestId, { status: 'failed', error: 'Device disconnected' });
+        delete _sessions[phone];
+    }
     delete _seqMap[phone];
 });
 
@@ -229,89 +374,156 @@ bus.on('device:message', ({ msgId, body, seq, phone }) => {
         const replyMsgId  = body.readUInt16BE(2);
         const replyResult = body[4];
         if (replyMsgId === 0x9206) {
-            const resultText = ['Success','Failed','Wrong Msg','Not Supported'][replyResult] || `Unknown(${replyResult})`;
-            log(`[${phone}] 0x9206 ack — result:${replyResult} (${resultText})`);
+            const session = _sessions[phone];
+            log(`[${phone}] 0x9206 ack — result:${replyResult}`);
             if (replyResult === 0) {
                 broadcast({ type: 'status', phone, message: '✅ Camera accepted, uploading via FTP...' });
+                if (session) {
+                    updateRedis(phone, session.requestId, { status: 'in_progress' });
+                }
             } else {
                 err(`[${phone}] Camera rejected 0x9206 code:${replyResult}`);
                 broadcast({ type: 'error', phone, message: `Camera rejected request (code ${replyResult})` });
-                delete _sessions[phone];
+                if (session) {
+                    updateRedis(phone, session.requestId, {
+                        status: 'failed',
+                        error: `Camera rejected 0x9206 (code ${replyResult})`,
+                    });
+                    delete _sessions[phone];
+                }
             }
         }
         return;
     }
 
-    // 0x1205 — file list response (camera confirmed files exist)
+    // 0x1205 — file list response
     if (msgId === 0x1205) {
         const totalFiles = body.readUInt32BE(2);
         log(`[${phone}] 0x1205 file list — total:${totalFiles}`);
         if (totalFiles === 0) {
-            warn(`[${phone}] ⚠️ Camera reports 0 files — wrong time range or no SD card`);
+            warn(`[${phone}] ⚠️ Camera reports 0 files`);
             broadcast({ type: 'error', phone, message: '⚠️ Camera found 0 files for this time range' });
+            const session = _sessions[phone];
+            if (session) {
+                updateRedis(phone, session.requestId, { status: 'failed', error: '0 files found on camera' });
+                delete _sessions[phone];
+            }
         } else {
-            broadcast({ type: 'status', phone, message: `📁 Camera found ${totalFiles} file(s), sending FTP command...` });
+            broadcast({ type: 'status', phone, message: `📁 Camera found ${totalFiles} file(s)` });
         }
         return;
     }
 
     // 0x1206 — file upload complete
     if (msgId === 0x1206) {
-        const result = body[2];
+        const result  = body[2];
+        const session = _sessions[phone];
         log(`[${phone}] 0x1206 upload result:${result}`);
 
         // ACK back to camera
         bus.emit('device:send', { phone, frame: buildAck(framePhone(phone), seq, 0x1206) });
 
-        if (result === 0) {
-            log(`[${phone}] ✅ Upload complete`);
-            broadcast({ type: 'status', phone, message: '📦 Camera upload complete!' });
-        } else {
+        if (result !== 0) {
             err(`[${phone}] ❌ Upload failed code:${result}`);
             broadcast({ type: 'error', phone, message: `Upload failed (code ${result})` });
-            delete _sessions[phone];
+            if (session) {
+                updateRedis(phone, session.requestId, {
+                    status: 'failed',
+                    error:  `Camera reported upload failure (code ${result})`,
+                });
+                delete _sessions[phone];
+            }
         }
+        // result=0: FTP STOR handler will mark complete when file lands
     }
 });
 
 // ── Core logic ────────────────────────────────────────────────────────────────
-function triggerDownload({ phone, ch, startTime, endTime, folder }) {
+async function triggerDownload({ phone, ch, startTime, endTime, folder }) {
     phone = String(phone);
-
-    // Default folder: /recordings/<phone>/
     if (!folder) folder = `/${phone}/`;
 
-    log(`▶ triggerDownload phone:${phone} ch:${ch} ${startTime} → ${endTime} folder:${folder}`);
+    // Generate unique request ID
+    const requestId = crypto.randomBytes(8).toString('hex');
+    const createdAt = new Date().toISOString();
+
+    log(`▶ triggerDownload requestId:${requestId} phone:${phone} ch:${ch} ${startTime} → ${endTime} folder:${folder}`);
 
     // Cancel any stuck previous session
     if (_sessions[phone]) {
         bus.emit('device:send', { phone, frame: build9207(phone, 0, 2) });
-        log(`[${phone}] Cancelled previous session`);
+        await updateRedis(phone, _sessions[phone].requestId, {
+            status: 'failed',
+            error:  'Superseded by new request',
+        });
         delete _sessions[phone];
     }
 
-    // Step 1 — query file list (0x9205)
+    // Build the expected file path (camera uses its own naming convention)
+    // We can't know exact filename until STOR — but we know the folder
+    const expectedFolder = path.join(RECORDINGS_DIR, folder);
+
+    // Save initial Redis record
+    const record = {
+        requestId,
+        phone,
+        ch,
+        startTime,
+        endTime,
+        folder,
+        status:         'queued',
+        filePath:       null,
+        filename:       null,
+        url:            null,
+        fileSize:       null,
+        expectedFolder: expectedFolder,
+        createdAt,
+        updatedAt:      createdAt,
+        error:          null,
+    };
+    await saveToRedis(record);
+
+    // Store session in memory
+    _sessions[phone] = { requestId, ch, startTime, endTime, folder, sentAt: Date.now() };
+
+    // Step 1 — query file list
     bus.emit('device:send', { phone, frame: build9205(phone, ch, startTime, endTime) });
     log(`[${phone}] Sent 0x9205`);
-    broadcast({ type: 'status', phone, message: `🔍 Querying camera for ch${ch} recordings...` });
+    broadcast({ type: 'status', phone, requestId, message: `🔍 Querying camera for ch${ch} recordings...` });
 
-    // Step 2 — send FTP command (0x9206) after 3s
-    setTimeout(() => {
+    // Step 2 — send FTP command after 3s
+    setTimeout(async () => {
         const frame = build9206(phone, ch, startTime, endTime, folder);
         bus.emit('device:send', { phone, frame });
-        _sessions[phone] = { ch, startTime, endTime, folder, sentAt: Date.now() };
         log(`[${phone}] Sent 0x9206 folder:${folder}`);
-        broadcast({ type: 'status', phone, message: `⏳ FTP command sent, waiting for camera...` });
+        broadcast({ type: 'status', phone, requestId, message: `⏳ FTP command sent to camera...` });
+        await updateRedis(phone, requestId, { status: 'in_progress' });
     }, 3000);
+
+    // Return immediately with requestId so caller can track
+    return {
+        requestId,
+        status:    'queued',
+        phone,
+        ch,
+        startTime,
+        endTime,
+        folder,
+        trackUrl:  `/api/ftp-status/${requestId}`,
+        historyUrl: `/api/ftp-history/${phone}`,
+        message:   'Download queued. Use trackUrl to poll status.',
+    };
 }
 
 function cancelDownload(phone) {
     phone = String(phone);
-    if (!_sessions[phone]) {
+    const session = _sessions[phone];
+    if (!session) {
         broadcast({ type: 'status', phone, message: 'No active download' });
         return;
     }
     bus.emit('device:send', { phone, frame: build9207(phone, 0, 2) });
+    updateRedis(phone, session.requestId, { status: 'failed', error: 'Cancelled by user' });
     delete _sessions[phone];
     broadcast({ type: 'status', phone, message: '🛑 Download cancelled' });
     log(`[${phone}] Cancelled`);
@@ -345,10 +557,8 @@ function buildFrame(msgId, body, phone) {
         })
     ).copy(header, 4);
     header.writeUInt16BE(nextSeq(phone), 10);
-
     const payload = Buffer.concat([header, body]);
     let cs = 0; payload.forEach(b => cs ^= b);
-
     return Buffer.concat([
         Buffer.from([0x7E]),
         escapeBuffer(Buffer.concat([payload, Buffer.from([cs])])),
@@ -376,7 +586,6 @@ function parseDateTime(dtStr, fallback) {
     return { y, mo, d, h, mi, s };
 }
 
-// 0x9205 — query recording list
 function build9205(phone, channel, startTime, endTime) {
     const fp   = framePhone(phone);
     const s    = parseDateTime(startTime, '00:00:00');
@@ -386,12 +595,10 @@ function build9205(phone, channel, startTime, endTime) {
     bcdBytes(s.y%100, s.mo, s.d, s.h, s.mi, s.s).copy(body, 1);
     bcdBytes(e.y%100, e.mo, e.d, e.h, e.mi, e.s).copy(body, 7);
     body.fill(0x00, 13, 21);
-    body[21] = 0;
-    body[22] = 0;
+    body[21] = 0; body[22] = 0;
     return buildFrame(0x9205, body, fp);
 }
 
-// 0x9206 — file upload instruction
 function build9206(phone, channel, startTime, endTime, folder = '/') {
     const fp      = framePhone(phone);
     const s       = parseDateTime(startTime, '00:00:00');
@@ -413,15 +620,13 @@ function build9206(phone, channel, startTime, endTime, folder = '/') {
     bcdBytes(s.y%100, s.mo, s.d, s.h, s.mi, s.s).copy(body, p); p += 6;
     bcdBytes(e.y%100, e.mo, e.d, e.h, e.mi, e.s).copy(body, p); p += 6;
     body.fill(0x00, p, p + 8); p += 8;
-    body[p++] = 0;    // avType:      audio+video
-    body[p++] = 1;    // streamType:  main stream
+    body[p++] = 0;    // avType
+    body[p++] = 1;    // streamType: main
     body[p++] = 0;    // storageType: all
     body[p++] = 0x07; // taskCondition: WiFi+LAN+3G/4G
-
     return buildFrame(0x9206, body, fp);
 }
 
-// 0x9207 — upload control (pause/resume/cancel)
 function build9207(phone, sessionId, control) {
     const fp   = framePhone(phone);
     const body = Buffer.alloc(3);
@@ -431,13 +636,13 @@ function build9207(phone, sessionId, control) {
 }
 
 // ── FTP server ────────────────────────────────────────────────────────────────
-function makeFtpHandler(sessionPasvPort) {
+function makeFtpHandler() {
     return ftpSock => {
         log(`FTP control from ${ftpSock.remoteAddress}:${ftpSock.remotePort}`);
 
         let uploadStream = null;
         let currentDir   = '/';
-        let assignedPort = sessionPasvPort; // each session gets its own PASV port
+        let assignedPort = null;
 
         const reply = (code, msg) => ftpSock.write(`${code} ${msg}\r\n`);
         reply(220, 'FTP Server Ready');
@@ -449,7 +654,6 @@ function makeFtpHandler(sessionPasvPort) {
                 const arg = args.join(' ');
 
                 switch (cmd.toUpperCase()) {
-
                     case 'USER': reply(331, 'Please specify the password'); break;
                     case 'PASS': reply(230, 'Logged in'); break;
                     case 'SIZE': reply(213, '0'); break;
@@ -476,27 +680,15 @@ function makeFtpHandler(sessionPasvPort) {
 
                     case 'MKD': {
                         const dirPath = path.join(RECORDINGS_DIR, arg.replace(/^\//, ''));
-                        try {
-                            fs.mkdirSync(dirPath, { recursive: true });
-                            reply(257, `"${arg}" created`);
-                        } catch (e) {
-                            reply(550, 'Failed to create directory');
-                        }
+                        try { fs.mkdirSync(dirPath, { recursive: true }); reply(257, `"${arg}" created`); }
+                        catch (e) { reply(550, 'Failed to create directory'); }
                         break;
                     }
 
                     case 'PASV': {
-                        // Free previous port if camera sends PASV twice
-                        if (assignedPort) {
-                            freePasvPort(assignedPort);
-                            assignedPort = null;
-                        }
-                        // Allocate fresh port for this session
-                        assignedPort = allocatePasvPortAny();
-                        if (!assignedPort) {
-                            reply(421, 'No data ports available, try again later');
-                            break;
-                        }
+                        if (assignedPort) { freePasvPort(assignedPort); assignedPort = null; }
+                        assignedPort = allocatePasvPort();
+                        if (!assignedPort) { reply(421, 'No data ports available'); break; }
                         const ip = SERVER_IP.split('.');
                         const p1 = Math.floor(assignedPort / 256);
                         const p2 = assignedPort % 256;
@@ -524,14 +716,10 @@ function makeFtpHandler(sessionPasvPort) {
                                         return `${isDir?'drwxr-xr-x':'-rw-r--r--'} 1 ftp ftp ${stat.size} ${months[d.getMonth()]} ${String(d.getDate()).padStart(2,' ')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')} ${name}`;
                                     }).join('\r\n') + '\r\n';
                                     ds.end(listing);
-                                } catch (e) {
-                                    ds.end('');
-                                }
+                                } catch (e) { ds.end(''); }
                                 slot.dataSocket = null;
                                 reply(226, 'Directory send OK');
-                            } else {
-                                setTimeout(sendList, 100);
-                            }
+                            } else { setTimeout(sendList, 100); }
                         };
                         sendList();
                         break;
@@ -543,45 +731,64 @@ function makeFtpHandler(sessionPasvPort) {
                             ? path.join(RECORDINGS_DIR, argDir)
                             : path.join(RECORDINGS_DIR, currentDir);
 
-                        if (!fs.existsSync(saveDir)) {
-                            fs.mkdirSync(saveDir, { recursive: true });
-                        }
+                        if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
 
-                        const filename   = path.basename(arg || `rec_${Date.now()}.mp4`);
+                        const filename = path.basename(arg || `rec_${Date.now()}.mp4`);
                         let uploadPath = path.join(saveDir, filename);
 
-                       // ── Ignore duplicate STOR only for same full path ─────────────────
+                        // Rename if duplicate from same camera retry
                         if (fs.existsSync(uploadPath) && fs.statSync(uploadPath).size > 1024) {
-                            // Rename with timestamp instead of skipping — handles retry from same camera
-                            const ext     = path.extname(filename);
-                            const base    = path.basename(filename, ext);
-                            const newPath = path.join(saveDir, `${base}_${Date.now()}${ext}`);
-                            log(`STOR duplicate — renaming to: ${path.basename(newPath)}`);
-                            uploadPath   = newPath;
-                            uploadStream = fs.createWriteStream(uploadPath);
-                        } else {
-                            uploadStream = fs.createWriteStream(uploadPath);
+                            const ext  = path.extname(filename);
+                            const base = path.basename(filename, ext);
+                            uploadPath = path.join(saveDir, `${base}_${Date.now()}${ext}`);
+                            log(`STOR duplicate — renaming to: ${path.basename(uploadPath)}`);
                         }
-                        uploadStream     = fs.createWriteStream(uploadPath);
+
+                        uploadStream = fs.createWriteStream(uploadPath);
                         log(`STOR → ${uploadPath}`);
                         reply(150, 'Ready to receive');
 
+                        // Find which phone this belongs to by matching folder
+                        const relDir    = saveDir.replace(RECORDINGS_DIR, '').replace(/^[/\\]/, '');
+                        const ftpPhone  = relDir.replace(/\//g, '') || null;
+                        const session   = ftpPhone ? _sessions[ftpPhone] : null;
+                        const requestId = session?.requestId || null;
+
                         const slot = assignedPort ? _pasvPool[assignedPort] : null;
 
-                        const onComplete = () => {
-                            const relPath = uploadPath.replace(RECORDINGS_DIR, '').replace(/^[/\\]/, '');
-                            log(`✅ Transfer complete: ${filename}`);
+                        const onComplete = async () => {
+                            const finalFilename = path.basename(uploadPath);
+                            const relPath       = uploadPath.replace(RECORDINGS_DIR, '').replace(/^[/\\]/, '');
+                            const fileSize      = fs.existsSync(uploadPath) ? fs.statSync(uploadPath).size : 0;
+                            const fullPath      = path.resolve(uploadPath);
+
+                            log(`✅ Transfer complete: ${finalFilename} (${fileSize} bytes)`);
                             reply(226, 'Transfer complete');
-                            broadcast({
-                                type:     'ftp_ready',
-                                phone:    slot?.phone || 'unknown',
-                                url:      `/recordings/${relPath}`,
-                                filename: filename,
-                            });
-                            if (assignedPort) {
-                                freePasvPort(assignedPort);
-                                assignedPort = null;
+
+                            const readyPayload = {
+                                type:       'ftp_ready',
+                                phone:      ftpPhone,
+                                requestId,
+                                url:        `/recordings/${relPath}`,
+                                filename:   finalFilename,
+                                filePath:   fullPath,
+                                fileSize,
+                            };
+                            broadcast(readyPayload);
+
+                            // Update Redis with complete status + file info
+                            if (ftpPhone && requestId) {
+                                await updateRedis(ftpPhone, requestId, {
+                                    status:   'complete',
+                                    filePath: fullPath,
+                                    filename: finalFilename,
+                                    url:      `/recordings/${relPath}`,
+                                    fileSize,
+                                });
+                                delete _sessions[ftpPhone];
                             }
+
+                            if (assignedPort) { freePasvPort(assignedPort); assignedPort = null; }
                         };
 
                         const handleData = (ds) => {
@@ -607,7 +814,7 @@ function makeFtpHandler(sessionPasvPort) {
                                     slot.pendingStor = null;
                                     err('No data connection after 30s');
                                     reply(425, 'No data connection');
-                                    if (assignedPort) freePasvPort(assignedPort);
+                                    if (assignedPort) { freePasvPort(assignedPort); assignedPort = null; }
                                 }
                             }, 30000);
                         } else {
@@ -619,20 +826,19 @@ function makeFtpHandler(sessionPasvPort) {
                     case 'QUIT':
                         reply(221, 'Goodbye');
                         ftpSock.end();
-                        if (assignedPort) freePasvPort(assignedPort);
+                        if (assignedPort && !_pasvPool[assignedPort]?.dataSocket) {
+                            freePasvPort(assignedPort); assignedPort = null;
+                        }
                         break;
 
-                    default:
-                        reply(202, 'Command not implemented');
+                    default: reply(202, 'Command not implemented');
                 }
             });
         });
 
-       ftpSock.on('close', () => {
+        ftpSock.on('close', () => {
             log('FTP control connection closed');
-            // Do NOT end uploadStream here — data socket may still be transferring
-            // The write stream will be ended by the data socket's 'end'/'close' events
-            // Only free PASV port after data is done
+            if (uploadStream) { try { uploadStream.end(); } catch (_) {} }
             if (assignedPort && !_pasvPool[assignedPort]?.dataSocket) {
                 freePasvPort(assignedPort);
             }
@@ -641,43 +847,30 @@ function makeFtpHandler(sessionPasvPort) {
     };
 }
 
-// ── Start FTP + PASV servers ──────────────────────────────────────────────────
 function startFtpServer() {
     initPasvPool();
 
-    // One PASV data server per port in the pool
     for (let i = 0; i < PASV_POOL_SIZE; i++) {
         const port = PASV_PORT_START + i;
         const slot = _pasvPool[port];
-
-        const pasvServer = net.createServer(ds => {
-            log(`PASV data connection on :${port} from ${ds.remoteAddress}`);
-            if (slot.pendingStor) {
-                slot.pendingStor(ds);
-                slot.pendingStor = null;
-            } else {
+        const srv  = net.createServer(ds => {
+            log(`PASV data on :${port} from ${ds.remoteAddress}`);
+            if (slot.pendingStor) { slot.pendingStor(ds); slot.pendingStor = null; }
+            else {
                 slot.dataSocket = ds;
-                setTimeout(() => {
-                    if (slot.dataSocket === ds) {
-                        ds.end();
-                        slot.dataSocket = null;
-                    }
-                }, 30000);
+                setTimeout(() => { if (slot.dataSocket === ds) { ds.end(); slot.dataSocket = null; } }, 30000);
             }
         });
-
-        pasvServer.listen(port, '0.0.0.0', () => log(`✓ PASV :${port}`));
-        pasvServer.on('error', e => err(`PASV :${port} error:`, e.message));
-        slot.server = pasvServer;
+        srv.listen(port, '0.0.0.0', () => log(`✓ PASV :${port}`));
+        srv.on('error', e => err(`PASV :${port} error:`, e.message));
+        slot.server = srv;
     }
 
-    // FTP control server
-    const ftpServer = net.createServer(makeFtpHandler(null));
+    const ftpServer = net.createServer(makeFtpHandler());
     ftpServer.listen(FTP_PORT, '0.0.0.0', () => log(`✓ FTP control on :${FTP_PORT}`));
     ftpServer.on('error', e => err(`FTP :${FTP_PORT} error:`, e.message));
 
-    // Port 21 fallback
-    const ftp21 = net.createServer(makeFtpHandler(null));
+    const ftp21 = net.createServer(makeFtpHandler());
     ftp21.listen(21, '0.0.0.0', () => log(`✓ FTP control on :21 (fallback)`));
     ftp21.on('error', e => {
         warn(`Port 21 unavailable (${e.message})`);
@@ -685,8 +878,5 @@ function startFtpServer() {
     });
 }
 
-// ── Boot ──────────────────────────────────────────────────────────────────────
 startFtpServer();
 log(`Started — FTP:${FTP_PORT} PASV:${PASV_PORT_START}-${PASV_PORT_START+PASV_POOL_SIZE-1} HTTP:${HTTP_PORT} WS:${WS_PORT}`);
-log(`Recordings: ${RECORDINGS_DIR}`);
-log(`PASV pool size: ${PASV_POOL_SIZE} (max ${PASV_POOL_SIZE} concurrent uploads)`);
