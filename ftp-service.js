@@ -105,53 +105,85 @@ function connectRedis() {
 redis = connectRedis();
 
 // ── Redis helpers ─────────────────────────────────────────────────────────────
-function redisKey(phone, requestId) {
-    return `ftp:${phone}:${requestId}`;
-}
-function redisListKey(phone) {
-    return `ftp:list:${phone}`;
+//
+// Two Redis structures:
+//
+// 1. CURRENT — one record per phone, shows only the active/latest operation
+//    Key:   ftp:current
+//    Type:  HASH  (field = phone, value = JSON)
+//    Usage: HSET ftp:current <phone> <json>
+//           HGET ftp:current <phone>
+//           HGETALL ftp:current   ← all phones at once
+//
+// 2. HISTORY — ordered list of all requests per phone
+//    Key:   ftp:history:<phone>
+//    Type:  LIST  (newest first, capped at 50)
+//    Usage: LPUSH ftp:history:<phone> <json>
+//           LRANGE ftp:history:<phone> 0 49
+
+const REDIS_CURRENT_KEY = 'ftp:current';
+
+function historyKey(phone) {
+    return `ftp:history:${phone}`;
 }
 
+// Save new record → updates current + appends to history
 async function saveToRedis(record) {
     if (!redis) return;
     try {
-        const key     = redisKey(record.phone, record.requestId);
-        const listKey = redisListKey(record.phone);
-        const now     = new Date().toISOString();
-        record.updatedAt = now;
+        record.updatedAt = new Date().toISOString();
+        const json = JSON.stringify(record);
 
-        await redis.set(key, JSON.stringify(record), 'EX', REDIS_TTL);
+        // 1. Update current hash — HSET ftp:current <phone> <json>
+        await redis.hset(REDIS_CURRENT_KEY, record.phone, json);
 
-        // Keep ordered list of requestIds per phone (latest first, max 50)
-        await redis.lpush(listKey, record.requestId);
-        await redis.ltrim(listKey, 0, 49);
-        await redis.expire(listKey, REDIS_TTL);
+        // 2. Prepend to history list — LPUSH ftp:history:<phone> <json>
+        const hKey = historyKey(record.phone);
+        await redis.lpush(hKey, json);
+        await redis.ltrim(hKey, 0, 49);          // keep latest 50
+        await redis.expire(hKey, REDIS_TTL);
 
-        log(`Redis saved: ${key} status:${record.status}`);
+        log(`Redis saved current[${record.phone}] requestId:${record.requestId} status:${record.status}`);
     } catch (e) {
         err('Redis save error:', e.message);
     }
 }
 
+// Update existing current record + update matching history entry
 async function updateRedis(phone, requestId, patch) {
     if (!redis) return;
     try {
-        const key      = redisKey(phone, requestId);
-        const existing = await redis.get(key);
-        if (!existing) { warn(`Redis key not found: ${key}`); return; }
+        const now = new Date().toISOString();
 
-        const record = { ...JSON.parse(existing), ...patch, updatedAt: new Date().toISOString() };
-        await redis.set(key, JSON.stringify(record), 'EX', REDIS_TTL);
-        log(`Redis updated: ${key} status:${record.status}`);
+        // 1. Update current hash
+        const existing = await redis.hget(REDIS_CURRENT_KEY, phone);
+        if (!existing) { warn(`Redis current[${phone}] not found`); return; }
+        const current = { ...JSON.parse(existing), ...patch, updatedAt: now };
+        await redis.hset(REDIS_CURRENT_KEY, phone, JSON.stringify(current));
+
+        // 2. Update matching entry in history list
+        const hKey = historyKey(phone);
+        const items = await redis.lrange(hKey, 0, 49);
+        for (let i = 0; i < items.length; i++) {
+            const item = JSON.parse(items[i]);
+            if (item.requestId === requestId) {
+                const updated = { ...item, ...patch, updatedAt: now };
+                await redis.lset(hKey, i, JSON.stringify(updated));
+                break;
+            }
+        }
+
+        log(`Redis updated current[${phone}] requestId:${requestId} status:${patch.status || current.status}`);
     } catch (e) {
         err('Redis update error:', e.message);
     }
 }
 
-async function getFromRedis(phone, requestId) {
+// Get current record for a phone
+async function getCurrentFromRedis(phone) {
     if (!redis) return null;
     try {
-        const raw = await redis.get(redisKey(phone, requestId));
+        const raw = await redis.hget(REDIS_CURRENT_KEY, phone);
         return raw ? JSON.parse(raw) : null;
     } catch (e) {
         err('Redis get error:', e.message);
@@ -159,18 +191,57 @@ async function getFromRedis(phone, requestId) {
     }
 }
 
+// Get all current records (all phones)
+async function getAllCurrentFromRedis() {
+    if (!redis) return {};
+    try {
+        const all = await redis.hgetall(REDIS_CURRENT_KEY);
+        if (!all) return {};
+        const result = {};
+        for (const [phone, raw] of Object.entries(all)) {
+            try { result[phone] = JSON.parse(raw); } catch (_) {}
+        }
+        return result;
+    } catch (e) {
+        err('Redis getall error:', e.message);
+        return {};
+    }
+}
+
+// Get by requestId — scan history of all phones
+async function getByRequestId(requestId) {
+    if (!redis) return null;
+    try {
+        // Check all current records first (fast)
+        const all = await redis.hgetall(REDIS_CURRENT_KEY);
+        if (all) {
+            for (const raw of Object.values(all)) {
+                const rec = JSON.parse(raw);
+                if (rec.requestId === requestId) return rec;
+            }
+        }
+        // Not in current — scan history keys
+        const historyKeys = await redis.keys('ftp:history:*');
+        for (const hKey of historyKeys) {
+            const items = await redis.lrange(hKey, 0, 49);
+            for (const raw of items) {
+                const rec = JSON.parse(raw);
+                if (rec.requestId === requestId) return rec;
+            }
+        }
+        return null;
+    } catch (e) {
+        err('Redis getByRequestId error:', e.message);
+        return null;
+    }
+}
+
+// Get history for a phone (latest 50, newest first)
 async function getHistoryFromRedis(phone) {
     if (!redis) return [];
     try {
-        const listKey   = redisListKey(phone);
-        const requestIds = await redis.lrange(listKey, 0, 49);
-        const keys      = requestIds.map(id => redisKey(phone, id));
-        if (!keys.length) return [];
-        const values    = await redis.mget(...keys);
-        return values
-            .filter(Boolean)
-            .map(v => JSON.parse(v))
-            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+        const items = await redis.lrange(historyKey(phone), 0, 49);
+        return items.map(raw => { try { return JSON.parse(raw); } catch (_) { return null; } }).filter(Boolean);
     } catch (e) {
         err('Redis history error:', e.message);
         return [];
@@ -266,28 +337,45 @@ http.createServer((req, res) => {
 
     // ── GET /api/ftp-status/:requestId ────────────────────────────────────────
     if (req.method === 'GET' && urlPath.startsWith('/api/ftp-status/')) {
-        const requestId = urlPath.replace('/api/ftp-status/', '');
-        // Search across all phones for this requestId
+        const requestId = urlPath.replace('/api/ftp-status/', '').trim();
         (async () => {
             if (!redis) {
                 res.writeHead(503, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: 'Redis not configured' }));
                 return;
             }
-            try {
-                // Scan for key matching ftp:*:requestId
-                const keys = await redis.keys(`ftp:*:${requestId}`);
-                if (!keys.length) {
-                    res.writeHead(404, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: 'Request not found' }));
-                    return;
-                }
-                const raw = await redis.get(keys[0]);
+            const record = await getByRequestId(requestId);
+            if (!record) {
+                res.writeHead(404, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: `Request ${requestId} not found` }));
+                return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(record));
+        })();
+        return;
+    }
+
+    // ── GET /api/ftp-current              → all phones current status ─────────
+    // ── GET /api/ftp-current/:phone       → one phone current status ──────────
+    if (req.method === 'GET' && urlPath.startsWith('/api/ftp-current')) {
+        const phone = urlPath.replace('/api/ftp-current', '').replace(/^\//, '').trim();
+        (async () => {
+            if (!redis) {
+                res.writeHead(503, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Redis not configured' }));
+                return;
+            }
+            if (phone) {
+                // Single phone
+                const record = await getCurrentFromRedis(phone);
+                res.writeHead(record ? 200 : 404, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(record || { error: `No current record for phone ${phone}` }));
+            } else {
+                // All phones
+                const all = await getAllCurrentFromRedis();
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(raw || '{}');
-            } catch (e) {
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: e.message }));
+                res.end(JSON.stringify(all));
             }
         })();
         return;
@@ -295,7 +383,7 @@ http.createServer((req, res) => {
 
     // ── GET /api/ftp-history/:phone ───────────────────────────────────────────
     if (req.method === 'GET' && urlPath.startsWith('/api/ftp-history/')) {
-        const phone = urlPath.replace('/api/ftp-history/', '');
+        const phone = urlPath.replace('/api/ftp-history/', '').trim();
         (async () => {
             const history = await getHistoryFromRedis(phone);
             res.writeHead(200, { 'Content-Type': 'application/json' });
