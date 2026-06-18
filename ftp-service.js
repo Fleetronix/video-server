@@ -525,7 +525,7 @@ async function triggerDownload({ phone, ch, startTime, endTime, folder }) {
     if (!folder) folder = `/${phone}/`;
 
     // Generate unique request ID
-    const requestId = crypto.randomBytes(8).toString('hex');
+    const requestId = folder;
     const createdAt = new Date().toISOString();
 
     log(`▶ triggerDownload requestId:${requestId} phone:${phone} ch:${ch} ${startTime} → ${endTime} folder:${folder}`);
