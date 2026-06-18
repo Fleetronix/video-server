@@ -250,8 +250,10 @@ async function getHistoryFromRedis(phone) {
 }
 
 // ── Internal state ────────────────────────────────────────────────────────────
-// _sessions[phone] = { requestId, ch, startTime, endTime, folder, sentAt }
-const _sessions = {};
+// _queue[phone]   = array of pending jobs waiting to be sent to camera
+// _sessions[phone] = the SINGLE job currently active (sent to camera)
+const _queue    = {};   // { [phone]: [ job, job, ... ] }
+const _sessions = {};   // { [phone]: job }  — currently active job
 const _seqMap   = {};
 
 // PASV pool
@@ -412,6 +414,19 @@ http.createServer((req, res) => {
         return;
     }
 
+    // ── GET /api/ftp-queue/:phone  → pending queue for a phone ───────────────
+    if (req.method === 'GET' && urlPath.startsWith('/api/ftp-queue/')) {
+        const phone = urlPath.replace('/api/ftp-queue/', '').trim();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            phone,
+            active:  _sessions[phone] || null,
+            pending: (_queue[phone] || []).map((j, i) => ({ ...j, queuePosition: i + 1 })),
+            total:   (_queue[phone]?.length || 0) + (_sessions[phone] ? 1 : 0),
+        }));
+        return;
+    }
+
     // ── GET /api/sessions ─────────────────────────────────────────────────────
     if (req.method === 'GET' && urlPath === '/api/sessions') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -449,10 +464,16 @@ bus.on('device:connected', ({ phone }) => {
 
 bus.on('device:disconnected', ({ phone }) => {
     log(`Device disconnected: ${phone}`);
-    // Mark any in-progress session as failed
     if (_sessions[phone]) {
         updateRedis(phone, _sessions[phone].requestId, { status: 'failed', error: 'Device disconnected' });
         delete _sessions[phone];
+    }
+    // Fail all queued jobs too
+    if (_queue[phone]) {
+        _queue[phone].forEach(job => {
+            updateRedis(phone, job.requestId, { status: 'failed', error: 'Device disconnected' });
+        });
+        _queue[phone] = [];
     }
     delete _seqMap[phone];
 });
@@ -479,7 +500,7 @@ bus.on('device:message', ({ msgId, body, seq, phone }) => {
                         status: 'failed',
                         error: `Camera rejected 0x9206 (code ${replyResult})`,
                     });
-                    delete _sessions[phone];
+                    jobFinished(phone);  // ← move to next
                 }
             }
         }
@@ -496,7 +517,7 @@ bus.on('device:message', ({ msgId, body, seq, phone }) => {
             const session = _sessions[phone];
             if (session) {
                 updateRedis(phone, session.requestId, { status: 'failed', error: '0 files found on camera' });
-                delete _sessions[phone];
+                jobFinished(phone);  // ← move to next
             }
         } else {
             broadcast({ type: 'status', phone, message: `📁 Camera found ${totalFiles} file(s)` });
@@ -504,7 +525,7 @@ bus.on('device:message', ({ msgId, body, seq, phone }) => {
         return;
     }
 
-    // 0x1206 — file upload complete
+    // 0x1206 — file upload complete notification from camera
     if (msgId === 0x1206) {
         const result  = body[2];
         const session = _sessions[phone];
@@ -521,39 +542,75 @@ bus.on('device:message', ({ msgId, body, seq, phone }) => {
                     status: 'failed',
                     error:  `Camera reported upload failure (code ${result})`,
                 });
-                delete _sessions[phone];
+                jobFinished(phone);  // ← move to next
             }
         }
-        // result=0: FTP STOR handler will mark complete when file lands
+        // result=0: onComplete in STOR handler calls jobFinished after file saved
     }
 });
 
 // ── Core logic ────────────────────────────────────────────────────────────────
+
+// Process next job in queue for a phone — called after each job completes/fails
+async function processNextInQueue(phone) {
+    // If something still active, wait for it to finish
+    if (_sessions[phone]) return;
+
+    const queue = _queue[phone];
+    if (!queue || queue.length === 0) {
+        log(`[${phone}] Queue empty`);
+        return;
+    }
+
+    const job = queue.shift();
+    log(`[${phone}] Queue: starting job requestId:${job.requestId} (${queue.length} remaining)`);
+
+    _sessions[phone] = job;
+
+    // Update Redis status to in_progress
+    await updateRedis(phone, job.requestId, { status: 'in_progress', queuePosition: 0 });
+    broadcast({ type: 'status', phone, requestId: job.requestId, message: `▶ Starting download ch${job.ch} ${job.startTime} → ${job.endTime}` });
+
+    // Step 1 — query file list
+    bus.emit('device:send', { phone, frame: build9205(phone, job.ch, job.startTime, job.endTime) });
+    log(`[${phone}] Sent 0x9205`);
+
+    // Step 2 — send FTP command after 3s
+    setTimeout(async () => {
+        // Check session still matches — may have been cancelled
+        if (_sessions[phone]?.requestId !== job.requestId) return;
+        const frame = build9206(phone, job.ch, job.startTime, job.endTime, job.folder);
+        bus.emit('device:send', { phone, frame });
+        log(`[${phone}] Sent 0x9206 folder:${job.folder}`);
+        broadcast({ type: 'status', phone, requestId: job.requestId, message: `⏳ FTP command sent to camera...` });
+    }, 3000);
+}
+
+// Called when a job finishes (complete or failed) — clears session and starts next
+async function jobFinished(phone) {
+    delete _sessions[phone];
+    // Small delay so camera can reset before next job
+    setTimeout(() => processNextInQueue(phone), 2000);
+}
+
 async function triggerDownload({ phone, ch, startTime, endTime, folder, requestKey }) {
     phone = String(phone);
     if (!folder) folder = `/${phone}/`;
 
-    // Generate unique request ID
-    const requestId = requestKey;
+    const requestId = requestKey || crypto.randomBytes(8).toString('hex');
     const createdAt = new Date().toISOString();
 
-    log(`▶ triggerDownload requestId:${requestId} phone:${phone} ch:${ch} ${startTime} → ${endTime} folder:${folder}`);
+    // Init queue for this phone
+    if (!_queue[phone]) _queue[phone] = [];
 
-    // Cancel any stuck previous session
-    if (_sessions[phone]) {
-        bus.emit('device:send', { phone, frame: build9207(phone, 0, 2) });
-        await updateRedis(phone, _sessions[phone].requestId, {
-            status: 'failed',
-            error:  'Superseded by new request',
-        });
-        delete _sessions[phone];
-    }
+    const queuePosition = _queue[phone].length + (_sessions[phone] ? 1 : 0);
 
-    // Build the expected file path (camera uses its own naming convention)
-    // We can't know exact filename until STOR — but we know the folder
-    const expectedFolder = path.join(RECORDINGS_DIR, folder);
+    log(`▶ triggerDownload requestId:${requestId} phone:${phone} ch:${ch} ${startTime} → ${endTime} queuePos:${queuePosition}`);
 
-    // Save initial Redis record
+    // Build job
+    const job = { requestId, phone, ch, startTime, endTime, folder, sentAt: null };
+
+    // Save to Redis as queued
     const record = {
         requestId,
         phone,
@@ -562,46 +619,54 @@ async function triggerDownload({ phone, ch, startTime, endTime, folder, requestK
         endTime,
         folder,
         status:         'queued',
+        queuePosition,
         filePath:       null,
         filename:       null,
         url:            null,
         fileSize:       null,
-        expectedFolder: expectedFolder,
         createdAt,
         updatedAt:      createdAt,
         error:          null,
     };
     await saveToRedis(record);
 
-    // Store session in memory
-    _sessions[phone] = { requestId, ch, startTime, endTime, folder, sentAt: Date.now() };
+    // Push to queue
+    _queue[phone].push(job);
 
-    // Step 1 — query file list
-    bus.emit('device:send', { phone, frame: build9205(phone, ch, startTime, endTime) });
-    log(`[${phone}] Sent 0x9205`);
-    broadcast({ type: 'status', phone, requestId, message: `🔍 Querying camera for ch${ch} recordings...` });
+    broadcast({
+        type:     'status',
+        phone,
+        requestId,
+        message:  queuePosition === 0
+            ? `▶ Starting immediately`
+            : `⏳ Queued at position ${queuePosition}`,
+    });
 
-    // Step 2 — send FTP command after 3s
-    setTimeout(async () => {
-        const frame = build9206(phone, ch, startTime, endTime, folder);
-        bus.emit('device:send', { phone, frame });
-        log(`[${phone}] Sent 0x9206 folder:${folder}`);
-        broadcast({ type: 'status', phone, requestId, message: `⏳ FTP command sent to camera...` });
-        await updateRedis(phone, requestId, { status: 'in_progress' });
-    }, 3000);
+    // Update queue positions for all waiting jobs
+    _queue[phone].forEach((j, i) => {
+        updateRedis(phone, j.requestId, { queuePosition: i + 1 });
+    });
 
-    // Return immediately with requestId so caller can track
+    // Start processing if nothing active
+    if (!_sessions[phone]) {
+        processNextInQueue(phone);
+    }
+
     return {
         requestId,
-        status:    'queued',
+        status:       'queued',
+        queuePosition,
         phone,
         ch,
         startTime,
         endTime,
         folder,
-        trackUrl:  `/api/ftp-status/${requestId}`,
-        historyUrl: `/api/ftp-history/${phone}`,
-        message:   'Download queued. Use trackUrl to poll status.',
+        trackUrl:     `/api/ftp-status/${requestId}`,
+        historyUrl:   `/api/ftp-history/${phone}`,
+        queueUrl:     `/api/ftp-queue/${phone}`,
+        message:      queuePosition === 0
+            ? 'Starting immediately.'
+            : `Queued at position ${queuePosition}. ${_queue[phone].length} job(s) waiting.`,
     };
 }
 
@@ -614,9 +679,9 @@ function cancelDownload(phone) {
     }
     bus.emit('device:send', { phone, frame: build9207(phone, 0, 2) });
     updateRedis(phone, session.requestId, { status: 'failed', error: 'Cancelled by user' });
-    delete _sessions[phone];
     broadcast({ type: 'status', phone, message: '🛑 Download cancelled' });
-    log(`[${phone}] Cancelled`);
+    log(`[${phone}] Cancelled requestId:${session.requestId}`);
+    jobFinished(phone);  // move to next in queue
 }
 
 // ── Frame builders ────────────────────────────────────────────────────────────
@@ -914,9 +979,9 @@ function makeFtpHandler() {
                                     url:      `/recordings/${relPath}`,
                                     fileSize,
                                 });
-                                // Clean up session only after Redis is updated
-                                delete _sessions[ftpPhone];
                                 log(`Redis marked complete for ${ftpPhone} requestId:${capturedRequestId}`);
+                                // Move to next job in queue
+                                await jobFinished(ftpPhone);
                             } else {
                                 log(`⚠️ No requestId captured — Redis not updated. phone:${ftpPhone}`);
                             }
