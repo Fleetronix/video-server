@@ -153,7 +153,7 @@ async function updateRedis(phone, requestId, patch) {
         const existingStoppageVideoRecordingTriggered = await redis.hget(STOPPAGE_VIDEO_RECORDING_TRIGGERED, requestId);
         if (existingStoppageVideoRecordingTriggered) {
             const stopValue = JSON.parse(existingStoppageVideoRecordingTriggered);
-            const currentData = { ...JSON.parse(existingStoppageVideoRecordingTriggered), ...patch, updatedAt: now };
+            const currentData = { ...patch, updatedAt: now };
             await redis.hset(STOPPAGE_VIDEO_RECORDING_TRIGGERED, requestId, JSON.stringify(currentData));
         }
 
