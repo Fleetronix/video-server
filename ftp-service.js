@@ -851,9 +851,37 @@ function makeFtpHandler() {
                             completed = true;
 
                             const finalFilename = path.basename(uploadPath);
+
+                            //only for custom name
+                            let finalPath     = uploadPath;
+
+                            // Rename if customName provided
+                            const customName = process.env.CUSTOM_FILENAME || null;  
+                            if (customName) {
+                                const ext     = path.extname(finalFilename);
+                                const newName = customName.endsWith(ext) ? customName : `${customName}${ext}`;
+                                const newPath = path.join(path.dirname(uploadPath), newName);
+                                try {
+                                    fs.renameSync(uploadPath, newPath);
+                                    finalFilename = newName;
+                                    finalPath     = newPath;
+                                    log(`Renamed → ${newName}`);
+                                } catch (e) {
+                                    err(`Rename failed: ${e.message}`);
+                                }
+                            }
+                            
+
                             const relPath       = path.relative(path.resolve(RECORDINGS_DIR), path.resolve(uploadPath));
                             const fileSize      = fs.existsSync(uploadPath) ? fs.statSync(uploadPath).size : 0;
                             const fullPath      = path.resolve(uploadPath);
+
+
+                            //end of custom name ------------
+
+                            // const relPath  = path.relative(path.resolve(RECORDINGS_DIR), path.resolve(finalPath));
+                            // const fileSize = fs.existsSync(finalPath) ? fs.statSync(finalPath).size : 0;
+                            // const fullPath = path.resolve(finalPath);
 
                             log(`✅ Transfer complete: ${finalFilename} (${fileSize} bytes) phone:${ftpPhone} requestId:${capturedRequestId}`);
                             reply(226, 'Transfer complete');
