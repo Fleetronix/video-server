@@ -308,6 +308,7 @@ http.createServer((req, res) => {
         req.on('data', c => body += c);
         req.on('end', async () => {
             try {
+                console.log("[FTP-SVC] /api/ftp-download body:", body);
                 const { phone, ch, startTime, endTime, folder } = JSON.parse(body);
                 if (!phone || !ch || !startTime || !endTime) {
                     res.writeHead(400, { 'Content-Type': 'application/json' });
