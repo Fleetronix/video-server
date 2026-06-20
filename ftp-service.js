@@ -44,6 +44,7 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const Redis  = require('ioredis');
 const bus    = require('./device-bus');
+const { BlobServiceClient } = require('@azure/storage-blob');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const SERVER_IP       = process.env.SERVER_IP             || '127.0.0.1';
@@ -54,6 +55,11 @@ const HTTP_PORT       = parseInt(process.env.FTP_HTTP_PORT|| '8082');
 const WS_PORT         = parseInt(process.env.FTP_WS_PORT  || '8802');
 const RECORDINGS_DIR  = process.env.RECORDINGS_DIR        || './recordings';
 const REDIS_TTL       = parseInt(process.env.REDIS_TTL    || String(7 * 24 * 3600)); // 7 days
+
+// Azure Blob Storage
+const AZURE_CONN_STRING  = process.env.AZURE_STORAGE_CONNECTION_STRING || null;
+const AZURE_CONTAINER    = process.env.AZURE_STORAGE_CONTAINER         || 'recordings';
+const DELETE_LOCAL_AFTER_UPLOAD = process.env.DELETE_LOCAL_AFTER_UPLOAD !== 'false'; // default true
 
 // Phone → SN mapping
 const PHONE_TO_SN = {
@@ -70,6 +76,31 @@ if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR, { recursive: tr
 const log  = (...a) => console.log ('[FTP-SVC]', ...a);
 const warn = (...a) => console.warn('[FTP-SVC]', ...a);
 const err  = (...a) => console.error('[FTP-SVC]', ...a);
+
+// ── Azure Blob Storage ───────────────────────────────────────────────────────
+let blobServiceClient = null;
+let containerClient   = null;
+
+async function initAzureBlob() {
+    if (!AZURE_CONN_STRING) {
+        warn('AZURE_STORAGE_CONNECTION_STRING not set — Blob upload disabled, files stay local only.');
+        return;
+    }
+    try {
+        blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_CONN_STRING);
+        containerClient    = blobServiceClient.getContainerClient(AZURE_CONTAINER);
+        await containerClient.createIfNotExists();
+        log(`✅ Azure Blob ready — container: ${AZURE_CONTAINER}`);
+    } catch (e) {
+        err('Azure Blob init error:', e.message);
+        blobServiceClient = null;
+        containerClient   = null;
+    }
+}
+initAzureBlob();
+
+// Note: file→blob upload now happens inline via blockBlobClient.uploadStream()
+// directly from the FTP data socket in the STOR handler — no local file helper needed.
 
 // ── Redis ─────────────────────────────────────────────────────────────────────
 let redis = null;
@@ -886,101 +917,69 @@ function makeFtpHandler() {
                             ? path.join(RECORDINGS_DIR, argDir)
                             : path.join(RECORDINGS_DIR, currentDir);
 
-                        if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
-
                         const filename = path.basename(arg || `rec_${Date.now()}.mp4`);
-                        let uploadPath = path.join(saveDir, filename);
 
-                        // Rename if duplicate from same camera retry
-                        if (fs.existsSync(uploadPath) && fs.statSync(uploadPath).size > 1024) {
-                            const ext  = path.extname(filename);
-                            const base = path.basename(filename, ext);
-                            uploadPath = path.join(saveDir, `${base}_${Date.now()}${ext}`);
-                            log(`STOR duplicate — renaming to: ${path.basename(uploadPath)}`);
-                        }
-
-                        uploadStream = fs.createWriteStream(uploadPath);
-                        log(`STOR → ${uploadPath}`);
-                        reply(150, 'Ready to receive');
-
-                        // ── Identify phone and requestId NOW (before async completes) ──
-                        // Extract phone from folder using path.relative to handle ./recordings vs recordings
+                        // ── Identify phone and requestId NOW ──────────────────────────
                         const relDir   = path.relative(path.resolve(RECORDINGS_DIR), path.resolve(saveDir));
-                        // relDir is now just "15760064474" (the phone folder)
                         const ftpPhone = relDir.split(path.sep)[0] || null;
-
-                        // Capture requestId from session AT THIS MOMENT — not inside async callback
-                        // because _sessions[phone] may be deleted by then
                         const capturedRequestId = ftpPhone ? (_sessions[ftpPhone]?.requestId || null) : null;
 
-                        log(`STOR phone:${ftpPhone} requestId:${capturedRequestId}`);
+                        log(`STOR phone:${ftpPhone} requestId:${capturedRequestId} filename:${filename}`);
+
+                        if (!containerClient) {
+                            err('Azure Blob not configured — cannot accept STOR. Set AZURE_STORAGE_CONNECTION_STRING.');
+                            reply(550, 'Storage backend not configured');
+                            break;
+                        }
+
+                        // Custom rename if set
+                        let finalFilename = filename;
+                        const customName = process.env.CUSTOM_FILENAME || null;
+                        if (customName) {
+                            const ext = path.extname(filename);
+                            finalFilename = customName.endsWith(ext) ? customName : `${customName}${ext}`;
+                        }
+
+                        const blobPath = `${ftpPhone || 'unknown'}/${finalFilename}`;
+                        const blockBlobClient = containerClient.getBlockBlobClient(blobPath);
+
+                        log(`STOR → streaming directly to Azure Blob: ${blobPath}`);
+                        reply(150, 'Ready to receive');
 
                         const slot = assignedPort ? _pasvPool[assignedPort] : null;
-
-                        // Guard against onComplete firing twice (end + close both call uploadStream.end())
                         let completed = false;
 
-                        const onComplete = async () => {
+                        const onComplete = async (fileSize) => {
                             if (completed) return;
                             completed = true;
 
-                            const finalFilename = path.basename(uploadPath);
-
-                            //only for custom name
-                            let finalPath     = uploadPath;
-
-                            // Rename if customName provided
-                            const customName = process.env.CUSTOM_FILENAME || null;  
-                            if (customName) {
-                                const ext     = path.extname(finalFilename);
-                                const newName = customName.endsWith(ext) ? customName : `${customName}${ext}`;
-                                const newPath = path.join(path.dirname(uploadPath), newName);
-                                try {
-                                    fs.renameSync(uploadPath, newPath);
-                                    finalFilename = newName;
-                                    finalPath     = newPath;
-                                    log(`Renamed → ${newName}`);
-                                } catch (e) {
-                                    err(`Rename failed: ${e.message}`);
-                                }
-                            }
-                            
-
-                            const relPath       = path.relative(path.resolve(RECORDINGS_DIR), path.resolve(uploadPath));
-                            const fileSize      = fs.existsSync(uploadPath) ? fs.statSync(uploadPath).size : 0;
-                            const fullPath      = path.resolve(uploadPath);
-
-
-                            //end of custom name ------------
-
-                            // const relPath  = path.relative(path.resolve(RECORDINGS_DIR), path.resolve(finalPath));
-                            // const fileSize = fs.existsSync(finalPath) ? fs.statSync(finalPath).size : 0;
-                            // const fullPath = path.resolve(finalPath);
-
-                            log(`✅ Transfer complete: ${finalFilename} (${fileSize} bytes) phone:${ftpPhone} requestId:${capturedRequestId}`);
+                            const blobUrl = blockBlobClient.url;
+                            log(`✅ ☁️  Blob upload complete: ${blobPath} (${fileSize} bytes)`);
                             reply(226, 'Transfer complete');
 
                             broadcast({
                                 type:      'ftp_ready',
                                 phone:     ftpPhone,
                                 requestId: capturedRequestId,
-                                url:       `/recordings/${relPath}`,
+                                url:       blobUrl,
                                 filename:  finalFilename,
-                                filePath:  fullPath,
+                                blobUrl,
+                                blobPath,
                                 fileSize,
                             });
 
-                            // Update Redis to complete
                             if (ftpPhone && capturedRequestId) {
                                 await updateRedis(ftpPhone, capturedRequestId, {
                                     status:   'complete',
-                                    filePath: fullPath,
+                                    filePath: null,
                                     filename: finalFilename,
-                                    url:      `/recordings/${relPath}`,
+                                    url:      blobUrl,
+                                    blobUrl,
+                                    blobPath,
+                                    storedIn: 'azure-blob',
                                     fileSize,
                                 });
                                 log(`Redis marked complete for ${ftpPhone} requestId:${capturedRequestId}`);
-                                // Move to next job in queue
                                 await jobFinished(ftpPhone);
                             } else {
                                 log(`⚠️ No requestId captured — Redis not updated. phone:${ftpPhone}`);
@@ -989,17 +988,33 @@ function makeFtpHandler() {
                             if (assignedPort) { freePasvPort(assignedPort); assignedPort = null; }
                         };
 
-                        const handleData = (ds) => {
-                            log(`Piping data → ${uploadPath}`);
-                            ds.pipe(uploadStream);
-                            uploadStream.on('finish', onComplete);
-                            // Only call uploadStream.end() once — prefer 'end' over 'close'
-                            ds.on('end',   () => { uploadStream.end(); });
-                            ds.on('error', e => {
-                                err('Data socket error:', e.message);
-                                reply(426, 'Transfer aborted');
-                                uploadStream.destroy();
-                            });
+                        const onError = (e) => {
+                            if (completed) return;
+                            completed = true;
+                            err(`Blob upload error for ${blobPath}:`, e.message);
+                            reply(426, 'Transfer aborted — storage upload failed');
+                            if (assignedPort) { freePasvPort(assignedPort); assignedPort = null; }
+                        };
+
+                        // ── Pipe FTP data socket directly into Azure Blob — no disk write ──
+                        const handleData = async (ds) => {
+                            log(`Streaming data socket → Azure Blob (no local disk)`);
+                            let totalBytes = 0;
+                            ds.on('data', chunk => { totalBytes += chunk.length; });
+                            ds.on('error', onError);
+
+                            try {
+                                // uploadStream() reads from the Node Readable (ds) and uploads in blocks
+                                await blockBlobClient.uploadStream(
+                                    ds,
+                                    4 * 1024 * 1024,   // bufferSize: 4MB per block
+                                    5,                  // maxConcurrency: 5 parallel blocks
+                                    { blobHTTPHeaders: { blobContentType: 'video/mp4' } }
+                                );
+                                await onComplete(totalBytes);
+                            } catch (e) {
+                                onError(e);
+                            }
                         };
 
                         if (slot?.dataSocket) {
