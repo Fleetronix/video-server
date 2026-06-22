@@ -952,6 +952,7 @@ function makeFtpHandler() {
                         const onComplete = async (fileSize) => {
                             if (completed) return;
                             completed = true;
+                            clearTimeout(uploadTimeout);
 
                             const blobUrl = blockBlobClient.url;
                             log(`✅ ☁️  Blob upload complete: ${blobPath} (${fileSize} bytes)`);
@@ -993,23 +994,51 @@ function makeFtpHandler() {
                             completed = true;
                             err(`Blob upload error for ${blobPath}:`, e.message);
                             reply(426, 'Transfer aborted — storage upload failed');
+                            if (ftpPhone && capturedRequestId) {
+                                updateRedis(ftpPhone, capturedRequestId, {
+                                    status: 'failed',
+                                    error:  `Azure Blob upload failed: ${e.message}`,
+                                });
+                                jobFinished(ftpPhone);
+                            }
                             if (assignedPort) { freePasvPort(assignedPort); assignedPort = null; }
                         };
+
+                        // Safety timeout — if upload hangs for 10 min, fail it
+                        const uploadTimeout = setTimeout(() => {
+                            if (!completed) {
+                                onError(new Error('Upload timeout after 10 minutes'));
+                            }
+                        }, 10 * 60 * 1000);
 
                         // ── Pipe FTP data socket directly into Azure Blob — no disk write ──
                         const handleData = async (ds) => {
                             log(`Streaming data socket → Azure Blob (no local disk)`);
+
+                            // Wrap in PassThrough so we can handle 'close' without 'end'
+                            // Azure SDK's uploadStream needs a proper stream end signal
+                            const { PassThrough } = require('stream');
+                            const pass = new PassThrough();
                             let totalBytes = 0;
-                            ds.on('data', chunk => { totalBytes += chunk.length; });
-                            ds.on('error', onError);
+
+                            ds.on('data',  chunk => { totalBytes += chunk.length; });
+                            ds.on('error', e => { pass.destroy(e); });
+                            ds.on('end',   () => { pass.end(); });
+                            ds.on('close', () => {
+                                // Some cameras close socket without emitting 'end'
+                                if (!pass.writableEnded) pass.end();
+                            });
+                            ds.pipe(pass);
 
                             try {
-                                // uploadStream() reads from the Node Readable (ds) and uploads in blocks
                                 await blockBlobClient.uploadStream(
-                                    ds,
-                                    4 * 1024 * 1024,   // bufferSize: 4MB per block
-                                    5,                  // maxConcurrency: 5 parallel blocks
-                                    { blobHTTPHeaders: { blobContentType: 'video/mp4' } }
+                                    pass,
+                                    4 * 1024 * 1024,   // 4MB block size
+                                    5,                  // 5 parallel blocks
+                                    {
+                                        blobHTTPHeaders:    { blobContentType: 'video/mp4' },
+                                        onProgress: (p) => log(`☁️  Blob upload progress: ${p.loadedBytes} bytes`),
+                                    }
                                 );
                                 await onComplete(totalBytes);
                             } catch (e) {
