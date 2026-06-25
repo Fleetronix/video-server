@@ -552,6 +552,24 @@ bus.on('device:message', ({ msgId, body, seq, phone }) => {
             }
         } else {
             broadcast({ type: 'status', phone, message: `📁 Camera found ${totalFiles} file(s)` });
+            const session = _sessions[phone];
+            if (session) {
+                session.expectedFiles = totalFiles;          // upper bound reported by camera
+                session.startedFiles  = session.startedFiles  || 0;
+                session.resolvedFiles = session.resolvedFiles || 0;
+                session.savedFiles    = session.savedFiles    || 0;
+                session.cameraDone    = false;
+                // Safety net — advance the queue even if the camera never says "done"
+                if (session._jobTimeout) clearTimeout(session._jobTimeout);
+                session._jobTimeout = setTimeout(() => {
+                    warn(`[${phone}] Job timeout — saved ${session.savedFiles}/${totalFiles} file(s)`);
+                    updateRedis(phone, session.requestId, {
+                        status: session.savedFiles > 0 ? 'partial' : 'failed',
+                        error:  `Timed out: ${session.savedFiles}/${totalFiles} saved`,
+                    });
+                    jobFinished(phone, 'job-timeout');
+                }, 15 * 60 * 1000);
+            }
         }
         return;
     }
@@ -573,10 +591,24 @@ bus.on('device:message', ({ msgId, body, seq, phone }) => {
                     status: 'failed',
                     error:  `Camera reported upload failure (code ${result})`,
                 });
-                jobFinished(phone);  // ← move to next
+                jobFinished(phone, '0x1206-fail');  // ← move to next
+            }
+        } else if (session) {
+            // Camera finished sending EVERY file for this instruction.
+            // Whatever transfers have started are the full set.
+            session.cameraDone = true;
+            log(`[${phone}] 0x1206 done — started:${session.startedFiles || 0} saved:${session.savedFiles || 0}`);
+            if ((session.startedFiles || 0) === 0) {
+                // Camera said done but never opened a transfer — nothing to save
+                updateRedis(phone, session.requestId, {
+                    status: 'failed',
+                    error:  'Camera reported done but uploaded nothing',
+                });
+                jobFinished(phone, '0x1206-empty');
+            } else {
+                maybeFinish(phone);
             }
         }
-        // result=0: onComplete in STOR handler calls jobFinished after file saved
     }
 });
 
@@ -617,8 +649,30 @@ async function processNextInQueue(phone) {
     }, 3000);
 }
 
-// Called when a job finishes (complete or failed) — clears session and starts next
-async function jobFinished(phone) {
+// Advance the queue only when the camera says it's done AND every transfer that
+// started has resolved (uploaded to Azure or failed). Handles the case where the
+// camera lists 3 files but sends fewer, and where the last blob is still flushing.
+function maybeFinish(phone) {
+    const s = _sessions[phone];
+    if (!s) return;
+    if (s.cameraDone &&
+        (s.startedFiles  || 0) > 0 &&
+        (s.resolvedFiles || 0) >= (s.startedFiles || 0)) {
+        updateRedis(phone, s.requestId, {
+            status:     (s.savedFiles || 0) > 0 ? 'complete' : 'failed',
+            filesSaved: s.savedFiles || 0,
+        });
+        jobFinished(phone, 'all-files-resolved');
+    }
+}
+
+// Called when a job finishes (complete or failed) — clears session and starts next.
+// Idempotent: duplicate calls for the same job are ignored.
+async function jobFinished(phone, reason = 'done') {
+    const job = _sessions[phone];
+    if (!job) return;                       // already finished — ignore duplicate
+    if (job._jobTimeout) { clearTimeout(job._jobTimeout); job._jobTimeout = null; }
+    log(`[${phone}] jobFinished (${reason}) requestId:${job.requestId} saved:${job.savedFiles || 0}/${job.expectedFiles || '?'}`);
     delete _sessions[phone];
     // Small delay so camera can reset before next job
     setTimeout(() => processNextInQueue(phone), 2000);
@@ -940,6 +994,21 @@ function makeFtpHandler() {
                             finalFilename = customName.endsWith(ext) ? customName : `${customName}${ext}`;
                         }
 
+                        // ── Make blob name UNIQUE per file ──────────────────────────
+                        // Camera may upload several files per request, and CUSTOM_FILENAME
+                        // (if set) is identical for every one — without this they all
+                        // overwrite the same blob, so only the last survives.
+                        const sess    = ftpPhone ? _sessions[ftpPhone] : null;
+                        const fileSeq = sess ? ((sess.startedFiles || 0) + 1) : 1;
+                        if (sess) sess.startedFiles = fileSeq;
+                        {
+                            const ext2 = path.extname(finalFilename);
+                            const stem = path.basename(finalFilename, ext2);
+                            finalFilename = capturedRequestId
+                                ? `${capturedRequestId}_${String(fileSeq).padStart(2, '0')}_${stem}${ext2}`
+                                : `${Date.now()}_${stem}${ext2}`;
+                        }
+
                         const blobPath = `${ftpPhone || 'unknown'}/${finalFilename}`;
                         const blockBlobClient = containerClient.getBlockBlobClient(blobPath);
 
@@ -970,18 +1039,28 @@ function makeFtpHandler() {
                             });
 
                             if (ftpPhone && capturedRequestId) {
+                                const session = _sessions[ftpPhone];
+                                if (session && session.requestId === capturedRequestId) {
+                                    session.savedFiles    = (session.savedFiles    || 0) + 1;
+                                    session.resolvedFiles = (session.resolvedFiles || 0) + 1;
+                                }
+                                const saved    = session ? session.savedFiles : 1;
+                                const expected = session ? (session.expectedFiles || 1) : 1;
+
                                 await updateRedis(ftpPhone, capturedRequestId, {
-                                    status:   'complete',
-                                    filePath: null,
-                                    filename: finalFilename,
-                                    url:      blobUrl,
+                                    status:        (session && saved < expected && !session.cameraDone) ? 'in_progress' : 'complete',
+                                    filePath:      null,
+                                    filename:      finalFilename,
+                                    url:           blobUrl,
                                     blobUrl,
                                     blobPath,
-                                    storedIn: 'azure-blob',
+                                    storedIn:      'azure-blob',
                                     fileSize,
+                                    filesSaved:    saved,
+                                    filesExpected: expected,
                                 });
-                                log(`Redis marked complete for ${ftpPhone} requestId:${capturedRequestId}`);
-                                await jobFinished(ftpPhone);
+                                log(`[${ftpPhone}] file ${saved}/${expected} saved → ${blobPath}`);
+                                maybeFinish(ftpPhone);
                             } else {
                                 log(`⚠️ No requestId captured — Redis not updated. phone:${ftpPhone}`);
                             }
@@ -995,11 +1074,17 @@ function makeFtpHandler() {
                             err(`Blob upload error for ${blobPath}:`, e.message);
                             reply(426, 'Transfer aborted — storage upload failed');
                             if (ftpPhone && capturedRequestId) {
+                                const session = _sessions[ftpPhone];
+                                if (session && session.requestId === capturedRequestId) {
+                                    session.resolvedFiles = (session.resolvedFiles || 0) + 1;
+                                }
                                 updateRedis(ftpPhone, capturedRequestId, {
                                     status: 'failed',
                                     error:  `Azure Blob upload failed: ${e.message}`,
                                 });
-                                jobFinished(ftpPhone);
+                                // One file failed — don't kill the whole job; let the
+                                // remaining files finish, then advance.
+                                maybeFinish(ftpPhone);
                             }
                             if (assignedPort) { freePasvPort(assignedPort); assignedPort = null; }
                         };
@@ -1015,32 +1100,43 @@ function makeFtpHandler() {
                         const handleData = async (ds) => {
                             log(`Streaming data socket → Azure Blob (no local disk)`);
 
+                            // Wrap in PassThrough so we can handle 'close' without 'end'
+                            // Azure SDK's uploadStream needs a proper stream end signal
                             const { PassThrough } = require('stream');
                             const pass = new PassThrough();
                             let totalBytes = 0;
+
+                            // Idle timeout: no bytes for 60s → treat the socket as dead and
+                            // abort cleanly, instead of waiting the full 10-minute backstop.
+                            ds.setTimeout(60000, () => {
+                                err(`Data socket idle 60s — aborting (${totalBytes} bytes so far)`);
+                                pass.destroy(new Error(`Idle timeout after ${totalBytes} bytes`));
+                                try { ds.destroy(); } catch (_) {}
+                            });
 
                             ds.on('data',  chunk => { totalBytes += chunk.length; });
                             ds.on('error', e => { pass.destroy(e); });
                             ds.on('end',   () => { pass.end(); });
                             ds.on('close', () => {
+                                // Some cameras close socket without emitting 'end'
                                 if (!pass.writableEnded) pass.end();
                             });
 
-                            // Guard: socket may have already finished if it arrived early
+                            // Guard: an early-arriving socket may already be finished
                             if (ds.destroyed || ds.readableEnded) {
                                 pass.end();
                             } else {
-                                ds.resume();                // undo the pause() from the connection handler
+                                ds.resume();   // undo pause() applied to early sockets
                                 ds.pipe(pass);
                             }
 
                             try {
                                 await blockBlobClient.uploadStream(
                                     pass,
-                                    4 * 1024 * 1024,
-                                    5,
+                                    4 * 1024 * 1024,   // 4MB block size
+                                    5,                  // 5 parallel blocks
                                     {
-                                        blobHTTPHeaders: { blobContentType: 'video/mp4' },
+                                        blobHTTPHeaders:    { blobContentType: 'video/mp4' },
                                         onProgress: (p) => log(`☁️  Blob upload progress: ${p.loadedBytes} bytes`),
                                     }
                                 );
@@ -1061,6 +1157,14 @@ function makeFtpHandler() {
                                     err('No data connection after 30s');
                                     reply(425, 'No data connection');
                                     if (assignedPort) { freePasvPort(assignedPort); assignedPort = null; }
+                                    // Count this file as resolved (failed) so the queue can advance
+                                    if (ftpPhone) {
+                                        const s = _sessions[ftpPhone];
+                                        if (s && s.requestId === capturedRequestId) {
+                                            s.resolvedFiles = (s.resolvedFiles || 0) + 1;
+                                        }
+                                        maybeFinish(ftpPhone);
+                                    }
                                 }
                             }, 30000);
                         } else {
@@ -1099,17 +1203,13 @@ function startFtpServer() {
     for (let i = 0; i < PASV_POOL_SIZE; i++) {
         const port = PASV_PORT_START + i;
         const slot = _pasvPool[port];
-        const srv = net.createServer(ds => {
+        const srv  = net.createServer(ds => {
             log(`PASV data on :${port} from ${ds.remoteAddress}`);
-            if (slot.pendingStor) {
-                slot.pendingStor(ds);
-                slot.pendingStor = null;
-            } else {
-                ds.pause();                 // hold data until handleData attaches listeners
+            if (slot.pendingStor) { slot.pendingStor(ds); slot.pendingStor = null; }
+            else {
+                ds.pause();                 // hold data until STOR's handleData attaches listeners
                 slot.dataSocket = ds;
-                setTimeout(() => {
-                    if (slot.dataSocket === ds) { ds.end(); slot.dataSocket = null; }
-                }, 60000);                  // was 30000 — give slow STOR more room
+                setTimeout(() => { if (slot.dataSocket === ds) { ds.end(); slot.dataSocket = null; } }, 60000);
             }
         });
         srv.listen(port, '0.0.0.0', () => log(`✓ PASV :${port}`));
