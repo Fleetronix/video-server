@@ -1015,8 +1015,6 @@ function makeFtpHandler() {
                         const handleData = async (ds) => {
                             log(`Streaming data socket → Azure Blob (no local disk)`);
 
-                            // Wrap in PassThrough so we can handle 'close' without 'end'
-                            // Azure SDK's uploadStream needs a proper stream end signal
                             const { PassThrough } = require('stream');
                             const pass = new PassThrough();
                             let totalBytes = 0;
@@ -1025,18 +1023,24 @@ function makeFtpHandler() {
                             ds.on('error', e => { pass.destroy(e); });
                             ds.on('end',   () => { pass.end(); });
                             ds.on('close', () => {
-                                // Some cameras close socket without emitting 'end'
                                 if (!pass.writableEnded) pass.end();
                             });
-                            ds.pipe(pass);
+
+                            // Guard: socket may have already finished if it arrived early
+                            if (ds.destroyed || ds.readableEnded) {
+                                pass.end();
+                            } else {
+                                ds.resume();                // undo the pause() from the connection handler
+                                ds.pipe(pass);
+                            }
 
                             try {
                                 await blockBlobClient.uploadStream(
                                     pass,
-                                    4 * 1024 * 1024,   // 4MB block size
-                                    5,                  // 5 parallel blocks
+                                    4 * 1024 * 1024,
+                                    5,
                                     {
-                                        blobHTTPHeaders:    { blobContentType: 'video/mp4' },
+                                        blobHTTPHeaders: { blobContentType: 'video/mp4' },
                                         onProgress: (p) => log(`☁️  Blob upload progress: ${p.loadedBytes} bytes`),
                                     }
                                 );
@@ -1095,12 +1099,17 @@ function startFtpServer() {
     for (let i = 0; i < PASV_POOL_SIZE; i++) {
         const port = PASV_PORT_START + i;
         const slot = _pasvPool[port];
-        const srv  = net.createServer(ds => {
+        const srv = net.createServer(ds => {
             log(`PASV data on :${port} from ${ds.remoteAddress}`);
-            if (slot.pendingStor) { slot.pendingStor(ds); slot.pendingStor = null; }
-            else {
+            if (slot.pendingStor) {
+                slot.pendingStor(ds);
+                slot.pendingStor = null;
+            } else {
+                ds.pause();                 // hold data until handleData attaches listeners
                 slot.dataSocket = ds;
-                setTimeout(() => { if (slot.dataSocket === ds) { ds.end(); slot.dataSocket = null; } }, 30000);
+                setTimeout(() => {
+                    if (slot.dataSocket === ds) { ds.end(); slot.dataSocket = null; }
+                }, 60000);                  // was 30000 — give slow STOR more room
             }
         });
         srv.listen(port, '0.0.0.0', () => log(`✓ PASV :${port}`));

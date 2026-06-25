@@ -232,7 +232,7 @@ function startFFmpeg(phone) {
             if (l.includes('frame=') || l.includes('fps=')) return; // skip progress lines
             if (l.includes('error') || l.includes('Error') || l.includes('Invalid') ||
                 l.includes('muxing overhead') || l.includes('No such file')) {
-                console.error(`[FFmpeg ${phone}] ${l}`);
+                //console.error(`[FFmpeg ${phone}] ${l}`);
             }
         });
     });
