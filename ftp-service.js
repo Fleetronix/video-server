@@ -973,12 +973,18 @@ function makeFtpHandler() {
 
                         const filename = path.basename(arg || `rec_${Date.now()}.mp4`);
 
-                        // ── Identify phone and requestId NOW ──────────────────────────
-                        const relDir   = path.relative(path.resolve(RECORDINGS_DIR), path.resolve(saveDir));
-                        const ftpPhone = relDir.split(path.sep)[0] || null;
+                        // ── Identify folder, phone and requestId NOW ─────────────────
+                        // Camera uploads into a folder named like:
+                        //   <phone>_<id>_<timestamp>/CH0-....MP4
+                        // The session is keyed by the BARE phone, so we must split the
+                        // folder on '_' and take the prefix — otherwise the lookup misses
+                        // and requestId comes back null (queue never advances).
+                        const relDir    = path.relative(path.resolve(RECORDINGS_DIR), path.resolve(saveDir));
+                        const ftpFolder = relDir.split(path.sep)[0] || '';          // full folder, for blob path
+                        const ftpPhone  = (ftpFolder.split('_')[0] || '').trim() || null;  // bare phone, for session
                         const capturedRequestId = ftpPhone ? (_sessions[ftpPhone]?.requestId || null) : null;
 
-                        log(`STOR phone:${ftpPhone} requestId:${capturedRequestId} filename:${filename}`);
+                        log(`STOR folder:${ftpFolder} phone:${ftpPhone} requestId:${capturedRequestId} filename:${filename}`);
 
                         if (!containerClient) {
                             err('Azure Blob not configured — cannot accept STOR. Set AZURE_STORAGE_CONNECTION_STRING.');
@@ -1009,7 +1015,7 @@ function makeFtpHandler() {
                                 : `${Date.now()}_${stem}${ext2}`;
                         }
 
-                        const blobPath = `${ftpPhone || 'unknown'}/${finalFilename}`;
+                        const blobPath = `${ftpFolder || ftpPhone || 'unknown'}/${finalFilename}`;
                         const blockBlobClient = containerClient.getBlockBlobClient(blobPath);
 
                         log(`STOR → streaming directly to Azure Blob: ${blobPath}`);
