@@ -90,14 +90,14 @@ const wss = new WebSocketServer({ port: CONFIG.wsPort });
 console.log(`[${TAG}] ✓ WebSocket on :${CONFIG.wsPort}`);
 
 wss.on('connection', (ws, req) => {
-    console.log(`[WS] Browser connected from ${req.socket.remoteAddress}`);
+    console.log(`[${TAG}][WS] Browser connected from ${req.socket.remoteAddress}`);
     // Send current camera list immediately
     ws.send(JSON.stringify({
         type:    'cameras',
         cameras: buildCameraList(),
     }));
-    ws.on('close', () => console.log('[WS] Browser disconnected'));
-    ws.on('error', e  => console.error('[WS] Error:', e.message));
+    ws.on('close', () => console.log(`[${TAG}][WS] Browser disconnected`));
+    ws.on('error', e  => console.error(`[${TAG}][WS] Error:`, e.message));
 });
 
 function broadcast(obj) {
@@ -198,7 +198,7 @@ function startFFmpeg(phone) {
     if (!cam) return null;
     if (cam.restarting) return null;
 
-    console.log(`[FFmpeg ${phone}] Starting...`);
+    console.log(`[${TAG}][FFmpeg ${phone}] Starting...`);
 
     // Clean up old segment files so HLS player doesn't get confused
     try {
@@ -252,18 +252,30 @@ function startFFmpeg(phone) {
             if (l.includes('frame=') || l.includes('fps=')) return; // skip progress lines
             if (l.includes('error') || l.includes('Error') || l.includes('Invalid') ||
                 l.includes('muxing overhead') || l.includes('No such file')) {
-                //console.error(`[FFmpeg ${phone}] ${l}`);
+                //console.error(`[${TAG}][FFmpeg ${phone}] ${l}`);
             }
         });
     });
 
     ffmpeg.stdin.on('error', e => {
         // Ignore EPIPE — happens when FFmpeg restarts while we're writing
-        if (e.code !== 'EPIPE') console.error(`[FFmpeg ${phone}] stdin error: ${e.message}`);
+        if (e.code !== 'EPIPE') console.error(`[${TAG}][FFmpeg ${phone}] stdin error: ${e.message}`);
+    });
+
+    // Without this handler, a bad ffmpegPath (e.g. wrong env var) throws an
+    // uncaught exception that kills the ENTIRE process — including whichever
+    // other vendor's receiver happens to share it.
+    ffmpeg.on('error', e => {
+        console.error(`[${TAG}][FFmpeg ${phone}] failed to start (${CONFIG.ffmpegPath}): ${e.message}`);
+        if (cameras[phone]) {
+            cameras[phone].ffmpeg     = null;
+            cameras[phone].patPmtSent = false;
+            cameras[phone].gotIFrame  = false;
+        }
     });
 
     ffmpeg.on('close', code => {
-        console.log(`[FFmpeg ${phone}] exited (code ${code})`);
+        console.log(`[${TAG}][FFmpeg ${phone}] exited (code ${code})`);
         if (!cameras[phone]) return;  // camera disconnected — don't restart
         cameras[phone].ffmpeg    = null;
         cameras[phone].patPmtSent = false;
@@ -302,7 +314,7 @@ function startWatchdog(phone) {
             // ── NEW: if no stream socket exists, stop FFmpeg and wait ──────────
             // Camera stream connection dropped — stop restarting FFmpeg endlessly
             if (!cameras[phone].hasStreamSocket) {
-                console.warn(`[Watchdog ${phone}] No stream socket — stopping FFmpeg until camera reconnects`);
+                console.warn(`[${TAG}][Watchdog ${phone}] No stream socket — stopping FFmpeg until camera reconnects`);
                 if (cameras[phone].ffmpeg) {
                     cameras[phone].ffmpeg.kill('SIGKILL');
                     cameras[phone].ffmpeg    = null;
@@ -312,7 +324,7 @@ function startWatchdog(phone) {
                 return;
             }
 
-            console.warn(`[Watchdog ${phone}] No frames for ${age}ms — restarting FFmpeg`);
+            console.warn(`[${TAG}][Watchdog ${phone}] No frames for ${age}ms — restarting FFmpeg`);
             cameras[phone].ffmpeg.kill('SIGKILL');
         }
     }, 5000);
@@ -434,7 +446,7 @@ function handleVideoFrame(frameData, phone, dataType) {
         writeToFFmpeg(cam, phone, buildPAT());
         writeToFFmpeg(cam, phone, buildPMT());
         cam.patPmtSent = true;
-        console.log(`[${phone}] 📺 PAT+PMT sent, streaming started`);
+        console.log(`[${TAG}][${phone}] 📺 PAT+PMT sent, streaming started`);
         broadcast({ type: 'stream_started', phone, stream: `/public/${phone}.m3u8` });
     }
 
@@ -447,7 +459,7 @@ function handleVideoFrame(frameData, phone, dataType) {
 
     // Log frame stats every 300 frames
     if (cam.frameCount % 300 === 0) {
-        console.log(`[${phone}] 📊 ${cam.frameCount} frames processed`);
+        console.log(`[${TAG}][${phone}] 📊 ${cam.frameCount} frames processed`);
     }
 }
 
@@ -621,24 +633,25 @@ function parseGps(body, phone) {
 // ── TCP server ────────────────────────────────────────────────────────────────
 const tcpServer = net.createServer(socket => {
     const remote = `${socket.remoteAddress}:${socket.remotePort}`;
-    console.log(`[TCP] Connected: ${remote}`);
+    console.log(`[${TAG}][TCP] Connected: ${remote}`);
 
     // Keepalive — detect dead connections within ~30s
     socket.setKeepAlive(true, 10000);
     socket.setTimeout(300000);  // 5 minutes — GPS keeps socket alive every 10s
     socket.on('timeout', () => {
-        console.warn(`[TCP] Socket timeout (no data for 5min): ${remote}`);
+        console.warn(`[${TAG}][TCP] Socket timeout (no data for 5min): ${remote}`);
         socket.destroy();
     });
 
     let buffer = Buffer.alloc(0);
     let phone  = null;
+    let streamPacketWarned = false;   // warn once per connection, not once per packet
 
     socket.on('data', data => {
         try {
             // Guard against runaway buffers
             if (buffer.length + data.length > CONFIG.maxBufferBytes) {
-                console.warn(`[TCP] Buffer overflow for ${phone || remote} — resetting`);
+                console.warn(`[${TAG}][TCP] Buffer overflow for ${phone || remote} — resetting`);
                 buffer = Buffer.alloc(0);
             }
 
@@ -672,7 +685,7 @@ const tcpServer = net.createServer(socket => {
                         if (!cameras[camPhone].hasStreamSocket) {
                             cameras[camPhone].hasStreamSocket = true;
                             cameras[camPhone].streamSocket    = socket;
-                            console.log(`[${camPhone}] 📡 Stream socket established`);
+                            console.log(`[${TAG}][${camPhone}] 📡 Stream socket established`);
 
                             // Start FFmpeg now if not running
                             if (!cameras[camPhone].ffmpeg && !cameras[camPhone].restarting) {
@@ -680,6 +693,17 @@ const tcpServer = net.createServer(socket => {
                             }
                         }
                         processVideoPacket(rawData, camPhone, dataType, subpktMarker);
+                    } else if (!streamPacketWarned) {
+                        // No registered camera matches this stream packet's SIM — packet is
+                        // dropped. Logged once per connection (not per-packet) since this can
+                        // otherwise flood the log at stream frame rate.
+                        streamPacketWarned = true;
+                        console.warn(
+                            `[${TAG}][TCP] Stream packet from ${remote} has SIM/phone "${streamPhone}" ` +
+                            `(raw bytes: ${simBytes.toString('hex')}) which doesn't match any registered ` +
+                            `camera. Known cameras: [${Object.keys(cameras).join(', ') || 'none'}]. ` +
+                            `Packet dropped — check whether this device's registration phone matches its stream SIM encoding.`
+                        );
                     }
 
                     offset += 30 + dataBodyLen;
@@ -708,17 +732,17 @@ const tcpServer = net.createServer(socket => {
                         const replyMsgId  = body.readUInt16BE(2);
                         const replyResult = body[4];
                         const resultText  = ['Success','Failed','Wrong Msg','Not Supported'][replyResult] || `code:${replyResult}`;
-                        console.log(`[${phone}] ACK → 0x${replyMsgId.toString(16).padStart(4,'0')} ${resultText}`);
+                        console.log(`[${TAG}][${phone}] ACK → 0x${replyMsgId.toString(16).padStart(4,'0')} ${resultText}`);
                         bus.emit('device:message', { vendor: CONFIG.vendor, msgId, body, seq, phone, socket });
 
                     // ── 0x0100: Register ──────────────────────────────────────
                     } else if (msgId === 0x0100) {
-                        console.log(`[${phone}] Register`);
+                        console.log(`[${TAG}][${phone}] Register`);
                         socket.write(buildRegisterResponse(phone, seq, 0, 'AUTH1234'));
 
                     // ── 0x0102: Auth complete — set up camera ─────────────────
                     } else if (msgId === 0x0102) {
-                        console.log(`[${phone}] Auth OK — setting up camera`);
+                        console.log(`[${TAG}][${phone}] Auth OK — setting up camera`);
                         socket.write(buildAck(phone, seq, msgId));
 
                         const cam = getCamera(phone);
@@ -737,7 +761,7 @@ const tcpServer = net.createServer(socket => {
                             phone, CONFIG.serverIp, CONFIG.tcpPort, CONFIG.streamChannel
                         ));
 
-                        console.log(`[${phone}] ✅ Registered. Cameras online: ${Object.keys(tcpSockets).length}`);
+                        console.log(`[${TAG}][${phone}] ✅ Registered. Cameras online: ${Object.keys(tcpSockets).length}`);
                         broadcast({
                             type:    'camera_connected',
                             phone,
@@ -786,21 +810,21 @@ const tcpServer = net.createServer(socket => {
 
                         const logFile = `./gps_log_${CONFIG.vendor}_${phone}_${new Date().toISOString().slice(0,10)}.txt`;
                         fs.appendFile(logFile, record.join(',') + '\n', e => {
-                            if (e) console.error('[GPS LOG]', e.message);
+                            if (e) console.error(`[${TAG}][GPS LOG]`, e.message);
                         });
 
                     // ── 0x1205: File list response ────────────────────────────
                     } else if (msgId === 0x1205) {
                         const totalFiles = body.readUInt32BE(2);
-                        console.log(`[${phone}] 0x1205 file list — total:${totalFiles}`);
-                        if (totalFiles === 0) console.warn(`[${phone}] ⚠️ 0 files found for this time range`);
+                        console.log(`[${TAG}][${phone}] 0x1205 file list — total:${totalFiles}`);
+                        if (totalFiles === 0) console.warn(`[${TAG}][${phone}] ⚠️ 0 files found for this time range`);
 
                         // Log file sizes from SD card
                         if (totalFiles > 0 && body.length > 6) {
                             let p = 6;
                             for (let i = 0; i < totalFiles && p + 28 <= body.length; i++) {
                                 const fileSize = body.readUInt32BE(p + 24);
-                                console.log(`[${phone}] File ${i+1} on SD card: ${fileSize} bytes`);
+                                console.log(`[${TAG}][${phone}] File ${i+1} on SD card: ${fileSize} bytes`);
                                 p += 28;
                             }
                         }
@@ -809,7 +833,7 @@ const tcpServer = net.createServer(socket => {
 
                     // ── 0x1206: File upload done ──────────────────────────────
                     } else if (msgId === 0x1206) {
-                        console.log(`[${phone}] 0x1206 upload notification`);
+                        console.log(`[${TAG}][${phone}] 0x1206 upload notification`);
                         bus.emit('device:message', { vendor: CONFIG.vendor, msgId, body, seq, phone, socket });
 
                     // ── Everything else ───────────────────────────────────────
@@ -829,19 +853,19 @@ const tcpServer = net.createServer(socket => {
             buffer = offset > 0 ? buffer.slice(offset) : buffer;
 
         } catch (e) {
-            console.error(`[TCP] Parse error (${phone || remote}):`, e.message);
+            console.error(`[${TAG}][TCP] Parse error (${phone || remote}):`, e.message);
             buffer = Buffer.alloc(0);  // reset buffer on parse error to avoid cascading failures
         }
     });
 
     socket.on('close', () => {
-        console.log(`[TCP] Disconnected: ${remote} phone:${phone}`);
+        console.log(`[${TAG}][TCP] Disconnected: ${remote} phone:${phone}`);
         if (!phone) return;
 
         // Check if this was a stream socket for any camera
         for (const [camPhone, cam] of Object.entries(cameras)) {
             if (cam.streamSocket === socket) {
-                console.log(`[${camPhone}] 📡 Stream socket disconnected`);
+                console.log(`[${TAG}][${camPhone}] 📡 Stream socket disconnected`);
                 cam.hasStreamSocket = false;
                 cam.streamSocket    = null;
                 cam.gotIFrame       = false;
@@ -874,7 +898,7 @@ const tcpServer = net.createServer(socket => {
 
     socket.on('error', e => {
         if (e.code !== 'ECONNRESET') {
-            console.error(`[TCP] Socket error (${phone || remote}): ${e.message}`);
+            console.error(`[${TAG}][TCP] Socket error (${phone || remote}): ${e.message}`);
         }
     });
 });

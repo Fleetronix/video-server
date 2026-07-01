@@ -14,15 +14,19 @@
 require('dotenv').config();
 const createReceiver = require('./receiver-factory');
 
-createReceiver({
-    vendor:         'pictor',
-    tcpPort:        process.env.TCP_PORT    || '3007',
-    httpPort:       process.env.HTTP_PORT   || '8080',
-    wsPort:         process.env.WS_PORT     || '8801',
-    serverIp:       process.env.SERVER_IP,
-    ffmpegPath:     process.env.FFMPEG_PATH,
-    streamChannel:  process.env.STREAM_CH,
-    maxBufferBytes: process.env.MAX_BUF,
-    watchdogMs:     process.env.WATCHDOG_MS,
-    publicDir:      './public',   // unchanged — preserves existing stream URLs
-});
+if (process.env.PICTOR_ENABLED === 'false') {
+    console.log('[Pictor] Disabled via PICTOR_ENABLED=false — not starting.');
+} else {
+    createReceiver({
+        vendor:         'pictor',
+        tcpPort:        process.env.TCP_PORT    || '3007',
+        httpPort:       process.env.HTTP_PORT   || '8080',
+        wsPort:         process.env.WS_PORT     || '8801',
+        serverIp:       process.env.SERVER_IP,
+        ffmpegPath:     process.env.FFMPEG_PATH,
+        streamChannel:  process.env.STREAM_CH,
+        maxBufferBytes: process.env.MAX_BUF,
+        watchdogMs:     process.env.WATCHDOG_MS,
+        publicDir:      './public',   // unchanged — preserves existing stream URLs
+    });
+}
