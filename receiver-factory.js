@@ -105,10 +105,16 @@ function broadcast(obj) {
     wss.clients.forEach(c => { if (c.readyState === 1) c.send(raw); });
 }
 
+// Pictor keeps the original bare "/public" URL prefix so existing frontends
+// don't break. Every other vendor gets "/public-<vendor>" — matching the
+// on-disk folder name, which is what your reverse proxy / frontend appears
+// to already expect for Acumen.
+const PUBLIC_URL_PREFIX = vendor === 'pictor' ? '/public' : `/public-${vendor}`;
+
 function buildCameraList() {
     return Object.keys(tcpSockets).map(phone => ({
         phone,
-        stream: `/public/${phone}.m3u8`,
+        stream: `${PUBLIC_URL_PREFIX}/${phone}.m3u8`,
     }));
 }
 
@@ -153,6 +159,8 @@ http.createServer((req, res) => {
         filePath = './video.html';
     } else if (urlPath.startsWith('/public/')) {
         filePath = path.join(CONFIG.publicDir, urlPath.slice('/public/'.length));
+    } else if (urlPath.startsWith(`${PUBLIC_URL_PREFIX}/`)) {
+        filePath = path.join(CONFIG.publicDir, urlPath.slice(PUBLIC_URL_PREFIX.length + 1));
     } else {
         filePath = `.${urlPath}`;
     }
@@ -240,7 +248,10 @@ function startFFmpeg(phone) {
         `${CONFIG.publicDir}/${phone}.m3u8`,
     ]);
 
-    // Log only errors from FFmpeg stderr
+    // Surface FFmpeg's own diagnostics — this was being computed but never
+    // printed before (the console.error call was commented out), so any real
+    // decode failure was invisible. Set DEBUG_FFMPEG=true to see every line.
+    const debugFfmpeg = process.env.DEBUG_FFMPEG === 'true' || process.env.ACUMEN_DEBUG_FFMPEG === 'true';
     let stderrBuf = '';
     ffmpeg.stderr.on('data', d => {
         stderrBuf += d.toString();
@@ -249,10 +260,18 @@ function startFFmpeg(phone) {
         lines.forEach(line => {
             const l = line.trim();
             if (!l) return;
-            if (l.includes('frame=') || l.includes('fps=')) return; // skip progress lines
-            if (l.includes('error') || l.includes('Error') || l.includes('Invalid') ||
-                l.includes('muxing overhead') || l.includes('No such file')) {
-                //console.error(`[${TAG}][FFmpeg ${phone}] ${l}`);
+            if (l.includes('frame=') || l.includes('fps=')) return; // skip progress spam
+            const isStreamInfo = l.includes('Stream #') || l.includes('Input #') || l.includes('Output #') ||
+                                  l.includes('Video:') || l.includes('Audio:');
+            const isError = l.includes('error') || l.includes('Error') || l.includes('Invalid') ||
+                             l.includes('muxing overhead') || l.includes('No such file') ||
+                             l.includes('could not find') || l.includes('Unsupported');
+            if (isError) {
+                console.error(`[${TAG}][FFmpeg ${phone}] ${l}`);
+            } else if (isStreamInfo) {
+                console.log(`[${TAG}][FFmpeg ${phone}] ${l}`);
+            } else if (debugFfmpeg) {
+                console.log(`[${TAG}][FFmpeg ${phone}][debug] ${l}`);
             }
         });
     });
@@ -430,12 +449,47 @@ function handleVideoFrame(frameData, phone, dataType) {
 
     // dataType: 0=I-frame  1=P-frame  2=B-frame  3=audio  4=transparent
     const isVideo = dataType === 0 || dataType === 1 || dataType === 2;
+
+    // One-time raw diagnostic per camera — shows exactly what bytes the
+    // device is sending so a codec/format mismatch is visible in the logs
+    // instead of just "frames processed" with no output files.
+    if (!cam.loggedFirstFrame) {
+        cam.loggedFirstFrame = true;
+        const preview = frameData.slice(0, 16).toString('hex');
+        const dataTypeName = ['I-frame', 'P-frame', 'B-frame', 'audio', 'transparent'][dataType] || `unknown(${dataType})`;
+        console.log(
+            `[${TAG}][${phone}] 🔍 First frame: dataType=${dataTypeName} size=${frameData.length}B ` +
+            `first16=${preview}`
+        );
+        // NAL start-code sanity check — real H.264/HEVC elementary streams
+        // start with 00 00 00 01 or 00 00 01. If this is missing, either the
+        // subpacket reassembly is wrong or the camera isn't sending what we expect.
+        const hasStartCode = frameData.length >= 4 &&
+            frameData[0] === 0 && frameData[1] === 0 &&
+            (frameData[2] === 1 || (frameData[2] === 0 && frameData[3] === 1));
+        if (!hasStartCode) {
+            console.warn(
+                `[${TAG}][${phone}] ⚠️ First frame has no NAL start code (00 00 00 01 / 00 00 01) — ` +
+                `not valid H.264/HEVC elementary data, or subpacket reassembly produced garbage. This ` +
+                `is very likely why FFmpeg receives bytes but never produces output files.`
+            );
+        }
+    }
+
     if (!isVideo) return;
 
     // Wait for first I-frame before feeding P/B frames
     if (dataType === 0) {
         cam.gotIFrame = true;
     } else if (!cam.gotIFrame) {
+        cam.droppedBeforeIFrame = (cam.droppedBeforeIFrame || 0) + 1;
+        if (cam.droppedBeforeIFrame === 1 || cam.droppedBeforeIFrame % 300 === 0) {
+            console.warn(
+                `[${TAG}][${phone}] ⚠️ Dropped ${cam.droppedBeforeIFrame} frame(s) waiting for first I-frame ` +
+                `(dataType=0) — if this keeps climbing, the camera may never be sending a real I-frame, ` +
+                `or its I-frame marker doesn't match dataType=0 the way this parser expects.`
+            );
+        }
         return;
     }
 
@@ -447,7 +501,7 @@ function handleVideoFrame(frameData, phone, dataType) {
         writeToFFmpeg(cam, phone, buildPMT());
         cam.patPmtSent = true;
         console.log(`[${TAG}][${phone}] 📺 PAT+PMT sent, streaming started`);
-        broadcast({ type: 'stream_started', phone, stream: `/public/${phone}.m3u8` });
+        broadcast({ type: 'stream_started', phone, stream: `${PUBLIC_URL_PREFIX}/${phone}.m3u8` });
     }
 
     const { packets, nextCounter } = wrapFrameInTS(frameData, cam.tsCounter, Date.now());
@@ -457,9 +511,22 @@ function handleVideoFrame(frameData, phone, dataType) {
 
     for (const pkt of packets) writeToFFmpeg(cam, phone, pkt);
 
-    // Log frame stats every 300 frames
+    // Log frame stats every 300 frames, plus a one-time check that the HLS
+    // playlist has actually appeared on disk — if not, FFmpeg is receiving
+    // data but silently failing to produce output (check the [FFmpeg] lines
+    // just above this in the log for the real reason).
     if (cam.frameCount % 300 === 0) {
         console.log(`[${TAG}][${phone}] 📊 ${cam.frameCount} frames processed`);
+        if (cam.frameCount === 300) {
+            const m3u8 = `${CONFIG.publicDir}/${phone}.m3u8`;
+            if (!fs.existsSync(m3u8)) {
+                console.warn(
+                    `[${TAG}][${phone}] ⚠️ 300 frames sent to FFmpeg but ${m3u8} still doesn't exist. ` +
+                    `FFmpeg is receiving data but not producing HLS output — check the [FFmpeg ${phone}] ` +
+                    `lines above for the decode error (enable DEBUG_FFMPEG=true for full ffmpeg stderr).`
+                );
+            }
+        }
     }
 }
 
@@ -765,7 +832,7 @@ const tcpServer = net.createServer(socket => {
                         broadcast({
                             type:    'camera_connected',
                             phone,
-                            stream:  `/public/${phone}.m3u8`,
+                            stream:  `${PUBLIC_URL_PREFIX}/${phone}.m3u8`,
                             cameras: buildCameraList(),
                         });
                         bus.emit('device:connected', { vendor: CONFIG.vendor, phone, socket });
