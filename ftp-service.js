@@ -511,7 +511,7 @@ bus.on('device:disconnected', ({ phone }) => {
     delete _seqMap[phone];
 });
 
-bus.on('device:message', ({ msgId, body, seq, phone }) => {
+bus.on('device:message', async ({ msgId, body, seq, phone }) => {
 
     // 0x0001 — ACK for our 0x9206
     if (msgId === 0x0001) {
