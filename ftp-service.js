@@ -60,7 +60,7 @@ const REDIS_TTL       = parseInt(process.env.REDIS_TTL    || String(7 * 24 * 360
 const AZURE_CONN_STRING  = process.env.AZURE_STORAGE_CONNECTION_STRING || null;
 const AZURE_CONTAINER    = process.env.AZURE_STORAGE_CONTAINER         || 'recordings';
 const DELETE_LOCAL_AFTER_UPLOAD = process.env.DELETE_LOCAL_AFTER_UPLOAD !== 'false'; // default true
-
+console.log(`[FTP-SVC] Azure Blob Storage: ${AZURE_CONN_STRING}, ${AZURE_CONN_STRING ? 'enabled' : 'disabled'}, container: ${AZURE_CONTAINER}, deleteLocalAfterUpload: ${DELETE_LOCAL_AFTER_UPLOAD}`);
 // Phone → SN mapping
 const PHONE_TO_SN = {
     '1576064472': '15760064472',
