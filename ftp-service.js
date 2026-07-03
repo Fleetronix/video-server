@@ -56,6 +56,9 @@ const WS_PORT         = parseInt(process.env.FTP_WS_PORT  || '8802');
 const RECORDINGS_DIR  = process.env.RECORDINGS_DIR        || './recordings';
 const REDIS_TTL       = parseInt(process.env.REDIS_TTL    || String(7 * 24 * 3600)); // 7 days
 
+console.log(process.env);
+
+
 // Azure Blob Storage
 const AZURE_CONN_STRING  = process.env.AZURE_STORAGE_CONNECTION_STRING || null;
 const AZURE_CONTAINER    = process.env.AZURE_STORAGE_CONTAINER         || 'recordings';
@@ -97,7 +100,11 @@ async function initAzureBlob() {
         containerClient   = null;
     }
 }
-initAzureBlob();
+
+initAzureBlob().then(() => {
+    startFtpServer();
+    log(`Started — FTP:${FTP_PORT} ...`);
+});
 
 // Note: file→blob upload now happens inline via blockBlobClient.uploadStream()
 // directly from the FTP data socket in the STOR handler — no local file helper needed.
