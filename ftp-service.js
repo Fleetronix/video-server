@@ -101,10 +101,7 @@ async function initAzureBlob() {
     }
 }
 
-initAzureBlob().then(() => {
-    startFtpServer();
-    log(`Started — FTP:${FTP_PORT} ...`);
-});
+initAzureBlob();
 
 // Note: file→blob upload now happens inline via blockBlobClient.uploadStream()
 // directly from the FTP data socket in the STOR handler — no local file helper needed.
