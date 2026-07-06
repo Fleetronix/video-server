@@ -438,6 +438,48 @@ http.createServer((req, res) => {
         return;
     }
 
+    // ── POST /api/set-video-quality  → send 0x8103 to lower the recorded (store) stream ──
+    // Body: { phone, channel, storeResolution, storeFrameRate, storeBitRateKbps,
+    //         liveResolution?, liveFrameRate?, liveBitRateKbps? }
+    // NOTE: live* fields should match the camera's CURRENT live-view settings —
+    // there is no protocol query for these, so pass them in from your camera
+    // config if you have them. If omitted, sensible defaults are used, which
+    // may unintentionally change live view — see build8103() comments above.
+    if (req.method === 'POST' && urlPath === '/api/set-video-quality') {
+        let body = '';
+        req.on('data', c => body += c);
+        req.on('end', () => {
+            try {
+                const {
+                    phone, channel,
+                    storeResolution, storeFrameRate, storeBitRateKbps,
+                    liveResolution, liveFrameRate, liveBitRateKbps,
+                } = JSON.parse(body);
+
+                if (!phone || channel === undefined) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'phone and channel are required' }));
+                    return;
+                }
+
+                const frame = build8103(String(phone), channel, {
+                    storeResolution, storeFrameRate, storeBitRateKbps,
+                    liveResolution, liveFrameRate, liveBitRateKbps,
+                });
+
+                bus.emit('device:send', { phone: String(phone), frame });
+                log(`[${phone}] Sent 0x8103 — ch:${channel} storeRes:${storeResolution} storeFps:${storeFrameRate} storeKbps:${storeBitRateKbps}`);
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'sent', phone, channel }));
+            } catch (e) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: e.message }));
+            }
+        });
+        return;
+    }
+
     // ── GET /api/ftp-queue/:phone  → pending queue for a phone ───────────────
     if (req.method === 'GET' && urlPath.startsWith('/api/ftp-queue/')) {
         const phone = urlPath.replace('/api/ftp-queue/', '').trim();
@@ -539,6 +581,17 @@ bus.on('device:message', async ({ msgId, body, seq, phone }) => {
                     });
                     jobFinished(phone);  // ← move to next
                 }
+            }
+        }
+
+        // 0x8103 — ACK for a video/channel parameter change (e.g. our build8103 call)
+        if (replyMsgId === 0x8103) {
+            if (replyResult === 0) {
+                log(`[${phone}] 0x8103 (video params) accepted ✅`);
+                broadcast({ type: 'status', phone, message: '✅ Camera accepted new video quality settings' });
+            } else {
+                err(`[${phone}] 0x8103 (video params) rejected — code:${replyResult}`);
+                broadcast({ type: 'error', phone, message: `Camera rejected video settings (code ${replyResult})` });
             }
         }
         return;
@@ -1029,6 +1082,75 @@ function build9207(phone, sessionId, control) {
     body.writeUInt16BE(sessionId, 0);
     body[2] = control;
     return buildFrame(0x9207, body, fp);
+}
+
+// ── 0x8103 frame builder — set per-channel video parameters ────────────────
+// T/98 §5.3.1 (JT/T 808-2011 §8.8), parameter 0x0077 (Table 5/6):
+// "Individual video channel parameter settings" — targets ONE logical channel
+// and covers BOTH the live-view stream and the SD-card "store" stream in the
+// same 21-byte block.
+//
+// Use this to lower the STORE stream's resolution/bitrate/framerate — those
+// are the values that control how big the recorded files are that later get
+// pulled over FTP (see build9206 above).
+//
+// ⚠️ IMPORTANT — read before calling:
+//   1. Table 6 packs live-stream fields (bytes 1-9) and store-stream fields
+//      (bytes 10-18) together. You must supply BOTH, even if you only want
+//      to change recording (store) quality — there is no protocol message
+//      to query the camera's *current* live-stream settings, so pass in
+//      values that match what the camera is already using for live view,
+//      or you'll unintentionally change live view too.
+//   2. This only affects recordings made AFTER the camera accepts this
+//      command. It does nothing to files already on the SD card.
+//   3. Resolution codes (T/98 Table 2): 0=QCIF 1=CIF 2=WCIF 3=D1 4=WD1
+//      5=720P 6=1080P
+//
+// opts:
+//   liveEncodeMode, liveResolution, liveKeyframeInterval,
+//   liveFrameRate,  liveBitRateKbps        — must match current live settings
+//   storeEncodeMode, storeResolution, storeKeyframeInterval,
+//   storeFrameRate,  storeBitRateKbps      — the values you're changing
+//   osdFlags                               — OSD overlay bitmask (optional)
+function build8103(phone, channel, opts = {}) {
+    const fp = framePhone(phone);
+
+    if (opts.storeResolution === undefined || opts.storeBitRateKbps === undefined || opts.storeFrameRate === undefined) {
+        throw new Error('build8103: storeResolution, storeFrameRate and storeBitRateKbps are required');
+    }
+
+    // ── Table 6 payload (21 bytes) — one channel's full video parameter block ──
+    const chanBody = Buffer.alloc(21);
+    chanBody[0] = channel;                                            // logical channel number
+
+    // Live stream (bytes 1-9) — keep matching the camera's current live settings
+    chanBody[1] = opts.liveEncodeMode ?? 0;                           // 0=CBR 1=VBR 2=ABR
+    chanBody[2] = opts.liveResolution ?? 3;                           // default D1 — verify against your camera
+    chanBody.writeUInt16BE(opts.liveKeyframeInterval ?? 50, 3);       // frames
+    chanBody[5] = opts.liveFrameRate ?? 25;                           // fps
+    chanBody.writeUInt32BE(opts.liveBitRateKbps ?? 512, 6);           // kbps
+
+    // Store stream (bytes 10-18) — THIS shrinks the recorded/FTP'd files
+    chanBody[10] = opts.storeEncodeMode ?? 1;                         // 1=VBR recommended for storage
+    chanBody[11] = opts.storeResolution;                              // e.g. 0=QCIF for smallest files
+    chanBody.writeUInt16BE(opts.storeKeyframeInterval ?? 50, 12);     // frames
+    chanBody[14] = opts.storeFrameRate;                               // e.g. 10-15 fps
+    chanBody.writeUInt32BE(opts.storeBitRateKbps, 15);                // e.g. 256-512 kbps
+
+    chanBody.writeUInt16BE(opts.osdFlags ?? 0x003F, 19);              // OSD overlay bits (keep current)
+
+    // param 0x0077 value = channelCount(1) + Table6 block(21) = 22 bytes
+    const paramValue = Buffer.concat([Buffer.from([1]), chanBody]);
+
+    // 0x8103 body = paramCount(1) + [ paramId(4) + paramLen(1) + paramValue ]
+    const body = Buffer.alloc(1 + 4 + 1 + paramValue.length);
+    let p = 0;
+    body[p++] = 1;                            // setting one parameter
+    body.writeUInt32BE(0x0077, p); p += 4;    // param ID 0x0077 (Table 5/6)
+    body[p++] = paramValue.length;            // 22
+    paramValue.copy(body, p);
+
+    return buildFrame(0x8103, body, fp);
 }
 
 // ── FTP server ────────────────────────────────────────────────────────────────
