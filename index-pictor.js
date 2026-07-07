@@ -38,6 +38,7 @@ const CONFIG = {
     streamChannel:  parseInt(process.env.STREAM_CH     || '1'),
     maxBufferBytes: parseInt(process.env.MAX_BUF       || String(4 * 1024 * 1024)),  // 4MB per socket
     watchdogMs:     parseInt(process.env.WATCHDOG_MS   || '15000'),  // restart FFmpeg if no frames for 15s
+    streamReconnectMs: parseInt(process.env.STREAM_RECONNECT_MS || '60000'), // re-request 0x9101 if stream socket missing this long
 };
 
 console.log(`[Pictor] Server IP  : ${CONFIG.serverIp}`);
@@ -65,6 +66,8 @@ function makeCamera() {
         frameCount:      0,
         hasStreamSocket: false,   // ← add this
         streamSocket:    null,    // ← add this
+        streamSocketLostAt:   null,  // ← when the stream socket last dropped (for reconnect backoff)
+        lastReconnectSentAt:  null,  // ← last time we re-sent 0x9101 asking the device to reconnect
     };
 }
 
@@ -248,6 +251,19 @@ function startFFmpeg(phone) {
         cameras[phone].ffmpeg    = null;
         cameras[phone].patPmtSent = false;
         cameras[phone].gotIFrame  = false;
+
+        // ── FIX: don't blindly restart if there's no camera stream socket ──────
+        // Previously this always scheduled a restart, which fought the watchdog's
+        // "stop FFmpeg until camera reconnects" logic and caused an infinite
+        // kill/restart loop with no video source to encode. Only auto-restart
+        // here if the stream socket is actually still connected — otherwise
+        // the watchdog's reconnect logic (see startWatchdog) is responsible for
+        // bringing FFmpeg back once the device reconnects.
+        if (!cameras[phone].hasStreamSocket) {
+            console.log(`[FFmpeg ${phone}] no stream socket — not auto-restarting`);
+            return;
+        }
+
         cameras[phone].restarting = true;
         setTimeout(() => {
             if (!cameras[phone]) return;
@@ -288,6 +304,30 @@ function startWatchdog(phone) {
                     cameras[phone].ffmpeg    = null;
                     cameras[phone].patPmtSent = false;
                     cameras[phone].gotIFrame  = false;
+                }
+
+                // ── FIX: actively ask the device to reconnect instead of waiting ───
+                // Previously the server just sat here doing nothing until the device
+                // decided on its own to re-open the stream socket — which is why a
+                // manual pm2 restart was needed to "fix" it (restart just forces
+                // everything to re-establish). Instead: if the main signalling
+                // connection is still alive, periodically re-send 0x9101 to prompt
+                // the device to reconnect the stream socket itself.
+                const lostAt = cameras[phone].streamSocketLostAt || Date.now();
+                const downForMs = Date.now() - lostAt;
+                const lastSent  = cameras[phone].lastReconnectSentAt || 0;
+
+                if (downForMs > CONFIG.streamReconnectMs && (Date.now() - lastSent) > CONFIG.streamReconnectMs) {
+                    const signallingSocket = tcpSockets[phone];
+                    if (signallingSocket && !signallingSocket.destroyed) {
+                        console.warn(`[Watchdog ${phone}] Stream socket down ${Math.round(downForMs / 1000)}s — re-requesting video (0x9101)`);
+                        signallingSocket.write(buildVideoRequest(
+                            phone, CONFIG.serverIp, CONFIG.tcpPort, CONFIG.streamChannel
+                        ));
+                        cameras[phone].lastReconnectSentAt = Date.now();
+                    } else {
+                        console.warn(`[Watchdog ${phone}] Stream socket down but signalling socket also gone — waiting for full reconnect`);
+                    }
                 }
                 return;
             }
@@ -650,8 +690,10 @@ const tcpServer = net.createServer(socket => {
                     if (camPhone && cameras[camPhone]) {
                         // Mark that this socket is a stream socket for this camera
                         if (!cameras[camPhone].hasStreamSocket) {
-                            cameras[camPhone].hasStreamSocket = true;
-                            cameras[camPhone].streamSocket    = socket;
+                            cameras[camPhone].hasStreamSocket    = true;
+                            cameras[camPhone].streamSocket       = socket;
+                            cameras[camPhone].streamSocketLostAt  = null;  // ← clear outage tracking
+                            cameras[camPhone].lastReconnectSentAt = null;
                             console.log(`[${camPhone}] 📡 Stream socket established`);
 
                             // Start FFmpeg now if not running
@@ -822,10 +864,11 @@ const tcpServer = net.createServer(socket => {
         for (const [camPhone, cam] of Object.entries(cameras)) {
             if (cam.streamSocket === socket) {
                 console.log(`[${camPhone}] 📡 Stream socket disconnected`);
-                cam.hasStreamSocket = false;
-                cam.streamSocket    = null;
-                cam.gotIFrame       = false;
-                // Kill FFmpeg — will restart when stream socket reconnects
+                cam.hasStreamSocket    = false;
+                cam.streamSocket       = null;
+                cam.gotIFrame          = false;
+                cam.streamSocketLostAt = Date.now();  // ← start the reconnect-backoff clock
+                // Kill FFmpeg — will restart once the stream socket reconnects
                 if (cam.ffmpeg) {
                     cam.ffmpeg.kill('SIGKILL');
                     cam.ffmpeg     = null;
