@@ -293,62 +293,59 @@ function startWatchdog(phone) {
             clearInterval(cam.watchdog);
             return;
         }
-        const age = Date.now() - cameras[phone].lastFrameAt;
-        if (age > CONFIG.watchdogMs && cameras[phone].ffmpeg && !cameras[phone].restarting) {
 
-            // ── NEW: if no stream socket exists, stop FFmpeg and wait ──────────
-            // Camera stream connection dropped — stop restarting FFmpeg endlessly
-            if (!cameras[phone].hasStreamSocket) {
+        // ── Stream socket missing — handle THIS FIRST, independent of whether
+        // FFmpeg is running. (Bug fixed here: this used to live inside the
+        // "age > watchdogMs && cameras[phone].ffmpeg" check below. Once we
+        // stop FFmpeg and leave it null — which is correct, we don't want to
+        // keep restarting it against a dead source — that condition became
+        // permanently false, so the 0x9101 reconnect logic never ran again.
+        // That's why it stayed offline for 20+ minutes instead of recovering
+        // after ~60-90s. Checking hasStreamSocket first, before touching
+        // ffmpeg state at all, fixes that.) ───────────────────────────────────
+        if (!cameras[phone].hasStreamSocket) {
+            if (cameras[phone].ffmpeg && !cameras[phone].restarting) {
                 console.warn(`[Watchdog ${phone}] No stream socket — stopping FFmpeg until camera reconnects`);
-                if (cameras[phone].ffmpeg) {
-                    cameras[phone].ffmpeg.kill('SIGKILL');
-                    cameras[phone].ffmpeg    = null;
-                    cameras[phone].patPmtSent = false;
-                    cameras[phone].gotIFrame  = false;
-                }
-
-                // ── FIX: actively ask the device to reconnect instead of waiting ───
-                // Previously the server just sat here doing nothing until the device
-                // decided on its own to re-open the stream socket — which is why a
-                // manual pm2 restart was needed to "fix" it (restart just forces
-                // everything to re-establish). Instead: if the main signalling
-                // connection is still alive, periodically re-send 0x9101 to prompt
-                // the device to reconnect the stream socket itself.
-                const lostAt = cameras[phone].streamSocketLostAt || Date.now();
-                const downForMs = Date.now() - lostAt;
-                const lastSent  = cameras[phone].lastReconnectSentAt || 0;
-
-                if (downForMs > CONFIG.streamReconnectMs && (Date.now() - lastSent) > CONFIG.streamReconnectMs) {
-                    const signallingSocket = tcpSockets[phone];
-                    if (signallingSocket && !signallingSocket.destroyed) {
-                        console.warn(`[Watchdog ${phone}] Stream socket down ${Math.round(downForMs / 1000)}s — re-requesting video (0x9101)`);
-                        signallingSocket.write(buildVideoRequest(
-                            phone, CONFIG.serverIp, CONFIG.tcpPort, CONFIG.streamChannel
-                        ));
-                        cameras[phone].lastReconnectSentAt = Date.now();
-                    } else {
-                        console.warn(`[Watchdog ${phone}] Stream socket down but signalling socket also gone — waiting for full reconnect`);
-                    }
-                }
-                return;
+                cameras[phone].ffmpeg.kill('SIGKILL');
+                cameras[phone].ffmpeg     = null;
+                cameras[phone].patPmtSent = false;
+                cameras[phone].gotIFrame  = false;
             }
 
+            // Actively ask the device to reconnect instead of waiting forever.
+            const lostAt    = cameras[phone].streamSocketLostAt || Date.now();
+            const downForMs = Date.now() - lostAt;
+            const lastSent  = cameras[phone].lastReconnectSentAt || 0;
+
+            if (downForMs > CONFIG.streamReconnectMs && (Date.now() - lastSent) > CONFIG.streamReconnectMs) {
+                const signallingSocket = tcpSockets[phone];
+                if (signallingSocket && !signallingSocket.destroyed) {
+                    console.warn(`[Watchdog ${phone}] Stream socket down ${Math.round(downForMs / 1000)}s — re-requesting video (0x9101)`);
+                    signallingSocket.write(buildVideoRequest(
+                        phone, CONFIG.serverIp, CONFIG.tcpPort, CONFIG.streamChannel
+                    ));
+                    cameras[phone].lastReconnectSentAt = Date.now();
+                } else {
+                    console.warn(`[Watchdog ${phone}] Stream socket down but signalling socket also gone — waiting for full reconnect`);
+                }
+            }
+            return;
+        }
+
+        // ── Stream socket present — normal frame-staleness handling ─────────
+        const age = Date.now() - cameras[phone].lastFrameAt;
+        if (age > CONFIG.watchdogMs && cameras[phone].ffmpeg && !cameras[phone].restarting) {
             console.warn(`[Watchdog ${phone}] No frames for ${age}ms — restarting FFmpeg`);
             cameras[phone].ffmpeg.kill('SIGKILL');
 
-            // ── FIX: zombie stream socket detection ─────────────────────────────
+            // ── Zombie stream socket detection ───────────────────────────────
             // A socket can stay "connected" at the TCP level (never triggers our
             // setTimeout/keepalive, so hasStreamSocket never flips false) while
-            // no longer delivering usable video — e.g. it's sending *something*
-            // periodically (junk/partial packets) that resets the inactivity
-            // timer without ever producing a decodable frame. Without this check,
-            // the watchdog above just restarts FFmpeg forever against a dead
-            // source (this is what caused the 49-minute restart loop overnight).
-            // If frames have been missing for much longer than one watchdog
-            // cycle should ever allow, treat the socket itself as dead and force
-            // it closed — this triggers the normal socket 'close' handler, which
-            // sets hasStreamSocket=false and lets the 0x9101 reconnect logic
-            // above take over on the next tick.
+            // no longer delivering usable video. If frames have been missing far
+            // longer than one watchdog cycle should ever allow, treat the socket
+            // itself as dead and force it closed — this triggers the normal
+            // socket 'close' handler, which sets hasStreamSocket=false and lets
+            // the reconnect logic above take over on the next tick.
             if (age > CONFIG.zombieStreamMs && cameras[phone].streamSocket) {
                 console.warn(`[Watchdog ${phone}] Stream socket alive but frame-dead for ${Math.round(age / 1000)}s — forcing it closed`);
                 cameras[phone].streamSocket.destroy();
