@@ -27,6 +27,10 @@ const FORWARD_HOST    = process.env.FORWARD_HOST || '127.0.0.1';
 const FORWARD_PORT    = parseInt(process.env.FORWARD_PORT || '9000', 10);
 const RECONNECT_DELAY = parseInt(process.env.FORWARD_RECONNECT_MS || '5000', 10);
 
+// Master on/off switch for the whole forwarder. Set FORWARDER_ENABLED=false in
+// .env to disable it completely — no socket connect, no queuing, no sends.
+const FORWARDER_ENABLED = (process.env.FORWARDER_ENABLED || 'true').toLowerCase() !== 'false';
+
 // ── Internal state ─────────────────────────────────────────────────────────────
 let client        = null;
 let connected     = false;
@@ -35,6 +39,10 @@ let sendQueue     = [];   // buffered while disconnected
 
 // ── Connection management ──────────────────────────────────────────────────────
 function connect() {
+    if (!FORWARDER_ENABLED) {
+        console.log('[TCPForwarder] Disabled via FORWARDER_ENABLED=false — not connecting.');
+        return;
+    }
     if (reconnecting) return;
     reconnecting = true;
 
@@ -142,6 +150,10 @@ function sendSignallingPacket(rawBuffer) {
  * Internal: queue if not connected, write immediately if connected.
  */
 function _send(bufferOrString) {
+    if (!FORWARDER_ENABLED) {
+        // Forwarder turned off — drop silently instead of queuing forever.
+        return;
+    }
     if (!connected) {
         console.warn(`[TCPForwarder] Not connected — queuing (queue length: ${sendQueue.length + 1})`);
         sendQueue.push(bufferOrString);
@@ -150,7 +162,33 @@ function _send(bufferOrString) {
     _write(bufferOrString);
 }
 
+/**
+ * sendStreamAlert(phone, downMs)
+ *
+ * Sends a simple CSV alert line when a camera's video stream has stalled
+ * (no frames received) for longer than STREAM_STALL_ALERT_MS (see .env,
+ * consumed in index-pictor.js). Kept as plain CSV so it lands on the same
+ * TCP pipe/parser as the GPS records — adjust the format if your remote
+ * server expects something else (e.g. JSON).
+ *
+ * Example output:
+ *   ALERT,STREAM_STOPPED,1576064474,2026-05-13 19:49:03,32104
+ */
+function sendStreamAlert(phone, downMs) {
+    const paddedPhone = `1000${phone}`;
+    const line = [
+        'ALERT',
+        'STREAM_STOPPED',
+        paddedPhone,
+        new Date().toISOString().replace('T', ' ').substring(0, 19),
+        downMs,
+    ].join(',') + '\n';
+
+    console.warn(`[TCPForwarder] → ALERT: stream stopped for ${phone} (${downMs}ms)`);
+    _send(Buffer.from(line, 'utf8'));
+}
+
 // ── Boot ───────────────────────────────────────────────────────────────────────
 connect();
 
-module.exports = { sendGpsRecord, sendSignallingPacket };
+module.exports = { sendGpsRecord, sendSignallingPacket, sendStreamAlert };

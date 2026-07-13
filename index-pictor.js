@@ -38,6 +38,14 @@ const CONFIG = {
     streamChannel:  parseInt(process.env.STREAM_CH     || '1'),
     maxBufferBytes: parseInt(process.env.MAX_BUF       || String(4 * 1024 * 1024)),  // 4MB per socket
     watchdogMs:     parseInt(process.env.WATCHDOG_MS   || '15000'),  // restart FFmpeg if no frames for 15s
+
+    // Set STREAM_REQUEST_ENABLED=false in .env to stop asking cameras to start
+    // streaming (0x9101 is simply never sent on auth).
+    streamRequestEnabled: (process.env.STREAM_REQUEST_ENABLED || 'true').toLowerCase() !== 'false',
+
+    // How long a camera can go with no video frames before we fire a TCP
+    // alert to the remote server (via tcp-forwarder.js). Defaults to 30s.
+    streamStallAlertMs: parseInt(process.env.STREAM_STALL_ALERT_MS || '30000'),
 };
 
 console.log(`[Pictor] Server IP  : ${CONFIG.serverIp}`);
@@ -65,6 +73,7 @@ function makeCamera() {
         frameCount:      0,
         hasStreamSocket: false,   // ← add this
         streamSocket:    null,    // ← add this
+        stallAlertSent:  false,   // ← true once we've alerted for the current stall
     };
 }
 
@@ -277,6 +286,17 @@ function startWatchdog(phone) {
             return;
         }
         const age = Date.now() - cameras[phone].lastFrameAt;
+
+        // ── Stall alert — fire once per stall to the remote TCP server ─────
+        if (age > CONFIG.streamStallAlertMs) {
+            if (!cameras[phone].stallAlertSent) {
+                cameras[phone].stallAlertSent = true;
+                tcpForwarder.sendStreamAlert(phone, age);
+            }
+        } else {
+            cameras[phone].stallAlertSent = false;
+        }
+
         if (age > CONFIG.watchdogMs && cameras[phone].ffmpeg && !cameras[phone].restarting) {
 
             // ── NEW: if no stream socket exists, stop FFmpeg and wait ──────────
@@ -712,10 +732,14 @@ const tcpServer = net.createServer(socket => {
                         // Start watchdog
                         startWatchdog(phone);
 
-                        // Request live video
-                        socket.write(buildVideoRequest(
-                            phone, CONFIG.serverIp, CONFIG.tcpPort, CONFIG.streamChannel
-                        ));
+                        // Request live video (can be disabled via .env: STREAM_REQUEST_ENABLED=false)
+                        if (CONFIG.streamRequestEnabled) {
+                            socket.write(buildVideoRequest(
+                                phone, CONFIG.serverIp, CONFIG.tcpPort, CONFIG.streamChannel
+                            ));
+                        } else {
+                            console.log(`[${phone}] Streaming disabled via STREAM_REQUEST_ENABLED=false — skipping 0x9101`);
+                        }
 
                         console.log(`[${phone}] ✅ Registered. Cameras online: ${Object.keys(tcpSockets).length}`);
                         broadcast({
