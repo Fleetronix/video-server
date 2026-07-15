@@ -52,10 +52,10 @@ const CONFIG = {
     gpsStallAlertMs: parseInt(process.env.GPS_STALL_ALERT_MS || '30000'),
 
     // Which condition(s) should trigger the STREAM_INTRUPPED alert:
-    //   'stream' → only when video stream stalls
-    //   'gps'    → only when GPS reports stop
-    //   'both'   → either one stalling fires the alert (default)
-    alertOn: (process.env.ALERT_ON || 'both').toLowerCase(),
+    //   'gps'    → only when GPS (0x0200) reports stop coming from the device (default)
+    //   'stream' → only when the video stream stalls (no FFmpeg frames)
+    //   'both'   → either one stalling fires the alert
+    alertOn: (process.env.ALERT_ON || 'gps').toLowerCase(),
 };
 
 console.log(`[Pictor] Server IP  : ${CONFIG.serverIp}`);
