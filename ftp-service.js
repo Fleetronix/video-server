@@ -45,7 +45,7 @@ const { WebSocketServer } = require('ws');
 const Redis  = require('ioredis');
 const bus    = require('./device-bus');
 const { BlobServiceClient } = require('@azure/storage-blob');
-const { handleEventDownload } = require('./event-download');
+const { handleEventDownload, handleEventHistory } = require('./event-download');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const SERVER_IP       = process.env.SERVER_IP             || '127.0.0.1';
@@ -367,6 +367,11 @@ http.createServer((req, res) => {
     // ── POST /api/event-download  (everything: see event-download.js) ─────────
     if (req.method === 'POST' && urlPath === '/api/event-download') {
         return handleEventDownload(req, res);
+    }
+
+    // ── GET /api/event-history/:deviceId  (see event-download.js) ─────────────
+    if (req.method === 'GET' && urlPath.startsWith('/api/event-history/')) {
+        return handleEventHistory(req, res);
     }
 
     // ── GET /api/ftp-status/:requestId ────────────────────────────────────────

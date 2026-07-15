@@ -410,4 +410,87 @@ function handleEventDownload(req, res) {
     });
 }
 
-module.exports = { handleEventDownload, processEventDownload };
+// ── Filters available on GET /api/event-history/:deviceId ───────────────────
+// To add a new filter later, just add one line here — the query-param name
+// on the left becomes usable immediately, no other code changes needed.
+const HISTORY_FILTERABLE_FIELDS = {
+    alarmName:    { field: 'alarmName',    type: 'string' },
+    alarmType:    { field: 'alarmType',    type: 'number' },
+    vehicleId:    { field: 'vehicleId',    type: 'number' },
+    group:        { field: 'group',        type: 'string' },
+    deviceType:   { field: 'deviceType',   type: 'string' },
+    driverName:   { field: 'driverName',   type: 'string' },
+    uploadStatus: { field: 'uploadStatus', type: 'string' },   // pending|uploaded|failed|skipped
+};
+
+function buildEventHistoryFilter(deviceId, query) {
+    const filter = { deviceId };
+
+    // alarmTime is stored as "YYYY-MM-DD HH:mm:ss", which sorts/compares
+    // correctly as a plain string — no Date parsing needed.
+    if (query.startTime || query.endTime) {
+        filter.alarmTime = {};
+        if (query.startTime) filter.alarmTime.$gte = query.startTime;
+        if (query.endTime)   filter.alarmTime.$lte = query.endTime;
+    }
+
+    for (const [param, { field, type }] of Object.entries(HISTORY_FILTERABLE_FIELDS)) {
+        if (query[param] === undefined || query[param] === '') continue;
+        filter[field] = type === 'number' ? Number(query[param]) : query[param];
+    }
+
+    return filter;
+}
+
+// ── HTTP handler — GET /api/event-history/:deviceId ─────────────────────────
+// Query params: startTime, endTime, page, pageSize, sort,
+// + anything listed in HISTORY_FILTERABLE_FIELDS above (alarmName, alarmType, ...)
+async function handleEventHistory(req, res) {
+    try {
+        const urlObj   = new URL(req.url, 'http://localhost');
+        const deviceId = decodeURIComponent(urlObj.pathname.replace('/api/event-history/', '').trim());
+        const query    = Object.fromEntries(urlObj.searchParams.entries());
+
+        if (!deviceId) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'deviceId is required, e.g. /api/event-history/15760064474' }));
+            return;
+        }
+
+        const conn = await connectMongo();
+        if (!conn) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'MongoDB not configured' }));
+            return;
+        }
+
+        const page     = Math.max(parseInt(query.page     || '1',  10), 1);
+        const pageSize = Math.min(Math.max(parseInt(query.pageSize || '50', 10), 1), 500);
+        const sort     = query.sort || '-alarmTime';   // newest first by default
+
+        const filter = buildEventHistoryFilter(deviceId, query);
+
+        const [rows, total] = await Promise.all([
+            EventAlarm.find(filter).sort(sort).skip((page - 1) * pageSize).limit(pageSize).lean(),
+            EventAlarm.countDocuments(filter),
+        ]);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            deviceId,
+            filter,
+            page,
+            pageSize,
+            total,
+            totalPages: Math.ceil(total / pageSize),
+            count: rows.length,
+            data: rows,
+        }));
+    } catch (e) {
+        err('event-history failed:', e.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+    }
+}
+
+module.exports = { handleEventDownload, handleEventHistory, processEventDownload };
