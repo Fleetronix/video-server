@@ -368,7 +368,7 @@ async function processEventDownload(queryBody) {
         queryType:   queryBody.queryType,
         queryParams: queryBody.queryParams,
     };
-
+    console.log("processEventDownload>>>>>>>>>>>>>>>>>>>>>>>>>", queryContext)
     const settled = await Promise.allSettled(rows.map(alarm => processAlarmRow(alarm, queryContext)));
 
     const results = settled.map((r, i) =>
