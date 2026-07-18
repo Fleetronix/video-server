@@ -169,7 +169,7 @@ async function fetchAllAdasPages(queryBody) {
     let allRows = [];
     let total   = null;
     let msg     = 'Success';
-    console.log("...queryBody.....", ...queryBody, JSON.stringify(queryBody))
+    console.log("...queryBody.....",  JSON.stringify(queryBody))
     for (let page = 0; page < MAX_PAGES; page++) {
         const resp = await fetchRecentlyAdasListPage({ ...queryBody, pageNumber, pageSize });
         console.log("resp------------->>>>>>", resp)
