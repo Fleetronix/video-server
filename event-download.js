@@ -61,7 +61,7 @@ const EventAlarm            = require('./event-alarm-model');
 // ── Config ────────────────────────────────────────────────────────────────────
 const EVENT_API_BASE_URL = process.env.EVENT_API_BASE_URL || 'https://y.gpstracktech.com';
 const EVENT_API_KEY      = process.env.EVENT_API_KEY      || '';
-const EVENT_API_PATH     = process.env.EVENT_API_PATH     || '/api//alarm/recentlyAdasList';
+const EVENT_API_PATH     = process.env.EVENT_API_PATH     || '/api/alarm/recentlyAdasList';
 
 const AZURE_CONN_STRING      = process.env.AZURE_STORAGE_CONNECTION_STRING || null;
 const AZURE_EVENTS_CONTAINER = process.env.AZURE_EVENTS_CONTAINER          || 'events';
@@ -148,7 +148,9 @@ function fetchStream(fullUrl, headers, maxRedirects = 3) {
 
 // ── Call the upstream ADAS alarm list API — one page ─────────────────────────
 async function fetchRecentlyAdasListPage(queryBody) {
+    console.log("fetchRecentlyAdasListPage queryBody--------", queryBody);
     const fullUrl = EVENT_API_BASE_URL + EVENT_API_PATH;
+    console.log("fetchRecentlyAdasListPage fullUrl--------", fullUrl)
     return postJson(fullUrl, {
         'key':             EVENT_API_KEY,
         'Accept-Language': 'en',
@@ -170,7 +172,7 @@ async function fetchAllAdasPages(queryBody) {
 
     for (let page = 0; page < MAX_PAGES; page++) {
         const resp = await fetchRecentlyAdasListPage({ ...queryBody, pageNumber, pageSize });
-
+        console.log("resp------------->>>>>>", resp)
         if (resp.code !== 200) {
             throw new Error(`Upstream error: ${resp.msg || resp.code}`);
         }
