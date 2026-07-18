@@ -358,6 +358,7 @@ async function processAlarmRow(alarm, queryContext) {
 
 // ── Full pipeline: fetch list → process each row ─────────────────────────────
 async function processEventDownload(queryBody) {
+    console.log("processEventDownload QUERY BODY", JSON.stringify(queryBody))
     const upstream = await fetchAllAdasPages(queryBody);
 
     const rows = upstream.data || [];
@@ -389,6 +390,7 @@ async function processEventDownload(queryBody) {
 
 // ── HTTP handler — POST /api/event-download ─────────────────────────────────────
 function handleEventDownload(req, res) {
+    console.log("handleEventDownload>>>>>>>>>>>", JSON.stringify(req.body));
     let body = '';
     req.on('data', c => body += c);
     req.on('end', async () => {
