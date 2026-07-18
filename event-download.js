@@ -207,7 +207,7 @@ async function uploadAlarmVideoWithRetry(alarm) {
 
     const sourceUrl = `${EVENT_API_BASE_URL}${alarm.aviPath}`;
     const blobPath  = `${alarm.deviceId || 'unknown'}/${alarm.alarmId}.mp4`;
-
+    console.log("sourceUrl............", sourceUrl);
     let lastError = null;
 
     for (let attempt = 1; attempt <= UPLOAD_MAX_RETRIES; attempt++) {
