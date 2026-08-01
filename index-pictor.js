@@ -38,6 +38,24 @@ const CONFIG = {
     streamChannel:  parseInt(process.env.STREAM_CH     || '1'),
     maxBufferBytes: parseInt(process.env.MAX_BUF       || String(4 * 1024 * 1024)),  // 4MB per socket
     watchdogMs:     parseInt(process.env.WATCHDOG_MS   || '15000'),  // restart FFmpeg if no frames for 15s
+
+    // Set STREAM_REQUEST_ENABLED=false in .env to stop asking cameras to start
+    // streaming (0x9101 is simply never sent on auth).
+    streamRequestEnabled: (process.env.STREAM_REQUEST_ENABLED || 'true').toLowerCase() !== 'false',
+
+    // How long a camera can go with no video frames before we fire a TCP
+    // alert to the remote server (via tcp-forwarder.js). Defaults to 30s.
+    streamStallAlertMs: parseInt(process.env.STREAM_STALL_ALERT_MS || '30000'),
+
+    // How long a device can go with no GPS (0x0200) reports before that
+    // also counts as an interruption. Defaults to 30s.
+    gpsStallAlertMs: parseInt(process.env.GPS_STALL_ALERT_MS || '30000'),
+
+    // Which condition(s) should trigger the STREAM_INTRUPPED alert:
+    //   'gps'    → only when GPS (0x0200) reports stop coming from the device (default)
+    //   'stream' → only when the video stream stalls (no FFmpeg frames)
+    //   'both'   → either one stalling fires the alert
+    alertOn: (process.env.ALERT_ON || 'gps').toLowerCase(),
 };
 
 console.log(`[Pictor] Server IP  : ${CONFIG.serverIp}`);
@@ -51,6 +69,7 @@ if (!fs.existsSync('./public')) fs.mkdirSync('./public');
 // ── Per-camera state ──────────────────────────────────────────────────────────
 const cameras    = {};   // { [phone]: CameraState }
 const tcpSockets = {};   // { [phone]: net.Socket }
+const lastGps    = {};   // { [phone]: { ...gpsRecordFields, receivedAt } }
 
 function makeCamera() {
     return {
@@ -65,6 +84,7 @@ function makeCamera() {
         frameCount:      0,
         hasStreamSocket: false,   // ← add this
         streamSocket:    null,    // ← add this
+        stallAlertSent:  false,   // ← true once we've alerted for the current stall
     };
 }
 
@@ -277,6 +297,27 @@ function startWatchdog(phone) {
             return;
         }
         const age = Date.now() - cameras[phone].lastFrameAt;
+
+        // ── Stall alert — fire once per stall to the remote TCP server ─────
+        const streamDown = age > CONFIG.streamStallAlertMs;
+        const gpsDown     = lastGps[phone]
+            ? (Date.now() - lastGps[phone].receivedAt) > CONFIG.gpsStallAlertMs
+            : false;
+
+        let alertCondition = false;
+        if (CONFIG.alertOn === 'stream')      alertCondition = streamDown;
+        else if (CONFIG.alertOn === 'gps')    alertCondition = gpsDown;
+        else /* 'both' */                     alertCondition = streamDown || gpsDown;
+
+        if (alertCondition) {
+            if (!cameras[phone].stallAlertSent) {
+                cameras[phone].stallAlertSent = true;
+                tcpForwarder.sendStreamAlert(phone, lastGps[phone]);
+            }
+        } else {
+            cameras[phone].stallAlertSent = false;
+        }
+
         if (age > CONFIG.watchdogMs && cameras[phone].ffmpeg && !cameras[phone].restarting) {
 
             // ── NEW: if no stream socket exists, stop FFmpeg and wait ──────────
@@ -712,10 +753,14 @@ const tcpServer = net.createServer(socket => {
                         // Start watchdog
                         startWatchdog(phone);
 
-                        // Request live video
-                        socket.write(buildVideoRequest(
-                            phone, CONFIG.serverIp, CONFIG.tcpPort, CONFIG.streamChannel
-                        ));
+                        // Request live video (can be disabled via .env: STREAM_REQUEST_ENABLED=false)
+                        if (CONFIG.streamRequestEnabled) {
+                            socket.write(buildVideoRequest(
+                                phone, CONFIG.serverIp, CONFIG.tcpPort, CONFIG.streamChannel
+                            ));
+                        } else {
+                            console.log(`[${phone}] Streaming disabled via STREAM_REQUEST_ENABLED=false — skipping 0x9101`);
+                        }
 
                         console.log(`[${phone}] ✅ Registered. Cameras online: ${Object.keys(tcpSockets).length}`);
                         broadcast({
@@ -746,8 +791,7 @@ const tcpServer = net.createServer(socket => {
                             gps.alarms.join('|') || 'NONE',
                         ];
 
-                        tcpForwarder.sendGpsRecord({
-                            phone,      datetime: gps.datetime,
+                        const gpsSnapshot = {
                             latitude:   gps.lat,  longitude: gps.lon,
                             speed_kmh:  gps.speed, direction_deg: gps.direction,
                             elevation_m: gps.elevation,
@@ -761,8 +805,16 @@ const tcpServer = net.createServer(socket => {
                             oil_circuit:     gps.oil_circuit,
                             vehicle_circuit: gps.vehicle_circuit,
                             door:            gps.door,
+                        };
+
+                        tcpForwarder.sendGpsRecord({
+                            phone,      datetime: gps.datetime,
+                            ...gpsSnapshot,
                             alarms:          gps.alarms.join('|') || 'NONE',
                         });
+
+                        // Cache for STREAM_INTRUPPED alerts + mark GPS as fresh
+                        lastGps[phone] = { ...gpsSnapshot, receivedAt: Date.now() };
 
                         const logFile = `./gps_log_${phone}_${new Date().toISOString().slice(0,10)}.txt`;
                         fs.appendFile(logFile, record.join(',') + '\n', e => {
