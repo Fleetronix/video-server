@@ -3,36 +3,36 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // ftp-service.js  —  FTP DOWNLOAD SERVICE  (multi-camera + Redis tracking)
 //
-// Every download request gets a unique requestId.
-// Status is tracked in Azure Redis under key:  ftp:<phone>:<requestId>
+// Every download request gets a unique requestId and is tracked per FOLDER in
+// Redis. State lives across several purpose-built keys — see ftp-store.js for
+// the key list. The legacy `stoppageVideoRecordingTriggered` hash is still
+// mirrored on every transition, so the scheduler server needs no change.
 //
-// Redis record shape:
-// {
-//   requestId:  'abc123',
-//   phone:      '15760064474',
-//   ch:         1,
-//   startTime:  '2026-06-15 14:38:00',
-//   endTime:    '2026-06-15 14:38:20',
-//   folder:     '/15760064474/',
-//   status:     'queued' | 'in_progress' | 'complete' | 'failed',
-//   filePath:   '/full/path/to/file.mp4',   // set when complete
-//   filename:   'CH0-....MP4',              // set when complete
-//   url:        '/recordings/...',          // set when complete
-//   fileSize:   1234567,                    // set when complete
-//   createdAt:  '2026-06-15T14:38:00.000Z',
-//   updatedAt:  '2026-06-15T14:38:30.000Z',
-//   error:      'reason',                  // set when failed
-// }
+// Job lifecycle:
+//   queued → active → complete
+//                   ↘ partial | failed | no_files | interrupted → (retry) → queued
+//                                                               → dead (budget spent)
+//
+// Nothing except a verified `complete` or a `dead` record blocks a retry.
+// A job that stalls is caught three ways: an in-process watchdog, a Redis
+// lease that expires if the process dies, and a periodic reconciler that
+// re-queues due retries and promotes jobs whose blob is already in Azure.
 //
 // HTTP API  :8082
-//   POST /api/ftp-download   { phone, ch, startTime, endTime, folder }
-//        → { requestId, status:'queued', phone, ch, startTime, endTime, folder }
-//
-//   GET  /api/ftp-status/:requestId          → Redis record for that request
-//   GET  /api/ftp-history/:phone             → all records for a phone (latest 50)
-//   POST /api/ftp-cancel     { phone }
-//   GET  /api/sessions                       → active in-memory sessions
-//   GET  /recordings/**                      → download saved file
+//   POST   /api/ftp-download        { phone, ch, startTime, endTime, folder }
+//          → { requestId, status, terminal, queuePosition, ... }
+//   GET    /api/ftp-status/:requestId    → record for that request
+//   GET    /api/ftp-history/:phone       → records for a phone (latest 50)
+//   GET    /api/ftp-queue/:phone         → active job + durable pending queue
+//   GET    /api/ftp-stuck                → everything not complete, with attempts
+//   GET    /api/ftp-log/:folder          → state-transition history for one job
+//   GET    /api/ftp-migrate-preview      → what the legacy import would do (read-only)
+//   POST   /api/ftp-retry           { folder }   → force another attempt
+//   POST   /api/ftp-reconcile            → run the recovery sweep now
+//   DELETE /api/ftp-record/:folder       → wipe a job and all its indexes
+//   POST   /api/ftp-cancel          { phone }
+//   GET    /api/sessions                 → active in-memory sessions
+//   GET    /recordings/**                → download saved file
 // ─────────────────────────────────────────────────────────────────────────────
 
 require('dotenv').config();
@@ -140,144 +140,97 @@ function connectRedis() {
 
 redis = connectRedis();
 
-// ── Redis helpers ─────────────────────────────────────────────────────────────
+// ── Redis state ───────────────────────────────────────────────────────────────
 //
-// ── Redis ─────────────────────────────────────────────────────────────────────
-// Only ONE Redis hash used:
+// State lives in ftp-store.js now, spread across purpose-built keys instead of
+// one opaque hash — see that file's header for the full key list. The legacy
+// `stoppageVideoRecordingTriggered` hash is still mirrored on every transition,
+// so the scheduler server needs no change.
 //
-// HASH  stoppageVideoRecordingTriggered
-//   field: <folder>   (e.g. 15760064474_tripId_20260702T083914)
-//   value: JSON { folder, phone, requestId, status, blobUrl, blobPath,
-//                 startTime, endTime, createdAt, updatedAt, error }
-//
-// folder is used as key so duplicate requests for the same folder are blocked.
+// The wrappers below keep the existing call sites working while the rest of the
+// file moves to explicit state transitions.
 
-const STOPPAGE_HASH = 'stoppageVideoRecordingTriggered';
+const store = require('./ftp-store');
+store.init(redis);
 
-// ── Check if folder already processed ────────────────────────────────────────
-async function getStoppageRecord(folder) {
-    if (!redis) return null;
-    try {
-        const raw = await redis.hget(STOPPAGE_HASH, folder);
-        return raw ? JSON.parse(raw) : null;
-    } catch (e) {
-        err('Redis hget error:', e.message);
+// ── Retry / watchdog tuning ───────────────────────────────────────────────────
+const MAX_ATTEMPTS      = parseInt(process.env.FTP_MAX_ATTEMPTS      || '3');
+const RETRY_BASE_MS     = parseInt(process.env.FTP_RETRY_BASE_MS     || String(2 * 60 * 1000));
+const RETRY_MAX_MS      = parseInt(process.env.FTP_RETRY_MAX_MS      || String(30 * 60 * 1000));
+const LEASE_MS          = parseInt(process.env.FTP_LEASE_MS          || String(3 * 60 * 1000));
+const HANDSHAKE_TIMEOUT = parseInt(process.env.FTP_HANDSHAKE_TIMEOUT || String(90 * 1000));
+const TRANSFER_TIMEOUT  = parseInt(process.env.FTP_TRANSFER_TIMEOUT  || String(15 * 60 * 1000));
+const RECONCILE_MS      = parseInt(process.env.FTP_RECONCILE_MS      || String(60 * 1000));
+
+// Attempt 1 fails → retry in 2 min, then 4, then 8 … capped at RETRY_MAX_MS.
+function backoffMs(attempts) {
+    return Math.min(RETRY_BASE_MS * Math.pow(2, Math.max(0, attempts - 1)), RETRY_MAX_MS);
+}
+
+// ── Record helpers ────────────────────────────────────────────────────────────
+// Patch update: `status` in the patch is the state to move to.
+// Unlike the previous version this never silently no-ops — a missing record
+// is logged, because that used to be how a finished upload went unrecorded.
+async function updateStoppageRecord(folder, patch = {}, reason = '') {
+    if (!folder) { warn('updateStoppageRecord called without a folder — update dropped'); return null; }
+    const { status, ...rest } = patch;
+    const rec = await store.getJob(folder);
+    if (!rec) {
+        warn(`No job record for folder:${folder} — update dropped (status:${status || 'unchanged'})`);
         return null;
     }
+    return store.transition(folder, status || rec.status, {
+        patch:  rest,
+        reason: reason || status || 'update',
+        phone:  rec.phone,
+    });
 }
 
-// ── Save new record keyed by folder ──────────────────────────────────────────
-async function saveStoppageRecord(folder, data) {
-    if (!redis) return;
-    try {
-        const record = { ...data, updatedAt: new Date().toISOString() };
-        await redis.hset(STOPPAGE_HASH, folder, JSON.stringify(record));
-        log(`Redis HSET ${STOPPAGE_HASH}[${folder}] status:${data.status}`);
-    } catch (e) {
-        err('Redis save error:', e.message);
-    }
-}
-
-// ── Update existing record ────────────────────────────────────────────────────
-async function updateStoppageRecord(folder, patch) {
-    if (!redis) return;
-    try {
-        const existing = await redis.hget(STOPPAGE_HASH, folder);
-        if (!existing) return;
-        const record = { ...JSON.parse(existing), ...patch, updatedAt: new Date().toISOString() };
-        await redis.hset(STOPPAGE_HASH, folder, JSON.stringify(record));
-        log(`Redis updated ${STOPPAGE_HASH}[${folder}] status:${record.status}`);
-    } catch (e) {
-        err('Redis update error:', e.message);
-    }
-}
-
-// ── Delete a record (used when file not found in Azure after failure) ─────────
 async function deleteStoppageRecord(folder) {
-    if (!redis) return;
-    try {
-        await redis.hdel(STOPPAGE_HASH, folder);
-        log(`Redis deleted ${STOPPAGE_HASH}[${folder}]`);
-    } catch (e) {
-        err('Redis delete error:', e.message);
+    return store.deleteJob(folder);
+}
+
+// Mark a job failed and schedule the next attempt, or bury it once the
+// attempt budget is spent. This is the single place failure policy lives.
+async function failJob(folder, error, reason = 'failed', opts = {}) {
+    if (!folder) { warn(`failJob without folder (${reason})`); return null; }
+    const rec = await store.getJob(folder);
+    if (!rec) { warn(`failJob: no record for folder:${folder} (${reason})`); return null; }
+
+    const attempts = Number(rec.attempts || 0);
+    const state    = opts.state || 'failed';
+    const budget   = opts.maxAttempts || MAX_ATTEMPTS;
+
+    if (attempts >= budget) {
+        log(`[${rec.phone}] ${folder} exhausted ${attempts}/${budget} attempts — marking dead`);
+        return store.transition(folder, 'dead', {
+            patch:  { error: `${error} (gave up after ${attempts} attempts)`, lastError: error },
+            reason,
+            phone:  rec.phone,
+        });
     }
+
+    const retryAt = Date.now() + backoffMs(attempts);
+    log(`[${rec.phone}] ${folder} → ${state}, retry ${attempts + 1}/${budget} in ${Math.round(backoffMs(attempts) / 1000)}s`);
+    return store.transition(folder, state, {
+        patch:   { error, lastError: error },
+        reason,
+        retryAt,
+        phone:   rec.phone,
+    });
 }
 
-// ── Kept for API compatibility (ftp-status, ftp-current, ftp-history) ─────────
-// These now read from stoppageVideoRecordingTriggered only
-async function getByRequestId(requestId) {
-    if (!redis) return null;
-    try {
-        const all = await redis.hgetall(STOPPAGE_HASH);
-        if (!all) return null;
-        for (const raw of Object.values(all)) {
-            const rec = JSON.parse(raw);
-            if (rec.requestId === requestId) return rec;
-        }
-        return null;
-    } catch (e) { return null; }
-}
+// ── Read paths (indexed — no more full-hash scans) ────────────────────────────
+async function getByRequestId(requestId)   { return store.findByRequestId(requestId); }
+async function getCurrentFromRedis(phone)  { return store.latestByPhone(phone); }
+async function getAllCurrentFromRedis()    { return store.allJobs(); }
+async function getHistoryFromRedis(phone)  { return store.historyByPhone(phone); }
 
-async function getCurrentFromRedis(phone) {
-    if (!redis) return null;
-    try {
-        const all = await redis.hgetall(STOPPAGE_HASH);
-        if (!all) return null;
-        const entries = Object.values(all)
-            .map(r => { try { return JSON.parse(r); } catch (_) { return null; } })
-            .filter(r => r && r.phone === phone)
-            .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-        return entries[0] || null;
-    } catch (e) { return null; }
-}
-
-async function getAllCurrentFromRedis() {
-    if (!redis) return {};
-    try {
-        const all = await redis.hgetall(STOPPAGE_HASH);
-        if (!all) return {};
-        const result = {};
-        for (const [folder, raw] of Object.entries(all)) {
-            try { result[folder] = JSON.parse(raw); } catch (_) {}
-        }
-        return result;
-    } catch (e) { return {}; }
-}
-
-async function getHistoryFromRedis(phone) {
-    if (!redis) return [];
-    try {
-        const all = await redis.hgetall(STOPPAGE_HASH);
-        if (!all) return [];
-        return Object.values(all)
-            .map(r => { try { return JSON.parse(r); } catch (_) { return null; } })
-            .filter(r => r && r.phone === phone)
-            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    } catch (e) { return []; }
-}
-
-// Stubs to avoid breaking existing call sites
-async function saveToRedis() {}
-async function updateRedis(phone, requestId, patch) {
-    // Find folder for this requestId and update it
-    if (!redis) return;
-    try {
-        const all = await redis.hgetall(STOPPAGE_HASH);
-        if (!all) return;
-        for (const [folder, raw] of Object.entries(all)) {
-            const rec = JSON.parse(raw);
-            if (rec.requestId === requestId) {
-                await updateStoppageRecord(folder, patch);
-                break;
-            }
-        }
-    } catch (e) { err('updateRedis error:', e.message); }
-}
 
 // ── Internal state ────────────────────────────────────────────────────────────
-// _queue[phone]   = array of pending jobs waiting to be sent to camera
+// The pending queue lives in Redis (ftp:queue:<phone>) so it survives a
+// restart. Only the job currently being driven is held in memory.
 // _sessions[phone] = the SINGLE job currently active (sent to camera)
-const _queue    = {};   // { [phone]: [ job, job, ... ] }
 const _sessions = {};   // { [phone]: job }  — currently active job
 const _seqMap   = {};
 
@@ -452,13 +405,18 @@ http.createServer((req, res) => {
     // ── GET /api/ftp-queue/:phone  → pending queue for a phone ───────────────
     if (req.method === 'GET' && urlPath.startsWith('/api/ftp-queue/')) {
         const phone = urlPath.replace('/api/ftp-queue/', '').trim();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-            phone,
-            active:  _sessions[phone] || null,
-            pending: (_queue[phone] || []).map((j, i) => ({ ...j, queuePosition: i + 1 })),
-            total:   (_queue[phone]?.length || 0) + (_sessions[phone] ? 1 : 0),
-        }));
+        (async () => {
+            const pending = await store.queueList(phone);
+            const records = await Promise.all(pending.map(f => store.getJob(f)));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                phone,
+                active:  _sessions[phone] || null,
+                lease:   await store.leaseOwner(phone),
+                pending: records.filter(Boolean).map((r, i) => ({ ...r, queuePosition: i + 1 })),
+                total:   pending.length + (_sessions[phone] ? 1 : 0),
+            }));
+        })();
         return;
     }
 
@@ -482,6 +440,142 @@ http.createServer((req, res) => {
         return;
     }
 
+    // ── GET /api/ftp-stuck  → everything that is not complete ────────────────
+    // This is the "why did only 4 of my 5 videos process" endpoint.
+    if (req.method === 'GET' && urlPath === '/api/ftp-stuck') {
+        (async () => {
+            const states = ['queued', 'active', 'partial', 'failed', 'no_files', 'interrupted', 'dead'];
+            const out = {};
+            for (const s of states) {
+                const jobs = await store.jobsInState(s);
+                if (jobs.length) {
+                    out[s] = jobs.map(j => ({
+                        folder:     j.folder,
+                        phone:      j.phone,
+                        requestId:  j.requestId,
+                        startTime:  j.startTime,
+                        endTime:    j.endTime,
+                        attempts:   Number(j.attempts || 0),
+                        maxAttempts: Number(j.maxAttempts || MAX_ATTEMPTS),
+                        error:      j.error || null,
+                        updatedAt:  j.updatedAt,
+                        ageMinutes: j.updatedAt ? Math.round((Date.now() - new Date(j.updatedAt)) / 60000) : null,
+                    }));
+                }
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ counts: await store.countsByState(), stuck: out, stats: await store.stats() }, null, 2));
+        })();
+        return;
+    }
+
+    // ── GET /api/ftp-log/:folder  → the transition history for one job ───────
+    if (req.method === 'GET' && urlPath.startsWith('/api/ftp-log/')) {
+        const folder = decodeURIComponent(urlPath.replace('/api/ftp-log/', '')).trim();
+        (async () => {
+            const record = await store.getJob(folder);
+            if (!record) {
+                res.writeHead(404, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: `No record for folder ${folder}` }));
+                return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ record, history: await store.getLog(folder) }, null, 2));
+        })();
+        return;
+    }
+
+    // ── POST /api/ftp-retry  { folder }  → force another attempt ─────────────
+    // The supported replacement for deleting the Redis key by hand.
+    if (req.method === 'POST' && urlPath === '/api/ftp-retry') {
+        let body = '';
+        req.on('data', c => body += c);
+        req.on('end', async () => {
+            try {
+                const { folder, resetAttempts = true } = JSON.parse(body || '{}');
+                if (!folder) throw new Error('folder is required');
+                const record = await store.getJob(folder);
+                if (!record) throw new Error(`No record for folder ${folder}`);
+
+                const recovered = await recoverFromStorage(folder, record);
+                if (recovered) {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify(recovered));
+                    return;
+                }
+
+                await store.transition(folder, 'queued', {
+                    patch:  resetAttempts ? { attempts: 0, error: null } : { error: null },
+                    reason: 'manual-retry',
+                    phone:  record.phone,
+                });
+                await store.queuePush(record.phone, folder);
+                if (!_sessions[record.phone]) processNextInQueue(record.phone);
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ folder, phone: record.phone, status: 'queued', requeued: true }));
+            } catch (e) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: e.message }));
+            }
+        });
+        return;
+    }
+
+    // ── DELETE /api/ftp-record/:folder  → wipe a job and all its indexes ──────
+    if (req.method === 'DELETE' && urlPath.startsWith('/api/ftp-record/')) {
+        const folder = decodeURIComponent(urlPath.replace('/api/ftp-record/', '')).trim();
+        (async () => {
+            const record = await store.getJob(folder);
+            if (record?.phone) await store.queueRemove(record.phone, folder);
+            await deleteStoppageRecord(folder);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ folder, deleted: true, existed: !!record }));
+        })();
+        return;
+    }
+
+    // ── GET /api/ftp-migrate-preview  → what the legacy import would do ──────
+    // Read-only. Add ?full=1 for the per-folder list.
+    if (req.method === 'GET' && urlPath === '/api/ftp-migrate-preview') {
+        (async () => {
+            try {
+                const plan = await planLegacyMigration();
+                const full = /[?&]full=1/.test(req.url);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    hash:                plan.hash,
+                    dryRunEnabled:       MIGRATE_DRYRUN,
+                    autoRetryEnabled:    MIGRATE_AUTORETRY,
+                    total:               plan.total,
+                    alreadyMigrated:     plan.alreadyMigrated,
+                    willImport:          plan.willImport,
+                    willAutoRetry:       plan.willAutoRetry,
+                    byLegacyStatus:      plan.byLegacyStatus,
+                    byTarget:            plan.byTarget,
+                    unparsable:          plan.unparsable,
+                    completeWithoutBlob: plan.completeWithoutBlob,
+                    items: full
+                        ? plan.items.map(({ legacy, ...rest }) => rest)
+                        : `${plan.items.length} item(s) — add ?full=1 to list them`,
+                }, null, 2));
+            } catch (e) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: e.message }));
+            }
+        })();
+        return;
+    }
+
+    // ── POST /api/ftp-reconcile  → run the sweep now instead of waiting ──────
+    if (req.method === 'POST' && urlPath === '/api/ftp-reconcile') {
+        (async () => {
+            await reconcile();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ran: true, counts: await store.countsByState() }));
+        })();
+        return;
+    }
     // ── GET /recordings/** ────────────────────────────────────────────────────
     if (req.method === 'GET' && urlPath.startsWith('/recordings/')) {
         const rel      = urlPath.replace('/recordings/', '');
@@ -505,23 +599,39 @@ http.createServer((req, res) => {
 }).listen(HTTP_PORT, '0.0.0.0', () => log(`HTTP API on :${HTTP_PORT}`));
 
 // ── Bus listeners ─────────────────────────────────────────────────────────────
-bus.on('device:connected', ({ phone }) => {
+bus.on('device:connected', async ({ phone }) => {
     log(`Device connected: ${phone}`);
     _seqMap[phone] = 0;
+    // Anything left interrupted by an earlier drop becomes due immediately,
+    // so a camera coming back online picks its own backlog up.
+    for (const rec of await store.jobsInState('interrupted')) {
+        if (rec.phone !== phone) continue;
+        await store.transition(rec.folder, 'interrupted', {
+            reason: 'device-reconnected', retryAt: Date.now(), phone,
+        });
+    }
+    processNextInQueue(phone);
 });
 
-bus.on('device:disconnected', ({ phone }) => {
+bus.on('device:disconnected', async ({ phone }) => {
     log(`Device disconnected: ${phone}`);
-    if (_sessions[phone]) {
-        updateRedis(phone, _sessions[phone].requestId, { status: 'failed', error: 'Device disconnected' });
+    // Interrupted, not failed: the pending work is still wanted. It stays in
+    // the durable queue and is retried when the camera returns, instead of
+    // being discarded the way the old in-memory queue was.
+    const active = _sessions[phone];
+    if (active) {
+        if (active._jobTimeout) { clearTimeout(active._jobTimeout); active._jobTimeout = null; }
         delete _sessions[phone];
+        await store.leaseRelease(phone, active.folderKey);
+        await failJob(active.folderKey, 'Device disconnected mid-download', 'device-disconnected', { state: 'interrupted' });
     }
-    // Fail all queued jobs too
-    if (_queue[phone]) {
-        _queue[phone].forEach(job => {
-            updateRedis(phone, job.requestId, { status: 'failed', error: 'Device disconnected' });
+    for (const folder of await store.queueList(phone)) {
+        await store.transition(folder, 'interrupted', {
+            patch:   { error: 'Device disconnected before this job started' },
+            reason:  'device-disconnected',
+            retryAt: Date.now() + backoffMs(1),
+            phone,
         });
-        _queue[phone] = [];
     }
     delete _seqMap[phone];
 });
@@ -538,17 +648,17 @@ bus.on('device:message', async ({ msgId, body, seq, phone }) => {
             if (replyResult === 0) {
                 broadcast({ type: 'status', phone, message: '✅ Camera accepted, uploading via FTP...' });
                 if (session) {
-                    updateRedis(phone, session.requestId, { status: 'in_progress' });
+                    // Camera is talking — swap the short handshake watchdog for
+                    // the long transfer one.
+                    touchJob(phone, 'camera-accepted', TRANSFER_TIMEOUT);
                 }
             } else {
                 err(`[${phone}] Camera rejected 0x9206 code:${replyResult}`);
                 broadcast({ type: 'error', phone, message: `Camera rejected request (code ${replyResult})` });
                 if (session) {
-                    updateRedis(phone, session.requestId, {
-                        status: 'failed',
-                        error: `Camera rejected 0x9206 (code ${replyResult})`,
-                    });
-                    jobFinished(phone);  // ← move to next
+                    await failJob(session.folderKey,
+                        `Camera rejected 0x9206 (code ${replyResult})`, '0x9206-rejected');
+                    jobFinished(phone, '0x9206-rejected');  // ← move to next
                 }
             }
         }
@@ -564,11 +674,12 @@ bus.on('device:message', async ({ msgId, body, seq, phone }) => {
             broadcast({ type: 'error', phone, message: '⚠️ Camera found 0 files for this time range' });
             const session = _sessions[phone];
             if (session) {
-                // Mark as no_files — blocks retries for this folder
-                await updateStoppageRecord(session.folderKey, {
-                    status: 'no_files',
-                    error:  '0 files found on camera SD card for this time range',
-                });
+                // 0x1205 returning 0 is not proof the SD card is empty — the
+                // camera can be busy or still flushing the current segment, and
+                // the 0x9206 that follows often succeeds anyway. So this is a
+                // retryable no_files, not the permanent tombstone it used to be.
+                await failJob(session.folderKey,
+                    '0 files reported by camera for this time range', '0-files', { state: 'no_files' });
                 jobFinished(phone, '0-files');
             }
         } else {
@@ -580,15 +691,9 @@ bus.on('device:message', async ({ msgId, body, seq, phone }) => {
                 session.resolvedFiles = session.resolvedFiles || 0;
                 session.savedFiles    = session.savedFiles    || 0;
                 session.cameraDone    = false;
-                if (session._jobTimeout) clearTimeout(session._jobTimeout);
-                session._jobTimeout = setTimeout(() => {
-                    warn(`[${phone}] Job timeout — saved ${session.savedFiles}/${totalFiles} file(s)`);
-                    updateStoppageRecord(session.folderKey, {
-                        status: session.savedFiles > 0 ? 'partial' : 'failed',
-                        error:  `Timed out: ${session.savedFiles}/${totalFiles} saved`,
-                    });
-                    jobFinished(phone, 'job-timeout');
-                }, 15 * 60 * 1000);
+                await updateStoppageRecord(session.folderKey,
+                    { expectedFiles: totalFiles }, 'file-list-received');
+                touchJob(phone, 'file-list-received', TRANSFER_TIMEOUT);
             }
         }
         return;
@@ -607,10 +712,8 @@ bus.on('device:message', async ({ msgId, body, seq, phone }) => {
             err(`[${phone}] ❌ Upload failed code:${result}`);
             broadcast({ type: 'error', phone, message: `Upload failed (code ${result})` });
             if (session) {
-                updateRedis(phone, session.requestId, {
-                    status: 'failed',
-                    error:  `Camera reported upload failure (code ${result})`,
-                });
+                await failJob(session.folderKey,
+                    `Camera reported upload failure (code ${result})`, '0x1206-fail');
                 jobFinished(phone, '0x1206-fail');  // ← move to next
             }
         } else if (session) {
@@ -620,12 +723,11 @@ bus.on('device:message', async ({ msgId, body, seq, phone }) => {
             log(`[${phone}] 0x1206 done — started:${session.startedFiles || 0} saved:${session.savedFiles || 0}`);
             if ((session.startedFiles || 0) === 0) {
                 // Camera said done but never opened a transfer — nothing to save
-                updateRedis(phone, session.requestId, {
-                    status: 'failed',
-                    error:  'Camera reported done but uploaded nothing',
-                });
+                await failJob(session.folderKey,
+                    'Camera reported done but uploaded nothing', '0x1206-empty');
                 jobFinished(phone, '0x1206-empty');
             } else {
+                touchJob(phone, '0x1206-done', TRANSFER_TIMEOUT);
                 maybeFinish(phone);
             }
         }
@@ -634,25 +736,92 @@ bus.on('device:message', async ({ msgId, body, seq, phone }) => {
 
 // ── Core logic ────────────────────────────────────────────────────────────────
 
-// Process next job in queue for a phone — called after each job completes/fails
-async function processNextInQueue(phone) {
-    // If something still active, wait for it to finish
-    if (_sessions[phone]) return;
+// Keep a running job alive. Every sign of life — a camera reply, an upload
+// progress tick — pushes both the in-process watchdog and the Redis lease out.
+// If the process dies or the job wedges, the lease simply expires and the
+// reconciler can tell the job is orphaned. That is what makes a permanently
+// stuck `in_progress` record impossible rather than merely unlikely.
+function touchJob(phone, reason = 'activity', timeoutMs = TRANSFER_TIMEOUT) {
+    const session = _sessions[phone];
+    if (!session) return;
 
-    const queue = _queue[phone];
-    if (!queue || queue.length === 0) {
-        log(`[${phone}] Queue empty`);
+    if (session._jobTimeout) clearTimeout(session._jobTimeout);
+    session._jobTimeout = setTimeout(() => {
+        const s = _sessions[phone];
+        if (!s || s.requestId !== session.requestId) return;
+        warn(`[${phone}] Watchdog fired after ${Math.round(timeoutMs / 1000)}s idle (${reason}) — saved ${s.savedFiles || 0}/${s.expectedFiles || '?'}`);
+        const partial = (s.savedFiles || 0) > 0;
+        failJob(s.folderKey,
+            `Stalled after ${reason}: ${s.savedFiles || 0}/${s.expectedFiles || '?'} files saved`,
+            'watchdog-timeout',
+            { state: partial ? 'partial' : 'interrupted' },
+        ).finally(() => jobFinished(phone, 'watchdog-timeout'));
+    }, timeoutMs);
+
+    store.leaseRenew(phone, session.folderKey, timeoutMs + LEASE_MS).catch(() => {});
+}
+
+// Pull the next folder off the durable queue and start it.
+// The queue lives in Redis now, so a restart mid-batch no longer loses the
+// jobs that had not been dispatched yet.
+async function processNextInQueue(phone) {
+    if (_sessions[phone]) return;   // something still active — wait for it
+
+    let folder;
+    let record;
+
+    // Skip over queue entries whose record has since been completed or removed.
+    while ((folder = await store.queuePop(phone))) {
+        record = await store.getJob(folder);
+        if (!record) { warn(`[${phone}] Queue entry ${folder} has no record — dropped`); continue; }
+        if (record.status === 'complete' || record.status === 'dead') {
+            log(`[${phone}] Queue entry ${folder} already ${record.status} — skipped`);
+            continue;
+        }
+        break;
+    }
+
+    if (!folder || !record) { log(`[${phone}] Queue empty`); return; }
+
+    // The lease is what stops two workers (or a restarted process racing its
+    // own leftovers) from driving the same camera at once.
+    if (!await store.leaseAcquire(phone, folder, HANDSHAKE_TIMEOUT + LEASE_MS)) {
+        const owner = await store.leaseOwner(phone);
+        warn(`[${phone}] Lease held by ${owner} — requeueing ${folder}`);
+        await store.queueUnshift(phone, folder);   // keep the batch in order
         return;
     }
 
-    const job = queue.shift();
-    log(`[${phone}] Queue: starting job requestId:${job.requestId} (${queue.length} remaining)`);
+    const attempts = Number(record.attempts || 0) + 1;
+    const job = {
+        requestId:  record.requestId,
+        phone,
+        ch:         Number(record.ch),
+        startTime:  record.startTime,
+        endTime:    record.endTime,
+        folder:     record.folderPath || `/${folder}/`,
+        folderKey:  folder,
+        streamType: Number(record.streamType || 1),
+        alarmMask:  record.alarmFlag || '0',
+        attempt:    attempts,
+        sentAt:     Date.now(),
+    };
 
     _sessions[phone] = job;
+    log(`[${phone}] Starting ${folder} requestId:${job.requestId} attempt:${attempts}/${MAX_ATTEMPTS}`);
 
-    // Update Redis status to in_progress
-    await updateRedis(phone, job.requestId, { status: 'in_progress', queuePosition: 0 });
-    broadcast({ type: 'status', phone, requestId: job.requestId, message: `▶ Starting download ch${job.ch} ${job.startTime} → ${job.endTime}` });
+    await store.transition(folder, 'active', {
+        patch:  { attempts, lastAttemptAt: new Date().toISOString(), queuePosition: 0, maxAttempts: MAX_ATTEMPTS },
+        reason: `dispatch-attempt-${attempts}`,
+        phone,
+    });
+
+    broadcast({ type: 'status', phone, requestId: job.requestId, message: `▶ Starting download ch${job.ch} ${job.startTime} → ${job.endTime} (attempt ${attempts})` });
+
+    // Arm the watchdog NOW, not once the camera answers. Previously a camera
+    // that never replied left the session pinned forever and stalled every
+    // later video in the batch.
+    touchJob(phone, 'awaiting-camera', HANDSHAKE_TIMEOUT);
 
     // Step 1 — query file list
     bus.emit('device:send', { phone, frame: build9205(phone, job.ch, job.startTime, job.endTime, BigInt(job.alarmMask || '0'), job.streamType || 1) });
@@ -678,11 +847,17 @@ function maybeFinish(phone) {
     if (s.cameraDone &&
         (s.startedFiles  || 0) > 0 &&
         (s.resolvedFiles || 0) >= (s.startedFiles || 0)) {
-        updateRedis(phone, s.requestId, {
-            status:     (s.savedFiles || 0) > 0 ? 'complete' : 'failed',
-            filesSaved: s.savedFiles || 0,
-        });
-        jobFinished(phone, 'all-files-resolved');
+        const saved = s.savedFiles || 0;
+        if (saved > 0) {
+            store.transition(s.folderKey, 'complete', {
+                patch:  { filesSaved: saved, error: null },
+                reason: 'all-files-resolved',
+                phone,
+            }).finally(() => jobFinished(phone, 'all-files-resolved'));
+        } else {
+            failJob(s.folderKey, 'Camera finished but no file reached storage', 'no-files-saved')
+                .finally(() => jobFinished(phone, 'no-files-saved'));
+        }
     }
 }
 
@@ -694,6 +869,8 @@ async function jobFinished(phone, reason = 'done') {
     if (job._jobTimeout) { clearTimeout(job._jobTimeout); job._jobTimeout = null; }
     log(`[${phone}] jobFinished (${reason}) requestId:${job.requestId} saved:${job.savedFiles || 0}/${job.expectedFiles || '?'}`);
     delete _sessions[phone];
+    await store.leaseRelease(phone, job.folderKey);
+    await store.queueRemove(phone, job.folderKey);
     // Small delay so camera can reset before next job
     setTimeout(() => processNextInQueue(phone), 2000);
 }
@@ -702,111 +879,80 @@ async function triggerDownload({ phone, ch, startTime, endTime, folder, requestK
     phone = String(phone);
     if (!folder) folder = `/${phone}/`;
 
+    // The queue, the dedupe claim and the retry schedule all live in Redis.
+    // Without it a request would be accepted and then silently dropped, so
+    // fail loudly instead of pretending it was queued.
+    if (!store.enabled()) {
+        throw new Error('Redis is not configured — downloads cannot be queued. Set REDIS_HOST.');
+    }
+
     const streamType = normalizeStreamType(quality);
-    const { mask: alarmMask, resolved: events_resolved, unknown: events_unknown } = buildAlarmMask(events, alarmFlag);
+    const { mask: alarmMask } = buildAlarmMask(events, alarmFlag);
     const requestId = requestKey || crypto.randomBytes(8).toString('hex');
     const createdAt = new Date().toISOString();
 
     // ── Folder key (strip leading/trailing slashes for consistent Redis key) ──
     const folderKey = folder.replace(/^\/+|\/+$/g, '');
 
-    // ── DUPLICATE CHECK — if folder already processed, skip ──────────────────
-    const existing = await getStoppageRecord(folderKey);
-    if (existing) {
-        if (existing.status === 'complete' && existing.blobUrl) {
-            log(`[${phone}] Duplicate blocked — folder:${folderKey} already complete blobUrl:${existing.blobUrl}`);
-            return {
-                requestId:    existing.requestId,
-                status:       'complete',
-                duplicate:    true,
-                blobUrl:      existing.blobUrl,
-                blobPath:     existing.blobPath,
-                message:      'Already processed. File available at blobUrl.',
-            };
-        }
-        if (existing.status === 'no_files') {
-            log(`[${phone}] Duplicate blocked — folder:${folderKey} previously had 0 files`);
-            return {
-                requestId:    existing.requestId,
-                status:       'no_files',
-                duplicate:    true,
-                message:      'Camera had 0 files for this time range. Not retrying.',
-            };
-        }
-        if (existing.status === 'queued' || existing.status === 'in_progress') {
-            log(`[${phone}] Duplicate blocked — folder:${folderKey} already ${existing.status}`);
-            return {
-                requestId:    existing.requestId,
-                status:       existing.status,
-                duplicate:    true,
-                message:      `Already ${existing.status}.`,
-            };
-        }
-        // status === 'failed' → check Azure before retrying
-        if (existing.status === 'failed' && containerClient) {
-            const expectedBlob = `${folderKey}/vehicle-monitoring-trip.MP4`;
-            try {
-                const blobClient = containerClient.getBlockBlobClient(expectedBlob);
-                const exists = await blobClient.exists();
-                if (exists) {
-                    // File is in Azure despite failed status — update and return
-                    const blobUrl = blobClient.url;
-                    await updateStoppageRecord(folderKey, { status: 'complete', blobUrl, blobPath: expectedBlob });
-                    log(`[${phone}] Failed record recovered — file found in Azure: ${expectedBlob}`);
-                    return { requestId: existing.requestId, status: 'complete', duplicate: true, blobUrl, message: 'File found in Azure.' };
-                } else {
-                    // Not in Azure — delete Redis key and retry
-                    await deleteStoppageRecord(folderKey);
-                    log(`[${phone}] Failed record removed — file not in Azure, retrying: ${folderKey}`);
-                }
-            } catch (e) {
-                err('Azure exists check error:', e.message);
-            }
-        }
-    }
-
-    // Init queue for this phone
-    if (!_queue[phone]) _queue[phone] = [];
-    const queuePosition = _queue[phone].length + (_sessions[phone] ? 1 : 0);
-
-    log(`▶ triggerDownload requestId:${requestId} phone:${phone} ch:${ch} ${startTime} → ${endTime} folder:${folderKey} queuePos:${queuePosition}`);
-
-    const job = { requestId, phone, ch, startTime, endTime, folder, folderKey, streamType, alarmMask: alarmMask.toString(), sentAt: null };
-
-    // Save initial record to stoppageVideoRecordingTriggered keyed by folder
-    await saveStoppageRecord(folderKey, {
+    const newRecord = {
         requestId,
         phone,
         ch,
         startTime,
         endTime,
-        folder:       folderKey,
+        folder:     folderKey,
+        folderPath: folder,
         streamType,
-        quality:      streamType === 2 ? 'low' : 'high',
-        alarmFlag:    alarmMask.toString(),
-        status:       'queued',
-        queuePosition,
-        blobUrl:      null,
-        blobPath:     null,
-        filename:     null,
-        fileSize:     null,
+        quality:    streamType === 2 ? 'low' : 'high',
+        alarmFlag:  alarmMask.toString(),
+        maxAttempts: MAX_ATTEMPTS,
         createdAt,
-        error:        null,
-    });
+    };
 
-    _queue[phone].push(job);
+    // ── Claim the folder atomically ───────────────────────────────────────────
+    // createJob only succeeds for the first caller, so two concurrent requests
+    // for the same video can no longer both start.
+    const claimed = await store.createJob(folderKey, newRecord);
 
+    if (!claimed) {
+        const existing = await store.getJob(folderKey);
+        const decision = await decideOnExisting(phone, folderKey, existing);
+        if (decision) return decision;
+
+        // Retrying an existing record. Adopt this caller's requestId so the
+        // trackUrl we hand back actually resolves, and refresh the request
+        // parameters in case the caller widened the time window.
+        await store.transition(folderKey, 'queued', {
+            patch: {
+                requestId,
+                startTime,
+                endTime,
+                ch,
+                streamType,
+                folderPath: folder,
+                alarmFlag:  alarmMask.toString(),
+                error:      null,
+            },
+            reason: 're-requested',
+            phone,
+        });
+    }
+
+    log(`▶ triggerDownload requestId:${requestId} phone:${phone} ch:${ch} ${startTime} → ${endTime} folder:${folderKey}`);
+
+    await store.queuePush(phone, folderKey);
+    const pending = await store.queueList(phone);
+    const queuePosition = Math.max(0, pending.indexOf(folderKey)) + (_sessions[phone] ? 1 : 0);
+
+    await updateStoppageRecord(folderKey, { queuePosition }, 'enqueued');
     broadcast({ type: 'status', phone, requestId, message: queuePosition === 0 ? `▶ Starting immediately` : `⏳ Queued at position ${queuePosition}` });
-
-    _queue[phone].forEach((j, i) => {
-        updateStoppageRecord(j.folderKey, { queuePosition: i + 1 });
-    });
 
     if (!_sessions[phone]) processNextInQueue(phone);
 
     return {
         requestId,
         status:        'queued',
+        terminal:      false,
         queuePosition,
         phone,
         ch,
@@ -818,7 +964,353 @@ async function triggerDownload({ phone, ch, startTime, endTime, folder, requestK
     };
 }
 
-function cancelDownload(phone) {
+// What to do when a request arrives for a folder we already know about.
+// Returns a response to send back, or null meaning "reset it and re-run".
+//
+// The old version treated `no_files` and any `queued`/`in_progress` as
+// permanent, which is how a record ended up needing to be deleted by hand.
+// Now the only truly terminal states are a verified `complete` and a `dead`
+// record that has burned its whole attempt budget.
+async function decideOnExisting(phone, folderKey, existing) {
+    if (!existing) return null;   // record vanished under us — treat as new
+
+    const attempts = Number(existing.attempts || 0);
+
+    // ── Terminal: already delivered ──────────────────────────────────────────
+    if (existing.status === 'complete' && existing.blobUrl) {
+        log(`[${phone}] Duplicate blocked — ${folderKey} already complete`);
+        return {
+            requestId: existing.requestId, status: 'complete', terminal: true, duplicate: true,
+            blobUrl: existing.blobUrl, blobPath: existing.blobPath,
+            message: 'Already processed. File available at blobUrl.',
+        };
+    }
+
+    // ── Genuinely running: leave it alone ────────────────────────────────────
+    // "Running" means there is a live lease or an in-process session, not just
+    // a status field that says so.
+    if (existing.status === 'active') {
+        const owner = await store.leaseOwner(phone);
+        if (_sessions[phone]?.folderKey === folderKey || owner === folderKey) {
+            log(`[${phone}] Duplicate blocked — ${folderKey} is actually running`);
+            return {
+                requestId: existing.requestId, status: 'in_progress', terminal: false, duplicate: true,
+                message: 'Already in progress.',
+            };
+        }
+        warn(`[${phone}] ${folderKey} claims active but holds no lease — orphaned, reclaiming`);
+    }
+
+    // ── Still waiting its turn ───────────────────────────────────────────────
+    if (existing.status === 'queued') {
+        const pending = await store.queueList(phone);
+        if (pending.includes(folderKey)) {
+            return {
+                requestId: existing.requestId, status: 'queued', terminal: false, duplicate: true,
+                queuePosition: pending.indexOf(folderKey),
+                message: 'Already queued.',
+            };
+        }
+        warn(`[${phone}] ${folderKey} claims queued but is not in the queue — requeueing`);
+    }
+
+    // ── Anything else: check storage before spending another attempt ─────────
+    const recovered = await recoverFromStorage(folderKey, existing);
+    if (recovered) return recovered;
+
+    if (existing.status === 'dead' || attempts >= MAX_ATTEMPTS) {
+        log(`[${phone}] ${folderKey} exhausted ${attempts}/${MAX_ATTEMPTS} attempts — needs manual retry`);
+        return {
+            requestId: existing.requestId, status: 'dead', terminal: true, duplicate: true,
+            attempts, error: existing.error || null,
+            message: `Gave up after ${attempts} attempts. POST /api/ftp-retry to force another.`,
+            retryUrl: '/api/ftp-retry',
+        };
+    }
+
+    log(`[${phone}] ${folderKey} was ${existing.status} (attempt ${attempts}) — retrying`);
+    return null;   // fall through and re-queue
+}
+
+// If the blob is already in Azure, the job really did succeed — the record just
+// never got updated (e.g. the camera uploaded into a differently-named folder).
+// Promote it instead of re-downloading a video we already have.
+async function recoverFromStorage(folderKey, existing) {
+    if (!containerClient) return null;
+    const expectedBlob = `${folderKey}/vehicle-monitoring-trip.MP4`;
+    try {
+        const blobClient = containerClient.getBlockBlobClient(expectedBlob);
+        if (!await blobClient.exists()) return null;
+        const props   = await blobClient.getProperties().catch(() => ({}));
+        const blobUrl = blobClient.url;
+        await store.transition(folderKey, 'complete', {
+            patch: {
+                blobUrl,
+                blobPath: expectedBlob,
+                filename: 'vehicle-monitoring-trip.MP4',
+                fileSize: props.contentLength || null,
+                storedIn: 'azure-blob',
+                error:    null,
+            },
+            reason: 'recovered-from-storage',
+            phone:  existing?.phone,
+        });
+        log(`Recovered ${folderKey} — blob already in Azure: ${expectedBlob}`);
+        return {
+            requestId: existing?.requestId, status: 'complete', terminal: true, duplicate: true,
+            blobUrl, blobPath: expectedBlob, recovered: true,
+            message: 'File already present in Azure.',
+        };
+    } catch (e) {
+        err('Azure exists check error:', e.message);
+        return null;
+    }
+}
+
+// ── Reconciler ────────────────────────────────────────────────────────────────
+// The piece that removes the manual step. Every RECONCILE_MS it:
+//   1. re-homes jobs whose lease expired (process died, camera wedged),
+//   2. verifies unfinished jobs against Azure and promotes real successes,
+//   3. re-queues anything whose retry time has come.
+let _reconciling = false;
+
+async function reconcile() {
+    if (!store.enabled() || _reconciling) return;
+    _reconciling = true;
+    try {
+        // 1 — orphaned `active` jobs: status says running, nothing holds the lease.
+        for (const rec of await store.jobsInState('active')) {
+            const { folder, phone } = rec;
+            if (_sessions[phone]?.folderKey === folder) continue;      // running here
+            if (await store.leaseOwner(phone) === folder) continue;    // lease still alive
+            warn(`Reconciler: ${folder} is active with no lease — recovering`);
+            if (await recoverFromStorage(folder, rec)) continue;
+            await failJob(folder, 'Worker lost the job (lease expired)', 'orphaned', { state: 'interrupted' });
+        }
+
+        // 2 — jobs stuck in `queued` that nothing is going to pick up.
+        for (const rec of await store.jobsInState('queued')) {
+            const { folder, phone } = rec;
+            const pending = await store.queueList(phone);
+            if (pending.includes(folder)) continue;
+            if (_sessions[phone]?.folderKey === folder) continue;
+            warn(`Reconciler: ${folder} is queued but absent from the queue — requeueing`);
+            await store.queuePush(phone, folder);
+            if (!_sessions[phone]) processNextInQueue(phone);
+        }
+
+        // 3 — anything whose backoff has elapsed.
+        for (const folder of await store.dueRetries()) {
+            const rec = await store.getJob(folder);
+            if (!rec) { await store.clearRetry(folder); continue; }
+            if (rec.status === 'complete' || rec.status === 'dead') { await store.clearRetry(folder); continue; }
+
+            if (await recoverFromStorage(folder, rec)) { await store.clearRetry(folder); continue; }
+
+            if (Number(rec.attempts || 0) >= MAX_ATTEMPTS) {
+                await store.transition(folder, 'dead', {
+                    patch:  { error: rec.error || `Gave up after ${rec.attempts} attempts` },
+                    reason: 'attempts-exhausted',
+                    phone:  rec.phone,
+                });
+                continue;
+            }
+
+            log(`Reconciler: retrying ${folder} (attempt ${Number(rec.attempts || 0) + 1}/${MAX_ATTEMPTS})`);
+            await store.clearRetry(folder);
+            await store.transition(folder, 'queued', { reason: 'retry-due', phone: rec.phone });
+            await store.queuePush(rec.phone, folder);
+            if (!_sessions[rec.phone]) processNextInQueue(rec.phone);
+        }
+    } catch (e) {
+        err('Reconciler error:', e.message);
+    } finally {
+        _reconciling = false;
+    }
+}
+
+// ── One-time backfill from the legacy hash ────────────────────────────────────
+// Records written before this change exist only in
+// `stoppageVideoRecordingTriggered`. Without importing them, an already-
+// completed video would look brand new and be downloaded all over again.
+//
+// Legacy `queued`/`in_progress` entries are the stuck ones — they are imported
+// as `interrupted` so they show up in /api/ftp-stuck. They are NOT auto-retried
+// unless FTP_MIGRATE_AUTORETRY=true, so a first deploy doesn't kick off a burst
+// of downloads; use POST /api/ftp-retry or just re-request them.
+const MIGRATE_AUTORETRY = process.env.FTP_MIGRATE_AUTORETRY === 'true';
+
+const LEGACY_STATUS_MAP = {
+    complete:    'complete',
+    failed:      'failed',
+    partial:     'partial',
+    no_files:    'no_files',
+    queued:      'interrupted',
+    in_progress: 'interrupted',
+};
+
+const MIGRATE_DRYRUN = process.env.FTP_MIGRATE_DRYRUN === 'true';
+
+function legacyHashName() {
+    return process.env.REDIS_MIRROR_HASH || 'stoppageVideoRecordingTriggered';
+}
+
+// Work out what the migration would do, without writing anything.
+// Exposed as GET /api/ftp-migrate-preview so it can be inspected on a running
+// service, and used by migrateLegacyHash() so the plan and the action agree.
+async function planLegacyMigration() {
+    const hashName = legacyHashName();
+    const all      = await redis.hgetall(hashName);
+    const folders  = Object.keys(all || {});
+
+    const plan = {
+        hash:               hashName,
+        total:              folders.length,
+        alreadyMigrated:    0,
+        unparsable:         [],
+        byLegacyStatus:     {},
+        byTarget:           {},
+        completeWithoutBlob: [],
+        items:              [],
+    };
+
+    // One pipelined existence check for the whole hash, rather than a round
+    // trip per folder — this can run over thousands of records.
+    const already = await store.existingJobs(folders);
+    plan.alreadyMigrated = already.size;
+
+    for (const folder of folders) {
+        if (already.has(folder)) continue;
+
+        let legacy;
+        try { legacy = JSON.parse(all[folder]); } catch (_) { plan.unparsable.push(folder); continue; }
+
+        const legacyStatus = legacy.status || '(none)';
+        const target       = LEGACY_STATUS_MAP[legacy.status] || 'interrupted';
+        const phone        = legacy.phone || folder.split('_')[0];
+
+        plan.byLegacyStatus[legacyStatus] = (plan.byLegacyStatus[legacyStatus] || 0) + 1;
+        plan.byTarget[target]             = (plan.byTarget[target] || 0) + 1;
+
+        // A legacy record marked complete but carrying no blobUrl is not
+        // treated as delivered — it will be re-downloaded. Worth seeing up front.
+        if (target === 'complete' && !legacy.blobUrl) plan.completeWithoutBlob.push(folder);
+
+        plan.items.push({
+            folder, phone, legacyStatus, target,
+            hasBlob:   !!legacy.blobUrl,
+            startTime: legacy.startTime || null,
+            endTime:   legacy.endTime || null,
+            error:     legacy.error || null,
+            legacy,
+        });
+    }
+
+    plan.willImport    = plan.items.length;
+    plan.willAutoRetry = MIGRATE_AUTORETRY
+        ? plan.items.filter(i => i.target !== 'complete').length
+        : 0;
+
+    return plan;
+}
+
+function logMigrationPlan(plan, dryRun) {
+    const tag = dryRun ? 'DRY RUN — no writes' : 'applying';
+    log(`Legacy migration (${tag}) from "${plan.hash}"`);
+    log(`  total fields:      ${plan.total}`);
+    log(`  already migrated:  ${plan.alreadyMigrated}`);
+    log(`  would import:      ${plan.willImport}`);
+    if (plan.unparsable.length) warn(`  unparsable JSON:   ${plan.unparsable.length} → ${plan.unparsable.slice(0, 5).join(', ')}`);
+    for (const [from, n] of Object.entries(plan.byLegacyStatus)) {
+        log(`    ${from.padEnd(12)} → ${(LEGACY_STATUS_MAP[from] || 'interrupted').padEnd(12)} ${n}`);
+    }
+    if (plan.completeWithoutBlob.length) {
+        warn(`  ${plan.completeWithoutBlob.length} record(s) marked complete but with no blobUrl — these will be re-downloaded:`);
+        plan.completeWithoutBlob.slice(0, 10).forEach(f => warn(`    ${f}`));
+    }
+    log(`  auto-retry on boot: ${plan.willAutoRetry}${MIGRATE_AUTORETRY ? '' : ' (FTP_MIGRATE_AUTORETRY is not true)'}`);
+}
+
+async function migrateLegacyHash({ dryRun = MIGRATE_DRYRUN } = {}) {
+    if (!store.enabled()) return null;
+    try {
+        const plan = await planLegacyMigration();
+        if (!plan.total) return plan;
+
+        logMigrationPlan(plan, dryRun);
+
+        if (dryRun) {
+            log('Legacy migration skipped — FTP_MIGRATE_DRYRUN=true. Unset it to apply.');
+            return plan;
+        }
+
+        let imported = 0, skipped = 0;
+        for (const item of plan.items) {
+            const { folder, phone, target, legacy } = item;
+
+            const created = await store.createJob(folder, {
+                requestId:   legacy.requestId || `legacy-${folder}`,
+                phone,
+                ch:          legacy.ch != null ? legacy.ch : 1,
+                startTime:   legacy.startTime,
+                endTime:     legacy.endTime,
+                folderPath:  `/${folder}/`,
+                streamType:  legacy.streamType != null ? legacy.streamType : 1,
+                quality:     legacy.quality || 'high',
+                alarmFlag:   legacy.alarmFlag || '0',
+                maxAttempts: MAX_ATTEMPTS,
+                createdAt:   legacy.createdAt || new Date().toISOString(),
+            });
+            if (!created) { skipped++; continue; }   // someone beat us to it
+
+            await store.transition(folder, target, {
+                patch: {
+                    blobUrl:   legacy.blobUrl || null,
+                    blobPath:  legacy.blobPath || null,
+                    filename:  legacy.filename || null,
+                    fileSize:  legacy.fileSize != null ? legacy.fileSize : null,
+                    error:     legacy.error || null,
+                    migrated:  'true',
+                },
+                reason:  `migrated-from-legacy-${legacy.status}`,
+                phone,
+                retryAt: (MIGRATE_AUTORETRY && target !== 'complete') ? Date.now() : undefined,
+            });
+            imported++;
+        }
+        log(`Legacy migration done: imported ${imported}, skipped ${skipped}, already present ${plan.alreadyMigrated}, total ${plan.total}`);
+        return plan;
+    } catch (e) {
+        err('Legacy migration error:', e.message);
+        return null;
+    }
+}
+
+// On boot, nothing is running — any record claiming otherwise is a leftover
+// from the previous process and must not block a retry.
+async function recoverOnStartup() {
+    if (!store.enabled()) return;
+    try {
+        await migrateLegacyHash();
+        for (const rec of await store.jobsInState('active')) {
+            warn(`Startup: ${rec.folder} was active when the process stopped — marking interrupted`);
+            if (await recoverFromStorage(rec.folder, rec)) continue;
+            await failJob(rec.folder, 'Service restarted mid-download', 'startup-recovery', { state: 'interrupted' });
+        }
+        for (const phone of await store.queuedPhones()) {
+            const pending = await store.queueList(phone);
+            if (pending.length) {
+                log(`Startup: ${phone} has ${pending.length} job(s) still queued — resuming`);
+                processNextInQueue(phone);
+            }
+        }
+        const counts = await store.countsByState();
+        log('Startup state:', JSON.stringify(counts));
+    } catch (e) {
+        err('Startup recovery error:', e.message);
+    }
+}
+async function cancelDownload(phone) {
     phone = String(phone);
     const session = _sessions[phone];
     if (!session) {
@@ -826,10 +1318,16 @@ function cancelDownload(phone) {
         return;
     }
     bus.emit('device:send', { phone, frame: build9207(phone, 0, 2) });
-    updateRedis(phone, session.requestId, { status: 'failed', error: 'Cancelled by user' });
+    // Deliberate cancel — fail it but schedule no retry. A fresh request for
+    // the same folder will still start it again.
+    await store.transition(session.folderKey, 'failed', {
+        patch:  { error: 'Cancelled by user' },
+        reason: 'user-cancelled',
+        phone,
+    });
     broadcast({ type: 'status', phone, message: '🛑 Download cancelled' });
     log(`[${phone}] Cancelled requestId:${session.requestId}`);
-    jobFinished(phone);  // move to next in queue
+    jobFinished(phone, 'user-cancelled');  // move to next in queue
 }
 
 // ── Frame builders ────────────────────────────────────────────────────────────
@@ -1149,9 +1647,29 @@ function makeFtpHandler() {
                         const relDir    = path.relative(path.resolve(RECORDINGS_DIR), path.resolve(saveDir));
                         const ftpFolder = relDir.split(path.sep)[0] || '';          // full folder, for blob path
                         const ftpPhone  = (ftpFolder.split('_')[0] || '').trim() || null;  // bare phone, for session
-                        const capturedRequestId = ftpPhone ? (_sessions[ftpPhone]?.requestId || null) : null;
+                        const activeJob = ftpPhone ? _sessions[ftpPhone] : null;
+                        const capturedRequestId = activeJob?.requestId || null;
 
-                        log(`STOR folder:${ftpFolder} phone:${ftpPhone} requestId:${capturedRequestId} filename:${filename}`);
+                        // The record is keyed by the folder from the original request.
+                        // If the camera uploads into a differently-named folder the
+                        // parsed name won't match anything, and the old code silently
+                        // dropped the update — blob in Azure, record stuck forever.
+                        // Trust the running job's key and fall back to the parsed one.
+                        const recordKey = activeJob?.folderKey || ftpFolder;
+                        if (activeJob && ftpFolder && activeJob.folderKey !== ftpFolder) {
+                            warn(`STOR folder mismatch — camera used "${ftpFolder}", job expects "${activeJob.folderKey}". Updating the job's record.`);
+                        }
+
+                        log(`STOR folder:${ftpFolder} record:${recordKey} phone:${ftpPhone} requestId:${capturedRequestId} filename:${filename}`);
+
+                        // Count the transfer the moment it starts. This was never
+                        // incremented, so maybeFinish() could never fire and the
+                        // 0x1206 handler always took the "uploaded nothing" branch —
+                        // racing a successful upload back to 'failed'.
+                        if (activeJob) {
+                            activeJob.startedFiles = (activeJob.startedFiles || 0) + 1;
+                            touchJob(ftpPhone, 'transfer-started', TRANSFER_TIMEOUT);
+                        }
 
                         if (!containerClient) {
                             err('Azure Blob not configured — cannot accept STOR. Set AZURE_STORAGE_CONNECTION_STRING.');
@@ -1197,19 +1715,23 @@ function makeFtpHandler() {
                                     session.savedFiles    = (session.savedFiles    || 0) + 1;
                                     session.resolvedFiles = (session.resolvedFiles || 0) + 1;
                                 }
-                                // Update stoppageVideoRecordingTriggered keyed by folder
-                                await updateStoppageRecord(ftpFolder, {
-                                    status:   'complete',
-                                    blobUrl,
-                                    blobPath,
-                                    filename: finalFilename,
-                                    fileSize,
-                                    storedIn: 'azure-blob',
+                                await store.transition(recordKey, 'complete', {
+                                    patch: {
+                                        blobUrl,
+                                        blobPath,
+                                        filename:   finalFilename,
+                                        fileSize,
+                                        storedIn:   'azure-blob',
+                                        uploadedAs: ftpFolder,
+                                        error:      null,
+                                    },
+                                    reason: 'blob-upload-complete',
+                                    phone:  ftpPhone,
                                 });
                                 log(`[${ftpPhone}] saved → ${blobPath}`);
                                 maybeFinish(ftpPhone);
                             } else {
-                                log(`⚠️ No phone identified — Redis not updated`);
+                                err(`⚠️ No phone identified for ${blobPath} — record not updated`);
                             }
 
                             if (assignedPort) { freePasvPort(assignedPort); assignedPort = null; }
@@ -1225,12 +1747,9 @@ function makeFtpHandler() {
                                 if (session && session.requestId === capturedRequestId) {
                                     session.resolvedFiles = (session.resolvedFiles || 0) + 1;
                                 }
-                                // Mark failed — next request will check Azure and retry if needed
-                                updateStoppageRecord(ftpFolder, {
-                                    status: 'failed',
-                                    error:  `Azure Blob upload failed: ${e.message}`,
-                                });
-                                maybeFinish(ftpPhone);
+                                // Schedule a retry rather than leaving it failed forever.
+                                failJob(recordKey, `Azure Blob upload failed: ${e.message}`, 'blob-upload-error')
+                                    .finally(() => maybeFinish(ftpPhone));
                             }
                             if (assignedPort) { freePasvPort(assignedPort); assignedPort = null; }
                         };
@@ -1283,7 +1802,12 @@ function makeFtpHandler() {
                                     5,                  // 5 parallel blocks
                                     {
                                         blobHTTPHeaders:    { blobContentType: 'video/mp4' },
-                                        onProgress: (p) => log(`☁️  Blob upload progress: ${p.loadedBytes} bytes`),
+                                        onProgress: (p) => {
+                                            log(`☁️  Blob upload progress: ${p.loadedBytes} bytes`);
+                                            // A big file is still a live job — keep the
+                                            // watchdog and the lease from expiring under it.
+                                            if (ftpPhone) touchJob(ftpPhone, 'upload-progress', TRANSFER_TIMEOUT);
+                                        },
                                     }
                                 );
                                 await onComplete(totalBytes);
@@ -1376,4 +1900,15 @@ function startFtpServer() {
 }
 
 startFtpServer();
+
+// Recover anything the previous process left mid-flight, then keep sweeping.
+// Without this, a restart leaves records claiming `in_progress` that nothing
+// will ever finish — the case that used to need a manual Redis delete.
+if (store.enabled()) {
+    setTimeout(() => recoverOnStartup(), 5000);
+    const reconcileTimer = setInterval(() => reconcile(), RECONCILE_MS);
+    reconcileTimer.unref?.();
+    log(`Reconciler every ${Math.round(RECONCILE_MS / 1000)}s — maxAttempts:${MAX_ATTEMPTS} lease:${Math.round(LEASE_MS / 1000)}s handshake:${Math.round(HANDSHAKE_TIMEOUT / 1000)}s transfer:${Math.round(TRANSFER_TIMEOUT / 60000)}m`);
+}
+
 log(`Started — FTP:${FTP_PORT} PASV:${PASV_PORT_START}-${PASV_PORT_START+PASV_POOL_SIZE-1} HTTP:${HTTP_PORT} WS:${WS_PORT}`);
