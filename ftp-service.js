@@ -554,6 +554,7 @@ http.createServer((req, res) => {
                     byLegacyStatus:      plan.byLegacyStatus,
                     byTarget:            plan.byTarget,
                     unparsable:          plan.unparsable,
+                    unrunnable:          plan.unrunnable,
                     completeWithoutBlob: plan.completeWithoutBlob,
                     items: full
                         ? plan.items.map(({ legacy, ...rest }) => rest)
@@ -761,10 +762,38 @@ function touchJob(phone, reason = 'activity', timeoutMs = TRANSFER_TIMEOUT) {
     store.leaseRenew(phone, session.folderKey, timeoutMs + LEASE_MS).catch(() => {});
 }
 
+// A record is only dispatchable if it carries everything build9205/build9206
+// need. Legacy records migrated from the old hash can be missing the time
+// window entirely, and an undefined startTime used to throw inside the
+// dispatch path and leave the job pinned as `active`.
+function unrunnableReason(record) {
+    if (!record.startTime || !record.endTime) return 'missing startTime/endTime';
+    if (!/^\d{4}-\d{2}-\d{2}/.test(String(record.startTime))) return `unparsable startTime "${record.startTime}"`;
+    if (!/^\d{4}-\d{2}-\d{2}/.test(String(record.endTime)))   return `unparsable endTime "${record.endTime}"`;
+    if (!record.phone)                                        return 'missing phone';
+    if (record.ch == null || Number.isNaN(Number(record.ch))) return 'missing channel';
+    return null;
+}
+
+// Every call site fires this without awaiting, so it must never reject —
+// an unhandled rejection takes the whole process down on Node 15+.
+async function processNextInQueue(phone) {
+    try {
+        await dispatchNext(phone);
+    } catch (e) {
+        err(`[${phone}] processNextInQueue crashed:`, e.stack || e.message);
+        const s = _sessions[phone];
+        if (s) {
+            await failJob(s.folderKey, `Internal error: ${e.message}`, 'dispatch-crash').catch(() => {});
+            await jobFinished(phone, 'dispatch-crash').catch(() => {});
+        }
+    }
+}
+
 // Pull the next folder off the durable queue and start it.
 // The queue lives in Redis now, so a restart mid-batch no longer loses the
 // jobs that had not been dispatched yet.
-async function processNextInQueue(phone) {
+async function dispatchNext(phone) {
     if (_sessions[phone]) return;   // something still active — wait for it
 
     let folder;
@@ -776,6 +805,18 @@ async function processNextInQueue(phone) {
         if (!record) { warn(`[${phone}] Queue entry ${folder} has no record — dropped`); continue; }
         if (record.status === 'complete' || record.status === 'dead') {
             log(`[${phone}] Queue entry ${folder} already ${record.status} — skipped`);
+            continue;
+        }
+        // Retrying this would throw in build9205 every time — bury it now so it
+        // shows up in /api/ftp-stuck instead of wedging the queue in a loop.
+        const bad = unrunnableReason(record);
+        if (bad) {
+            err(`[${phone}] ${folder} cannot be dispatched (${bad}) — marking dead`);
+            await store.transition(folder, 'dead', {
+                patch:  { error: `Not dispatchable: ${bad}` },
+                reason: 'unrunnable-record',
+                phone,
+            });
             continue;
         }
         break;
@@ -818,23 +859,39 @@ async function processNextInQueue(phone) {
 
     broadcast({ type: 'status', phone, requestId: job.requestId, message: `▶ Starting download ch${job.ch} ${job.startTime} → ${job.endTime} (attempt ${attempts})` });
 
-    // Arm the watchdog NOW, not once the camera answers. Previously a camera
-    // that never replied left the session pinned forever and stalled every
-    // later video in the batch.
-    touchJob(phone, 'awaiting-camera', HANDSHAKE_TIMEOUT);
+    // Anything that throws while building or sending a frame must fail this job
+    // and release the camera — otherwise the session stays pinned and every
+    // later video for this phone waits behind it.
+    try {
+        // Arm the watchdog NOW, not once the camera answers. Previously a camera
+        // that never replied left the session pinned forever and stalled every
+        // later video in the batch.
+        touchJob(phone, 'awaiting-camera', HANDSHAKE_TIMEOUT);
 
-    // Step 1 — query file list
-    bus.emit('device:send', { phone, frame: build9205(phone, job.ch, job.startTime, job.endTime, BigInt(job.alarmMask || '0'), job.streamType || 1) });
-    log(`[${phone}] Sent 0x9205`);
+        // Step 1 — query file list
+        bus.emit('device:send', { phone, frame: build9205(phone, job.ch, job.startTime, job.endTime, BigInt(job.alarmMask || '0'), job.streamType || 1) });
+        log(`[${phone}] Sent 0x9205`);
+    } catch (e) {
+        err(`[${phone}] Dispatch failed for ${folder}:`, e.message);
+        await failJob(folder, `Dispatch failed: ${e.message}`, 'dispatch-error');
+        await jobFinished(phone, 'dispatch-error');
+        return;
+    }
 
     // Step 2 — send FTP command after 3s
     setTimeout(async () => {
         // Check session still matches — may have been cancelled
         if (_sessions[phone]?.requestId !== job.requestId) return;
-        const frame = build9206(phone, job.ch, job.startTime, job.endTime, job.folder, BigInt(job.alarmMask || '0'), job.streamType || 1);
-        bus.emit('device:send', { phone, frame });
-        log(`[${phone}] Sent 0x9206 folder:${job.folder}`);
-        broadcast({ type: 'status', phone, requestId: job.requestId, message: `⏳ FTP command sent to camera...` });
+        try {
+            const frame = build9206(phone, job.ch, job.startTime, job.endTime, job.folder, BigInt(job.alarmMask || '0'), job.streamType || 1);
+            bus.emit('device:send', { phone, frame });
+            log(`[${phone}] Sent 0x9206 folder:${job.folder}`);
+            broadcast({ type: 'status', phone, requestId: job.requestId, message: `⏳ FTP command sent to camera...` });
+        } catch (e) {
+            err(`[${phone}] 0x9206 build failed for ${folder}:`, e.message);
+            await failJob(folder, `0x9206 build failed: ${e.message}`, 'dispatch-error');
+            await jobFinished(phone, 'dispatch-error');
+        }
     }, 3000);
 }
 
@@ -932,6 +989,9 @@ async function triggerDownload({ phone, ch, startTime, endTime, folder, requestK
                 folderPath: folder,
                 alarmFlag:  alarmMask.toString(),
                 error:      null,
+                // An explicit re-request is fresh intent, so it gets a fresh
+                // attempt budget rather than inheriting a spent one.
+                attempts:   0,
             },
             reason: 're-requested',
             phone,
@@ -1017,6 +1077,14 @@ async function decideOnExisting(phone, folderKey, existing) {
     // ── Anything else: check storage before spending another attempt ─────────
     const recovered = await recoverFromStorage(folderKey, existing);
     if (recovered) return recovered;
+
+    // A record buried for being unrunnable — typically a legacy import with no
+    // time window — must yield to a fresh request that actually supplies one.
+    // The caller patches the new parameters in on the retry path.
+    if (existing.status === 'dead' && unrunnableReason(existing)) {
+        log(`[${phone}] ${folderKey} was dead but unrunnable (${unrunnableReason(existing)}) — adopting the new request`);
+        return null;
+    }
 
     if (existing.status === 'dead' || attempts >= MAX_ATTEMPTS) {
         log(`[${phone}] ${folderKey} exhausted ${attempts}/${MAX_ATTEMPTS} attempts — needs manual retry`);
@@ -1151,6 +1219,8 @@ const LEGACY_STATUS_MAP = {
 
 const MIGRATE_DRYRUN = process.env.FTP_MIGRATE_DRYRUN === 'true';
 
+const isRetryTarget = t => t !== 'complete' && t !== 'dead';
+
 function legacyHashName() {
     return process.env.REDIS_MIRROR_HASH || 'stoppageVideoRecordingTriggered';
 }
@@ -1168,6 +1238,7 @@ async function planLegacyMigration() {
         total:              folders.length,
         alreadyMigrated:    0,
         unparsable:         [],
+        unrunnable:         [],
         byLegacyStatus:     {},
         byTarget:           {},
         completeWithoutBlob: [],
@@ -1186,8 +1257,18 @@ async function planLegacyMigration() {
         try { legacy = JSON.parse(all[folder]); } catch (_) { plan.unparsable.push(folder); continue; }
 
         const legacyStatus = legacy.status || '(none)';
-        const target       = LEGACY_STATUS_MAP[legacy.status] || 'interrupted';
         const phone        = legacy.phone || folder.split('_')[0];
+        let   target       = LEGACY_STATUS_MAP[legacy.status] || 'interrupted';
+
+        // Old records predating the current request shape can be missing the
+        // time window. Those can never be re-run — importing them as retryable
+        // just throws in build9205 on every attempt. Bury them instead, so they
+        // are visible in /api/ftp-stuck rather than looping.
+        const bad = (target !== 'complete') ? unrunnableReason({ ...legacy, phone }) : null;
+        if (bad) {
+            target = 'dead';
+            plan.unrunnable.push({ folder, legacyStatus, reason: bad });
+        }
 
         plan.byLegacyStatus[legacyStatus] = (plan.byLegacyStatus[legacyStatus] || 0) + 1;
         plan.byTarget[target]             = (plan.byTarget[target] || 0) + 1;
@@ -1208,7 +1289,7 @@ async function planLegacyMigration() {
 
     plan.willImport    = plan.items.length;
     plan.willAutoRetry = MIGRATE_AUTORETRY
-        ? plan.items.filter(i => i.target !== 'complete').length
+        ? plan.items.filter(i => isRetryTarget(i.target)).length
         : 0;
 
     return plan;
@@ -1227,6 +1308,10 @@ function logMigrationPlan(plan, dryRun) {
     if (plan.completeWithoutBlob.length) {
         warn(`  ${plan.completeWithoutBlob.length} record(s) marked complete but with no blobUrl — these will be re-downloaded:`);
         plan.completeWithoutBlob.slice(0, 10).forEach(f => warn(`    ${f}`));
+    }
+    if (plan.unrunnable.length) {
+        warn(`  ${plan.unrunnable.length} record(s) cannot be re-run and will be imported as dead:`);
+        plan.unrunnable.slice(0, 10).forEach(u => warn(`    ${u.folder} — ${u.reason}`));
     }
     log(`  auto-retry on boot: ${plan.willAutoRetry}${MIGRATE_AUTORETRY ? '' : ' (FTP_MIGRATE_AUTORETRY is not true)'}`);
 }
@@ -1274,7 +1359,7 @@ async function migrateLegacyHash({ dryRun = MIGRATE_DRYRUN } = {}) {
                 },
                 reason:  `migrated-from-legacy-${legacy.status}`,
                 phone,
-                retryAt: (MIGRATE_AUTORETRY && target !== 'complete') ? Date.now() : undefined,
+                retryAt: (MIGRATE_AUTORETRY && isRetryTarget(target)) ? Date.now() : undefined,
             });
             imported++;
         }
